@@ -152,6 +152,12 @@ class Store:
               id INTEGER PRIMARY KEY AUTOINCREMENT, target TEXT NOT NULL, name TEXT NOT NULL,
               kind TEXT NOT NULL, body TEXT NOT NULL, stamp INTEGER NOT NULL, historical INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS event_time ON events(stamp DESC,id DESC);
+            CREATE TABLE IF NOT EXISTS futures_accounts (
+              id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
+              api_key TEXT NOT NULL, api_secret TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS copy_bindings (
+              account_id INTEGER NOT NULL, target_id TEXT NOT NULL,
+              PRIMARY KEY(account_id, target_id));
             CREATE TABLE IF NOT EXISTS outbox (
               id INTEGER PRIMARY KEY AUTOINCREMENT, event INTEGER NOT NULL, channel TEXT NOT NULL,
               status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
@@ -427,12 +433,14 @@ def handler_factory(store, monitor, token):
                         targets = [dict(r) for r in db.execute('SELECT * FROM targets ORDER BY name')]
                         for row in targets:
                             row['detail'] = json.loads(row['detail'])
+                        accounts = [dict(r) for r in db.execute("SELECT id,name FROM futures_accounts ORDER BY id")]
+                        bindings = [dict(r) for r in db.execute('SELECT account_id,target_id FROM copy_bindings')]
                         counts = dict(db.execute('SELECT status,COUNT(*) FROM outbox GROUP BY status').fetchall())
                         errors = [dict(r) for r in db.execute("SELECT channel,attempts,error FROM outbox WHERE status='pending' AND error!='' ORDER BY id DESC LIMIT 5")]
                     settings = store.settings()
                     for key in SECRETS:
                         settings[key + '_configured'] = bool(settings.pop(key))
-                    return self.reply({'targets': targets, 'settings': settings, 'notifications': counts, 'notification_errors': errors})
+                    return self.reply({'targets': targets, 'settings': settings, 'notifications': counts, 'notification_errors': errors, 'futures_accounts': accounts, 'copy_bindings': bindings})
                 if parsed.path == '/api/events':
                     page = max(1, int(query.get('page', ['1'])[0]))
                     target, kind = query.get('target', [''])[0], query.get('kind', [''])[0]
@@ -487,6 +495,26 @@ def handler_factory(store, monitor, token):
                     monitor.add(data.get('id'))
                 elif self.path == '/api/toggle':
                     monitor.toggle(str(data.get('id')), data.get('enabled'))
+                elif self.path == '/api/futures-account':
+                    name, key, secret = (data.get(k, '').strip() for k in ('name', 'api_key', 'api_secret'))
+                    if not all((name, key, secret)) or any(len(x) > 256 for x in (name, key, secret)):
+                        raise ValueError('请填写账号名称、API Key 和 Secret Key')
+                    with store.db() as db:
+                        try:
+                            db.execute('INSERT INTO futures_accounts(name,api_key,api_secret) VALUES(?,?,?)', (name, key, secret))
+                        except sqlite3.IntegrityError:
+                            raise ValueError('账号名称已存在') from None
+                elif self.path == '/api/copy-binding':
+                    account_id, target_id, selected = data.get('account_id'), str(data.get('target_id', '')), data.get('selected')
+                    if not isinstance(account_id, int) or not isinstance(selected, bool):
+                        raise ValueError('关联参数错误')
+                    with store.db() as db:
+                        if not db.execute('SELECT 1 FROM futures_accounts WHERE id=?', (account_id,)).fetchone() or not db.execute('SELECT 1 FROM targets WHERE id=?', (target_id,)).fetchone():
+                            raise ValueError('账号或带单员不存在')
+                        if selected:
+                            db.execute('INSERT OR IGNORE INTO copy_bindings VALUES(?,?)', (account_id, target_id))
+                        else:
+                            db.execute('DELETE FROM copy_bindings WHERE account_id=? AND target_id=?', (account_id, target_id))
                 elif self.path == '/api/test-notification':
                     channel = data.get('channel')
                     if channel not in ('telegram', 'bark'):
