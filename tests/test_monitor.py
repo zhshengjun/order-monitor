@@ -191,7 +191,7 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(self.rows('targets')[0]['balance'], '200')
 
     def test_direction_combinations(self):
-        for side, position, expected in [('BUY', 'LONG', '开多 / 加多'), ('SELL', 'LONG', '减多 / 平多'), ('SELL', 'SHORT', '开空 / 加空'), ('BUY', 'SHORT', '减空 / 平空')]:
+        for side, position, expected in [('BUY', 'LONG', '开多'), ('SELL', 'LONG', '平多'), ('SELL', 'SHORT', '开空'), ('BUY', 'SHORT', '平空')]:
             self.assertEqual(direction({'side': side, 'positionSide': position}), expected)
 
 

@@ -43,8 +43,8 @@ def decimal_text(value):
 
 
 def direction(row):
-    return {('BUY', 'LONG'): '开多 / 加多', ('SELL', 'LONG'): '减多 / 平多',
-            ('SELL', 'SHORT'): '开空 / 加空', ('BUY', 'SHORT'): '减空 / 平空'}.get(
+    return {('BUY', 'LONG'): '开多', ('SELL', 'LONG'): '平多',
+            ('SELL', 'SHORT'): '开空', ('BUY', 'SHORT'): '平空'}.get(
                 (row.get('side'), row.get('positionSide')), row.get('side', '未知'))
 
 
@@ -308,6 +308,8 @@ class Monitor:
     @staticmethod
     def message(event):
         body = json.loads(event['body'])
+        if event['kind'] == 'order':
+            body['direction'] = direction(body)
         title = event['name'] + ' · ' + {'order': '交易操作', 'transfer': '资金划转', 'balance': '余额变化'}[event['kind']]
         if event['kind'] == 'order':
             text = '%s %s%s\n数量：%s %s\n均价：%s %s\n成交金额：%s %s\n已实现盈亏：%s %s' % (
@@ -444,6 +446,8 @@ def handler_factory(store, monitor, token):
                         rows = [dict(r) for r in db.execute('SELECT * FROM events WHERE ' + where + ' ORDER BY stamp DESC,id DESC LIMIT 50 OFFSET ?', args + [(page - 1) * 50])]
                     for row in rows:
                         row['body'] = json.loads(row['body'])
+                        if row['kind'] == 'order':
+                            row['body']['direction'] = direction(row['body'])
                     return self.reply({'list': rows, 'total': total, 'page': page})
                 if parsed.path == '/api/search':
                     nickname = query.get('q', [''])[0].strip()
