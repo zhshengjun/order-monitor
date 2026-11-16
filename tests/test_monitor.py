@@ -121,26 +121,20 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(self.rows('events'), [])
         self.assertEqual(self.rows('targets')[0]['failures'], 1)
 
-    def test_balance_numeric_equality_and_threshold(self):
+    def test_balance_snapshot_changes_do_not_create_events(self):
         self.baseline()
-        self.api.balance = '100.000000'
-        self.monitor.poll(PID)
-        self.assertEqual(len(self.rows('events')), 1)
-        self.store.save_settings({'balance_threshold': '5'})
-        self.api.balance = '103'
-        self.monitor.poll(PID)
-        self.assertEqual(self.rows('events')[-1]['kind'], 'balance')
-        self.assertEqual(self.rows('outbox'), [])
         self.api.balance = '110'
         self.monitor.poll(PID)
-        self.assertEqual(len(self.rows('outbox')), 2)
+        self.assertEqual(self.rows('targets')[0]['balance'], '110')
+        self.assertEqual(len(self.rows('events')), 1)
+        self.assertEqual(self.rows('outbox'), [])
 
     def test_transfer_is_separate_from_balance(self):
         self.baseline()
         self.api.transfers = [dict(time=101, coin='USDT', amount='10', transType='LEAD_WITHDRAW', **{'from': 'Lead Trading Account', 'to': 'Fiat and Spot'})]
         self.api.balance = '90'
         self.monitor.poll(PID)
-        self.assertEqual([r['kind'] for r in self.rows('events')], ['order', 'transfer', 'balance'])
+        self.assertEqual([r['kind'] for r in self.rows('events')], ['order', 'transfer'])
 
     def test_pause_cancels_pending_resume_catches_up(self):
         self.baseline()
@@ -194,7 +188,7 @@ class MonitorTests(unittest.TestCase):
         self.api.fail = False
         self.monitor.poll(PID)
         self.assertEqual(self.rows('targets')[0]['error'], '')
-        self.assertEqual(self.rows('events')[-1]['kind'], 'balance')
+        self.assertEqual(self.rows('targets')[0]['balance'], '200')
 
     def test_direction_combinations(self):
         for side, position, expected in [('BUY', 'LONG', '开多 / 加多'), ('SELL', 'LONG', '减多 / 平多'), ('SELL', 'SHORT', '开空 / 加空'), ('BUY', 'SHORT', '减空 / 平空')]:

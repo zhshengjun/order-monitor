@@ -295,12 +295,6 @@ class Monitor:
                             historical = first or (watermark is not None and stamp < watermark)
                             self.store.event(db, pid, detail['nickname'], kind, body, stamp, historical, settings)
                     balance = decimal_text(detail['marginBalance'])
-                    if not first and number(balance) != number(target['balance']):
-                        delta = number(balance) - number(target['balance'])
-                        body = {'before': target['balance'], 'after': balance, 'delta': decimal_text(delta), 'coin': detail.get('initInvestAsset', 'USDT')}
-                        # Threshold filters notifications, but all observed changes remain visible.
-                        notify_settings = settings if abs(delta) >= number(settings['balance_threshold']) else {**settings, 'telegram_enabled': False, 'bark_enabled': False}
-                        self.store.event(db, pid, detail['nickname'], 'balance', body, int(time.time() * 1000), False, notify_settings)
                     db.execute('UPDATE targets SET name=?,detail=?,balance=?,initialized=1,last_check=?,next_check=?,failures=0,error=\'\' WHERE id=?',
                                (detail['nickname'], dumps(detail), balance, time.time(), time.time() + settings['interval'], pid))
             except Exception as exc:
@@ -331,7 +325,7 @@ class Monitor:
         with self.lock:
             settings = self.store.settings()
             with self.store.db() as db:
-                tasks = db.execute("SELECT o.id AS task_id,o.channel,o.attempts,e.* FROM outbox o JOIN events e ON e.id=o.event WHERE o.status='pending' AND o.next_try<=? ORDER BY o.id LIMIT 10", (time.time(),)).fetchall()
+                tasks = db.execute("SELECT o.id AS task_id,o.channel,o.attempts,e.* FROM outbox o JOIN events e ON e.id=o.event WHERE o.status='pending' AND e.kind != 'balance' AND o.next_try<=? ORDER BY o.id LIMIT 10", (time.time(),)).fetchall()
             for task in tasks:
                 channel = task['channel']
                 if not settings[channel + '_enabled']:
@@ -440,7 +434,7 @@ def handler_factory(store, monitor, token):
                 if parsed.path == '/api/events':
                     page = max(1, int(query.get('page', ['1'])[0]))
                     target, kind = query.get('target', [''])[0], query.get('kind', [''])[0]
-                    where, args = '1=1', []
+                    where, args = "kind != 'balance'", []
                     for column, value in [('target', target), ('kind', kind)]:
                         if value:
                             where += ' AND ' + column + '=?'
