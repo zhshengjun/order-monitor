@@ -130,3 +130,7 @@ node --check static/app.js
 数据位于 Docker 命名卷 `monitor-data`。容器入口会修正 `/data` 目录及 SQLite 文件的所有者，然后降权为 UID/GID `10001` 运行服务；也支持 `./data:/data` 绑定挂载。若自行覆盖容器 `user`、使用只读挂载或不允许 chown 的网络文件系统，需要预先保证目录及文件对 `10001` 可写。不要删除数据卷来解决升级问题，否则会丢失增量同步位置。
 
 停止容器后备份整个卷，或使用 SQLite 在线备份 API；不要在写入过程中只复制主 `.db` 文件而忽略 WAL。当前没有自动清理历史，部署时注意磁盘空间。只运行一个应用实例，不共享数据库给多个副本。
+
+### 排查搜索或同步失败
+
+使用 `docker compose logs --tail=100 order-monitor` 查看脱敏日志。日志区分 DNS、TLS、超时、HTTP 状态和 JSON 格式错误；不记录代理地址、凭证、请求头或响应正文。`docker compose logs -f order-monitor` 可实时查看。容器内代理地址应使用容器可访问的地址，不能直接使用宿主机的 `127.0.0.1`。

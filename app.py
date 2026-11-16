@@ -6,6 +6,8 @@ import json
 import logging
 import os
 import sqlite3
+import socket
+import ssl
 import threading
 import time
 import urllib.error
@@ -71,11 +73,37 @@ class Binance:
             with urllib.request.urlopen(request, timeout=20) as response:
                 result = json.loads(response.read(8_000_000), parse_float=str)
         except urllib.error.HTTPError as exc:
-            raise UpstreamError('上游 HTTP %s；将退避重试' % exc.code) from None
-        except Exception:
-            raise UpstreamError('上游连接失败或响应格式错误；请检查网络和代理') from None
+            message = '上游 HTTP %s' % exc.code
+            LOG.warning('Binance request failed endpoint=%s reason=%s', endpoint.split('?')[0], message)
+            raise UpstreamError(message) from None
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+            if isinstance(reason, socket.gaierror):
+                category = 'DNS 解析失败'
+            elif isinstance(reason, ssl.SSLCertVerificationError):
+                category = 'TLS 证书验证失败'
+            elif isinstance(reason, ssl.SSLError):
+                category = 'TLS 握手失败'
+            elif isinstance(reason, (socket.timeout, TimeoutError)):
+                category = '连接超时'
+            elif isinstance(reason, json.JSONDecodeError):
+                category = '上游响应不是有效 JSON'
+            elif isinstance(reason, ConnectionRefusedError):
+                category = '连接被拒绝'
+            else:
+                category = '上游连接或响应失败'
+            # Exception messages may contain proxy credentials or URLs. Record only type and errno.
+            detail = '%s (%s%s)' % (category, type(reason).__name__,
+                                  ', errno=%s' % reason.errno if isinstance(getattr(reason, 'errno', None), int) else '')
+            LOG.warning('Binance request failed endpoint=%s reason=%s', endpoint.split('?')[0], detail)
+            raise UpstreamError(detail + '；请检查容器网络和代理') from None
+        if not isinstance(result, dict):
+            LOG.warning('Binance request failed endpoint=%s reason=unexpected JSON root', endpoint.split('?')[0])
+            raise UpstreamError('上游响应格式错误：JSON 根节点不是对象')
         if result.get('success') is not True or str(result.get('code')) != '000000':
-            raise UpstreamError('上游业务错误 %s' % result.get('code', 'unknown'))
+            code = str(result.get('code', 'unknown'))[:40]
+            LOG.warning('Binance request failed endpoint=%s business_code=%s', endpoint.split('?')[0], code)
+            raise UpstreamError('上游业务错误 %s' % code)
         if result.get('data') is None:
             raise UpstreamError('上游缺少 data，未推进同步位置')
         return result['data']
