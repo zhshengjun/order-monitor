@@ -61,6 +61,18 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(json.loads(self.rows('events')[0]['body'])['notional'], '0.125')
         self.assertEqual(self.rows('outbox'), [])
 
+    def test_first_boot_only_fetches_recent_page(self):
+        self.api.orders = [order(x) for x in range(3000, 0, -1)]
+        self.baseline()
+        self.assertEqual(len(self.rows('records')), 20)
+        self.assertEqual(self.api.calls, [('order', 1), ('transfer', 1)])
+        self.assertEqual(self.rows('outbox'), [])
+        self.api.calls.clear()
+        self.api.orders.insert(0, order(3001))
+        self.monitor.poll(PID)
+        self.assertEqual(self.api.calls, [('order', 1), ('transfer', 1)])
+        self.assertEqual(len([r for r in self.rows('events') if not r['historical']]), 1)
+
     def test_restart_deduplicates(self):
         self.baseline()
         Monitor(Store(self.store.path), self.api).poll(PID)

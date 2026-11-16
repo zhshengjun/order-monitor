@@ -467,7 +467,11 @@ def main():
     token = os.environ.get('ADMIN_TOKEN', '')
     if len(token) < 16:
         raise SystemExit('请设置至少 16 位的 ADMIN_TOKEN 环境变量')
-    store = Store(os.environ.get('DATABASE_PATH', str(ROOT / 'data' / 'monitor.db')))
+    database = os.environ.get('DATABASE_PATH', str(ROOT / 'data' / 'monitor.db'))
+    try:
+        store = Store(database)
+    except (OSError, sqlite3.Error) as exc:
+        raise SystemExit('数据库初始化失败：%s；请检查数据目录及文件写权限。%s: %s' % (database, type(exc).__name__, exc)) from None
     monitor = Monitor(store)
     worker = threading.Thread(target=monitor.run, daemon=True)
     worker.start()
