@@ -1,0 +1,18 @@
+services:
+  order-monitor:
+    build: .
+    image: ${MONITOR_IMAGE:-order-monitor:local}
+    restart: unless-stopped
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${PORT:-8080}:8080"
+    environment:
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?Please set ADMIN_TOKEN in .env}
+      BINANCE_BASE_URL: ${BINANCE_BASE_URL:-https://www.binance.com}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      NO_PROXY: localhost,127.0.0.1
+      COOKIE_SECURE: ${COOKIE_SECURE:-0}
+    volumes:
+      - monitor-data:/data
+volumes:
+  monitor-data:
