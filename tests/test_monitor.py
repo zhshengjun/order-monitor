@@ -28,10 +28,10 @@ class FakeAPI:
             raise UpstreamError('test upstream error')
         return {'leadPortfolioId': pid, 'nickname': '熬鹰资本', 'marginBalance': self.balance, 'initInvestAsset': 'USDT'}
 
-    def history(self, pid, kind, page):
+    def history(self, pid, kind, page, page_size=20):
         self.calls.append((kind, page))
         rows = self.orders if kind == 'order' else self.transfers
-        return {'total': len(rows), 'list': copy.deepcopy(rows[(page - 1) * 20:page * 20])}
+        return {'total': len(rows), 'list': copy.deepcopy(rows[(page - 1) * page_size:page * page_size])}
 
 
 class MonitorTests(unittest.TestCase):
@@ -93,6 +93,18 @@ class MonitorTests(unittest.TestCase):
         self.monitor.poll(PID)
         self.assertTrue(json.loads(self.rows('events')[-1]['body'])['updated'])
         self.assertEqual(len(self.rows('records')), 1)
+        self.assertEqual(len(self.rows('events')), 1)
+        self.assertEqual(self.rows('outbox'), [])
+
+    def test_page_size_five_catches_more_than_one_page(self):
+        self.baseline()
+        self.api.orders = [order(x) for x in range(113, 98, -1)]
+        self.monitor.poll(PID)
+        self.assertEqual(len([e for e in self.rows('events') if not e['historical']]), 13)
+        self.assertIn(('order', 3), self.api.calls)
+        self.assertEqual(len(self.rows('outbox')), 26)
+        self.monitor.poll(PID)
+        self.assertEqual(len(self.rows('outbox')), 26)
 
     def test_backfill_multiple_pages_no_historical_alert(self):
         self.baseline()
@@ -169,7 +181,7 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(self.store.settings()['telegram_token'], 'test-token')
         self.store.save_settings({'telegram_enabled': False, 'clear_telegram_token': True})
         self.assertEqual(self.store.settings()['telegram_token'], '')
-        for patch_data in [{'interval': 0}, {'balance_threshold': '-1'}, {'balance_threshold': 'NaN'}, {'bark_url': 'http://example.com'}]:
+        for patch_data in [{'page_size': 0}, {'page_size': 21}, {'interval': 0}, {'balance_threshold': '-1'}, {'balance_threshold': 'NaN'}, {'bark_url': 'http://example.com'}]:
             with self.assertRaises(ValueError):
                 self.store.save_settings(patch_data)
 

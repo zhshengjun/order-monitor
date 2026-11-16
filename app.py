@@ -18,7 +18,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parent
 API_PATH = '/bapi/futures/v1/friendly/future/copy-trade/'
-DEFAULTS = {'interval': 60, 'balance_threshold': '0', 'telegram_enabled': False,
+DEFAULTS = {'interval': 60, 'page_size': 5, 'balance_threshold': '0', 'telegram_enabled': False,
             'telegram_token': '', 'telegram_chat': '', 'bark_enabled': False,
             'bark_url': 'https://api.day.app', 'bark_key': ''}
 SECRETS = ('telegram_token', 'bark_key')
@@ -92,9 +92,9 @@ class Binance:
             'timeRange': '30D', 'apiKeyOnly': 'false', 'pageNumber': page, 'portfolioType': 'ALL',
             'hideFull': 'false', 'nickname': nickname, 'pageSize': 20})
 
-    def history(self, pid, kind, page):
+    def history(self, pid, kind, page, page_size=20):
         name = 'order-history' if kind == 'order' else 'transfer-history'
-        data = self.call('lead-portfolio/' + name, {'portfolioId': pid, 'pageSize': 20, 'pageNumber': page})
+        data = self.call('lead-portfolio/' + name, {'portfolioId': pid, 'pageSize': page_size, 'pageNumber': page})
         if not isinstance(data, dict) or not isinstance(data.get('list'), list) or 'total' not in data:
             raise UpstreamError('历史响应结构异常，未推进同步位置')
         for row in data['list']:
@@ -160,6 +160,9 @@ class Store:
             settings['interval'] = int(settings['interval'])
             if not 10 <= settings['interval'] <= 86400:
                 raise ValueError('监听频率必须为 10～86400 秒')
+            settings['page_size'] = int(settings['page_size'])
+            if not 1 <= settings['page_size'] <= 20:
+                raise ValueError('轮询每页数量必须为 1～20 条')
             settings['balance_threshold'] = decimal_text(settings['balance_threshold'])
             if number(settings['balance_threshold']) < 0:
                 raise ValueError('余额通知阈值不能为负数')
@@ -215,10 +218,11 @@ class Monitor:
         with self.store.db() as db:
             stamps = db.execute('SELECT MAX(stamp) FROM records WHERE target=? AND kind=?', (pid, kind)).fetchone()
             watermark = stamps[0]
+            page_size = self.store.settings(db)['page_size'] if initialized else 20
         rows = []
         time_key = 'orderTime' if kind == 'order' else 'time'
         for page in range(1, 51):
-            data = self.api.history(pid, kind, page)
+            data = self.api.history(pid, kind, page, page_size)
             batch = data['list']
             rows.extend(batch)
             if not initialized:
@@ -227,7 +231,7 @@ class Monitor:
                 return rows
             if watermark is not None and min(int(x[time_key]) for x in batch) < watermark:
                 return rows
-        raise UpstreamError('新增记录超过 1000 条，未推进同步位置；需检查历史缺口')
+        raise UpstreamError('新增记录超过 %s 条，未推进同步位置；可增加每页数量后重试' % (50 * page_size))
 
     def poll(self, pid):
         with self.lock:
@@ -253,7 +257,14 @@ class Monitor:
                             body = dict(row)
                             if kind == 'order':
                                 body.update(direction=direction(row), notional=decimal_text(number(row['executedQty']) * number(row['avgPrice'])), updated=bool(previous))
-                            historical = first or (not previous and watermark is not None and stamp < watermark)
+                            if previous:
+                                # Refresh the original display row; never enqueue an update as a new order.
+                                candidates = db.execute('SELECT id,body FROM events WHERE target=? AND kind=? AND stamp=?', (pid, kind, stamp)).fetchall()
+                                for event in candidates:
+                                    if identity(kind, json.loads(event['body'])) == key:
+                                        db.execute('UPDATE events SET body=? WHERE id=?', (dumps(body), event['id']))
+                                continue
+                            historical = first or (watermark is not None and stamp < watermark)
                             self.store.event(db, pid, detail['nickname'], kind, body, stamp, historical, settings)
                     balance = decimal_text(detail['marginBalance'])
                     if not first and number(balance) != number(target['balance']):
