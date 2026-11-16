@@ -487,6 +487,28 @@ def handler_factory(store, monitor, token):
                     monitor.add(data.get('id'))
                 elif self.path == '/api/toggle':
                     monitor.toggle(str(data.get('id')), data.get('enabled'))
+                elif self.path == '/api/test-notification':
+                    channel = data.get('channel')
+                    if channel not in ('telegram', 'bark'):
+                        raise ValueError('未知通知渠道')
+                    settings = store.settings()
+                    keys = ('telegram_token', 'telegram_chat') if channel == 'telegram' else ('bark_url', 'bark_key')
+                    for key in keys:
+                        value = data.get(key, '')
+                        if not isinstance(value, str) or len(value) > 1000:
+                            raise ValueError('通知配置格式错误')
+                        if value:
+                            settings[key] = value
+                    if channel == 'telegram' and not (settings['telegram_token'] and settings['telegram_chat']):
+                        raise ValueError('请填写 Telegram Token 和 Chat ID')
+                    if channel == 'bark':
+                        url = urllib.parse.urlsplit(settings['bark_url'])
+                        if url.scheme != 'https' or not url.hostname or url.username or url.query or url.fragment or not settings['bark_key']:
+                            raise ValueError('请填写 HTTPS Bark 服务地址和 Device Key')
+                    try:
+                        send_notification(channel, settings, '订单监听 · 测试通知', '通知配置正常，这是一条测试消息。')
+                    except Exception:
+                        raise ValueError('测试发送失败，请检查通知配置及服务器网络') from None
                 elif self.path == '/api/settings':
                     store.save_settings(data)
                 else:
