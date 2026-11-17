@@ -640,7 +640,8 @@ def handler_factory(store, monitor, token):
                             row['result']['orderId']=str(row['result']['orderId'])
                     return self.reply({'list':rows,'total':total,'page':page})
                 if parsed.path == '/api/events':
-                    page = max(1, int(query.get('page', ['1'])[0]))
+                    page = max(1, min(100000, int(query.get('page', ['1'])[0])))
+                    limit = max(1, min(50, int(query.get('limit', ['50'])[0])))
                     target, kind = query.get('target', [''])[0], query.get('kind', [''])[0]
                     where, args = ("kind IN ('order','transfer')" if kind == 'leader' else "kind != 'balance'"), []
                     if kind == 'leader': kind = ''
@@ -650,7 +651,7 @@ def handler_factory(store, monitor, token):
                             args.append(value)
                     with store.db() as db:
                         total = db.execute('SELECT COUNT(*) FROM events WHERE ' + where, args).fetchone()[0]
-                        rows = [dict(r) for r in db.execute('SELECT * FROM events WHERE ' + where + ' ORDER BY stamp DESC,id DESC LIMIT 50 OFFSET ?', args + [(page - 1) * 50])]
+                        rows = [dict(r) for r in db.execute('SELECT * FROM events WHERE ' + where + ' ORDER BY stamp DESC,id DESC LIMIT ? OFFSET ?', args + [limit, (page - 1) * limit])]
                     for row in rows:
                         row['body'] = json.loads(row['body'])
                         if row['kind'] == 'order':

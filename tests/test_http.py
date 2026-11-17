@@ -89,6 +89,15 @@ class HTTPTests(unittest.TestCase):
         status,data=self.request('/api/events?target=separate&kind=leader')
         self.assertEqual(status,200);self.assertEqual({x['kind'] for x in data['list']},{'order','transfer'})
 
+    def test_leader_record_pages_use_ten(self):
+        with self.store.db() as db:
+            for i in range(21):
+                db.execute('INSERT INTO events(target,name,kind,body,stamp,historical) VALUES(?,?,?,?,?,0)',('pages','leader','transfer','{}',i))
+        status,first=self.request('/api/events?target=pages&kind=leader&limit=10&page=1')
+        self.assertEqual(status,200);self.assertEqual(first['total'],21);self.assertEqual(len(first['list']),10)
+        _,third=self.request('/api/events?target=pages&kind=leader&limit=10&page=3')
+        self.assertEqual(len(third['list']),1)
+
     def test_auth_required(self):
         self.assertEqual(self.request('/api/state', authenticated=False)[0], 401)
         self.assertEqual(self.request('/api/targets', {'id': '123'}, authenticated=False)[0], 401)
