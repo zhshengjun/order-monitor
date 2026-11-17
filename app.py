@@ -543,9 +543,19 @@ class Monitor:
                     if not isinstance(balances,list): raise ValueError('账户余额响应格式错误')
                     usdt=next((asset for asset in balances if asset.get('asset')=='USDT'),None)
                     quote=client.quote(row['symbol'])
-                    params=plan(row,task['action'],task['before_qty'],old['quantity'] if old else '0',task['lead_balance'],balances,client.positions(),client.mode(),quote,client.rules())
+                    mark_price = leverage = None
+                    if task['action'] == 'open':
+                        mark = client.mark_price(row['symbol'])
+                        configs = client.symbol_config(row['symbol'])
+                        if not isinstance(mark, dict) or mark.get('symbol') != row['symbol'] or not isinstance(configs, list):
+                            raise ValueError('标记价格或杠杆配置响应无效')
+                        config = next((c for c in configs if isinstance(c,dict) and c.get('symbol') == row['symbol']), None)
+                        if not config: raise ValueError('未获取到交易对杠杆配置')
+                        mark_price, leverage = mark.get('markPrice'), config.get('leverage')
+                    params=plan(row,task['action'],task['before_qty'],old['quantity'] if old else '0',task['lead_balance'],balances,client.positions(),client.mode(),quote,client.rules(),mark_price=mark_price,leverage=leverage)
                     price=quote['askPrice'] if row['side']=='BUY' else quote['bidPrice']
                 except (ValueError,ExchangeError,KeyError,InvalidOperation) as exc:
+                    LOG.warning('跟单预检查失败 account=%s symbol=%s: %s', task['account_id'], row.get('symbol',''), str(exc)[:200])
                     with self.store.db() as db:
                         db.execute("UPDATE copy_tasks SET state='skipped',error=? WHERE id=?",(str(exc)[:250],task['id']))
                         self.copy_notice(db,task,'%s 跟单跳过：%s' % (row['symbol'],str(exc)[:200]))
@@ -556,15 +566,19 @@ class Monitor:
                     db.execute('INSERT OR REPLACE INTO copy_task_audit(task_id,balance_time,asset,wallet_balance,available_balance,lead_balance,reference_price,planned_quantity) VALUES(?,?,?,?,?,?,?,?)', (task['id'],balance_time,'USDT',str(usdt['balance']) if usdt and 'balance' in usdt else None,str(usdt['availableBalance']) if usdt and 'availableBalance' in usdt else None,task['lead_balance'],str(price),params['quantity']))
                     db.execute("UPDATE copy_tasks SET state='submitted',quantity=? WHERE id=? AND state='pending'",(params['quantity'],task['id']))
                 try: result=client.place(params)
-                except ExchangeError:
+                except ExchangeError as exc:
+                    reason=str(exc)[:200]
+                    LOG.warning('跟单提交结果未知 account=%s symbol=%s: %s', task['account_id'], row['symbol'], reason)
                     with self.store.db() as db:
-                        db.execute("UPDATE copy_tasks SET error='下单结果未知，等待查询确认',next_check=strftime('%s','now')+15 WHERE id=?",(task['id'],))
-                        self.copy_notice(db,task,'%s 下单结果未知，正在查询订单状态' % row['symbol'])
+                        db.execute("UPDATE copy_tasks SET error=?,next_check=strftime('%s','now')+15 WHERE id=?",('下单结果未知，等待查询确认：'+reason,task['id']))
+                        self.copy_notice(db,task,'%s 下单结果未知，正在查询订单状态：%s' % (row['symbol'],reason))
                     return
             else:
                 try: result=client.order(row['symbol'],task['client_id'])
-                except ExchangeError:
-                    with self.store.db() as db: db.execute("UPDATE copy_tasks SET error='订单结果未知，等待查询确认',next_check=strftime('%s','now')+15 WHERE id=?",(task['id'],))
+                except ExchangeError as exc:
+                    reason=str(exc)[:200]
+                    LOG.warning('跟单订单查询失败 account=%s symbol=%s: %s', task['account_id'], row['symbol'], reason)
+                    with self.store.db() as db: db.execute("UPDATE copy_tasks SET error=?,next_check=strftime('%s','now')+15 WHERE id=?",('订单结果未知，等待查询确认：'+reason,task['id']))
                     return
             status=result.get('status')
             if status not in ('FILLED','CANCELED','EXPIRED','REJECTED','EXPIRED_IN_MATCH'):
@@ -780,6 +794,14 @@ def handler_factory(store, monitor, token):
                     for key in SECRETS:
                         settings[key + '_configured'] = bool(settings.pop(key))
                     return self.reply({'targets': targets, 'settings': settings, 'notifications': counts, 'notification_errors': errors, 'futures_accounts': accounts, 'copy_bindings': bindings, 'virtual_sessions': virtual_sessions, 'virtual_positions': virtual_positions, 'virtual_events': virtual_events, 'copy_tasks': copy_tasks, 'copy_live': copy_live})
+                if parsed.path == '/api/futures-network':
+                    proxies = urllib.request.getproxies()
+                    via_proxy = bool(proxies.get('https')) and not urllib.request.proxy_bypass('fapi.binance.com')
+                    try:
+                        FuturesClient('', '').request('/fapi/v1/ping')
+                        return self.reply({'ok': True, 'proxy_enabled': via_proxy})
+                    except ExchangeError as exc:
+                        return self.reply({'ok': False, 'proxy_enabled': via_proxy, 'error': str(exc)})
                 if parsed.path == '/api/futures-snapshot':
                     account_id = int(query.get('account_id', ['0'])[0])
                     with store.db() as db:

@@ -139,6 +139,17 @@ class HTTPTests(unittest.TestCase):
             with urllib.request.urlopen(self.url + path) as response:
                 self.assertEqual(response.headers.get('Cache-Control'), 'no-cache')
 
+    def test_futures_network_diagnostic_is_authenticated_and_sanitized(self):
+        from copy_executor import ExchangeError
+        self.assertEqual(self.request('/api/futures-network',authenticated=False)[0],401)
+        with patch('app.FuturesClient.request',return_value={}), patch('app.urllib.request.getproxies',return_value={'https':'http://private-user:private-pass@proxy:123'}), patch('app.urllib.request.proxy_bypass',return_value=False):
+            status,result=self.request('/api/futures-network')
+        self.assertEqual(status,200);self.assertTrue(result['ok']);self.assertTrue(result['proxy_enabled'])
+        self.assertNotIn('private-pass',json.dumps(result))
+        with patch('app.FuturesClient.request',side_effect=ExchangeError('HTTP 451; 接口 /fapi/v1/ping')), patch('app.urllib.request.getproxies',return_value={}):
+            status,result=self.request('/api/futures-network')
+        self.assertEqual(status,200);self.assertFalse(result['ok']);self.assertIn('HTTP 451',result['error'])
+
     def test_auth_required(self):
         self.assertEqual(self.request('/api/state', authenticated=False)[0], 401)
         self.assertEqual(self.request('/api/targets', {'id': '123'}, authenticated=False)[0], 401)

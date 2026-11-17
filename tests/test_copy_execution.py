@@ -18,6 +18,8 @@ class FakeExchange:
     def mode(self): return {'dualSidePosition':False}
     def quote(self,s): return QUOTE
     def rules(self): return RULES
+    def mark_price(self,s): return {'symbol':s,'markPrice':'100'}
+    def symbol_config(self,s): return [{'symbol':s,'leverage':10}]
     def place(self,p): self.calls.append(('place',p)); return dict(self.result)
     def order(self,s,c): self.calls.append(('query',c)); return dict(self.result)
 
@@ -79,6 +81,23 @@ class CopyExecutionTests(unittest.TestCase):
             self.monitor.execute_copy()
         self.assertEqual([x[0] for x in FakeExchange.calls],['query'])
         self.assertEqual(self.rows('SELECT * FROM copy_tasks')[0]['state'],'filled')
+    def test_http_451_precheck_reports_failed_interface_without_placing(self):
+        row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
+        reason='HTTP 451; code 0; 接口 /fapi/v3/balance；请检查容器代理与合约 API 出口'
+        with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'balance',side_effect=ExchangeError(reason)):
+            self.monitor.execute_copy()
+        task=self.rows('SELECT state,error FROM copy_tasks')[0]
+        self.assertEqual(task['state'],'skipped');self.assertIn('/fapi/v3/balance',task['error'])
+        self.assertEqual(FakeExchange.calls,[])
+
+    def test_http_451_on_submit_keeps_pending_reconciliation(self):
+        row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
+        with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'place',side_effect=ExchangeError('HTTP 451; 接口 /fapi/v1/order')) as place:
+            self.monitor.execute_copy(); self.monitor.execute_copy()
+        task=self.rows('SELECT state,error FROM copy_tasks')[0]
+        self.assertEqual(task['state'],'submitted');self.assertIn('/fapi/v1/order',task['error'])
+        self.assertEqual(place.call_count,1)
+
     def test_close_no_position_is_not_placed(self):
         row=order(101,'1');row['side']='SELL';row['avgPrice']='100'
         with self.assertRaisesRegex(ValueError,'没有对应方向持仓'):
@@ -91,11 +110,55 @@ class CopyExecutionTests(unittest.TestCase):
 
     def test_price_guard_and_hedge(self):
         row=order(101,'1');row['avgPrice']='100'
-        with self.assertRaisesRegex(ValueError,'0.5%'):
-            plan(row,'open','0','0','100',BALANCES,[],{'dualSidePosition':False},{'bidPrice':'100','askPrice':'101'},RULES)
+        with self.assertRaisesRegex(ValueError,'1%'):
+            plan(row,'open','0','0','100',BALANCES,[],{'dualSidePosition':False},{'bidPrice':'100','askPrice':'101.01'},RULES)
         row['side']='SELL'
         p=plan(row,'close','1','1','100',BALANCES,[{'symbol':'BTCUSDT','positionSide':'LONG','positionAmt':'1'}],{'dualSidePosition':True},QUOTE,RULES)
         self.assertEqual(p['positionSide'],'LONG');self.assertNotIn('reduceOnly',p)
+
+    def test_minimum_order_flows_through_executor_without_changing_leverage(self):
+        row=order(101,'0.001');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
+        with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'result',{'status':'FILLED','executedQty':'0.05','orderId':1}):
+            self.monitor.execute_copy()
+        self.assertEqual(FakeExchange.calls[0][0],'place')
+        self.assertEqual(FakeExchange.calls[0][1]['quantity'],'0.050')
+        self.assertEqual(self.rows('SELECT state FROM copy_tasks')[0]['state'],'filled')
+        self.assertEqual(self.rows('SELECT quantity FROM copied_positions')[0]['quantity'],'0.05')
+
+    def test_small_open_uses_minimum_valid_market_order(self):
+        row=order(101,'0.001');row['avgPrice']='100'
+        result=plan(row,'open','0','0','1000',[{'asset':'USDT','availableBalance':'10'}],[],{'dualSidePosition':False},QUOTE,RULES,mark_price='100',leverage='10')
+        self.assertEqual(result['quantity'],'0.050')
+
+    def test_small_close_never_exceeds_owned_position(self):
+        row=order(101,'0.01');row['avgPrice']='100';row['side']='SELL'
+        positions=[{'symbol':'BTCUSDT','positionSide':'BOTH','positionAmt':'0.002'}]
+        result=plan(row,'close','1','0.002','100',BALANCES,positions,{'dualSidePosition':False},QUOTE,RULES)
+        self.assertEqual(result['quantity'],'0.001')
+        with self.assertRaisesRegex(ValueError,'可平仓'):
+            plan(row,'close','1','0.0005','100',BALANCES,positions,{'dualSidePosition':False},QUOTE,RULES)
+
+    def test_minimum_order_checks_actual_leverage_and_mark_price(self):
+        row=order(101,'0.001');row['avgPrice']='100'
+        with self.assertRaisesRegex(ValueError,'可用余额'):
+            plan(row,'open','0','0','1000',[{'asset':'USDT','availableBalance':'0.4'}],[],{'dualSidePosition':False},QUOTE,RULES,mark_price='99',leverage='10')
+        result=plan(row,'open','0','0','1000',[{'asset':'USDT','availableBalance':'1'}],[],{'dualSidePosition':False},QUOTE,RULES,mark_price='99',leverage='10')
+        self.assertEqual(result['quantity'],'0.051')
+
+    def test_minimum_open_is_skipped_when_it_exceeds_maximum(self):
+        import copy
+        rules=copy.deepcopy(RULES)
+        rules['symbols'][0]['filters'][0]['maxQty']='0.01'
+        row=order(101,'0.001');row['avgPrice']='100'
+        with self.assertRaisesRegex(ValueError,'超过最大数量'):
+            plan(row,'open','0','0','1000',BALANCES,[],{'dualSidePosition':False},QUOTE,rules,mark_price='100',leverage='10')
+
+    def test_missing_current_leverage_skips_without_order(self):
+        row=order(101,'0.001');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
+        with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'symbol_config',return_value=[]):
+            self.monitor.execute_copy()
+        self.assertEqual(FakeExchange.calls,[])
+        self.assertIn('杠杆配置',self.rows('SELECT state,error FROM copy_tasks')[0]['error'])
 
     def test_conflicting_signal_stops_copy_before_dispatch(self):
         row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
@@ -106,6 +169,18 @@ class CopyExecutionTests(unittest.TestCase):
         self.assertEqual(FakeExchange.calls,[])
 
 class FuturesTransportTests(unittest.TestCase):
+    def test_http_451_identifies_endpoint_without_response_body(self):
+        import io, urllib.error
+        from copy_executor import FuturesClient
+        error=urllib.error.HTTPError('https://example.invalid/secret',451,'denied',{},io.BytesIO(b'{"code":0,"msg":"private-secret"}'))
+        with patch('copy_executor.urllib.request.urlopen',side_effect=error):
+            with self.assertRaises(ExchangeError) as caught:
+                FuturesClient('key','secret').balance()
+        self.assertIn('HTTP 451',str(caught.exception))
+        self.assertIn('/fapi/v3/balance',str(caught.exception))
+        self.assertNotIn('private-secret',str(caught.exception))
+        self.assertNotIn('example.invalid',str(caught.exception))
+
     def test_market_order_is_signed_post(self):
         import hashlib,hmac,urllib.parse
         from copy_executor import FuturesClient
