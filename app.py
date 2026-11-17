@@ -142,14 +142,14 @@ class FuturesAccount:
         self.api_key, self.api_secret = api_key, api_secret
 
     def get(self, path):
-        if path not in ('/fapi/v3/balance', '/fapi/v3/positionRisk', '/fapi/v2/account'):
+        if path not in ('/fapi/v3/balance', '/fapi/v3/positionRisk', '/fapi/v2/account', '/fapi/v1/symbolConfig'):
             raise ValueError('不支持的查询')
         query = urllib.parse.urlencode({'timestamp': int(time.time() * 1000), 'recvWindow': 5000})
         signature = hmac.new(self.api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
         request = urllib.request.Request('https://fapi.binance.com' + path + '?' + query + '&signature=' + signature,
             headers={'X-MBX-APIKEY': self.api_key})
         try:
-            with urllib.request.urlopen(request, timeout=20) as response:
+            with urllib.request.urlopen(request, timeout=5 if path == '/fapi/v1/symbolConfig' else 20) as response:
                 result = json.loads(response.read(4000000), parse_float=str)
         except urllib.error.HTTPError as exc:
             try:
@@ -719,10 +719,18 @@ def handler_factory(store, monitor, token):
                     if not account:
                         raise ValueError('账号不存在')
                     client = FuturesAccount(account['api_key'], account['api_secret'])
-                    with ThreadPoolExecutor(max_workers=2) as pool:
+                    with ThreadPoolExecutor(max_workers=3) as pool:
                         balances_future = pool.submit(client.get, '/fapi/v3/balance')
                         positions_future = pool.submit(client.get, '/fapi/v3/positionRisk')
+                        config_future = pool.submit(client.get, '/fapi/v1/symbolConfig')
                         balances, positions = balances_future.result(), positions_future.result()
+                        try:
+                            configs = config_future.result()
+                            leverage = {c['symbol']: c['leverage'] for c in configs if isinstance(c, dict) and isinstance(c.get('symbol'), str) and str(c.get('leverage', '')).isdigit() and int(c['leverage']) > 0}
+                        except Exception:
+                            LOG.warning('账户 %s 杠杆配置查询失败', account_id)
+                            leverage = {}
+                    positions = [{**p, 'leverage': leverage.get(p.get('symbol'))} for p in positions]
                     return self.reply({'balances': balances, 'positions': positions, 'queried_at': int(time.time() * 1000)})
                 if parsed.path == '/api/copy-tasks':
                     account_id=int(query.get('account_id', ['0'])[0])

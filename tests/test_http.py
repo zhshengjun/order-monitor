@@ -99,6 +99,28 @@ class HTTPTests(unittest.TestCase):
         _,third=self.request('/api/events?target=pages&kind=leader&limit=10&page=3')
         self.assertEqual(len(third['list']),1)
 
+    def test_snapshot_shows_exchange_leverage_and_keeps_positions_on_config_error(self):
+        from app import UpstreamError
+        with self.store.db() as db:
+            account = db.execute("INSERT INTO futures_accounts(name,api_key,api_secret) VALUES('leverage-test','key','secret')").lastrowid
+        class FakeFutures:
+            fail = False
+            def __init__(self, *args): pass
+            def get(self, path):
+                if path.endswith('/balance'): return [{'asset': 'USDT', 'balance': '10'}]
+                if path.endswith('/positionRisk'): return [{'symbol': 'BTCUSDT', 'positionAmt': '0.1'}, {'symbol': 'ETHUSDT', 'positionAmt': '1'}]
+                if self.fail: raise UpstreamError('unavailable')
+                return [{'symbol': 'BTCUSDT', 'leverage': 20}, {'symbol': 'ETHUSDT', 'leverage': '5'}]
+        with patch('app.FuturesAccount', FakeFutures):
+            status, result = self.request('/api/futures-snapshot?account_id=%s' % account)
+            self.assertEqual(status, 200)
+            self.assertEqual([p['leverage'] for p in result['positions']], [20, '5'])
+            FakeFutures.fail = True
+            status, result = self.request('/api/futures-snapshot?account_id=%s' % account)
+            self.assertEqual(status, 200)
+            self.assertEqual([p['leverage'] for p in result['positions']], [None, None])
+            self.assertEqual(len(result['balances']), 1)
+
     def test_auth_required(self):
         self.assertEqual(self.request('/api/state', authenticated=False)[0], 401)
         self.assertEqual(self.request('/api/targets', {'id': '123'}, authenticated=False)[0], 401)
