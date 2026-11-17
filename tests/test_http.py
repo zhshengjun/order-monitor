@@ -134,6 +134,11 @@ class HTTPTests(unittest.TestCase):
         self.assertLess(ids.index(b),ids.index(a))
         self.assertEqual(self.request('/api/display-order',{**move,'relative_id':'999999'})[0],400)
 
+    def test_static_resources_revalidate_after_updates(self):
+        for path in ('/', '/app.js?v=20261117-2', '/style.css?v=20261117-2'):
+            with urllib.request.urlopen(self.url + path) as response:
+                self.assertEqual(response.headers.get('Cache-Control'), 'no-cache')
+
     def test_auth_required(self):
         self.assertEqual(self.request('/api/state', authenticated=False)[0], 401)
         self.assertEqual(self.request('/api/targets', {'id': '123'}, authenticated=False)[0], 401)

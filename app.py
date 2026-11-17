@@ -753,6 +753,7 @@ def handler_factory(store, monitor, token):
                 self.send_response(200)
                 self.send_header('Content-Type', {'html': 'text/html; charset=utf-8', 'js': 'text/javascript; charset=utf-8', 'css': 'text/css; charset=utf-8'}[path.rsplit('.', 1)[1]])
                 self.send_header('Content-Length', str(len(raw)))
+                self.send_header('Cache-Control', 'no-cache')
                 self.send_header('X-Content-Type-Options', 'nosniff')
                 self.send_header('Content-Security-Policy', "default-src 'self'; img-src 'self' https:; style-src 'self'; script-src 'self'; frame-ancestors 'none'; base-uri 'none'")
                 self.end_headers()
