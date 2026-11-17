@@ -11,7 +11,7 @@ BALANCES=[{'asset':'USDT','availableBalance':'100'}]
 QUOTE={'bidPrice':'99.9','askPrice':'100.1'}
 class FakeExchange:
     calls=[]
-    result={'status':'FILLED','executedQty':'1.000','orderId':1}
+    result={'status':'FILLED','executedQty':'0.999','orderId':1}
     def __init__(self,*args): pass
     def balance(self): return BALANCES
     def positions(self): return [{'symbol':'BTCUSDT','positionSide':'BOTH','positionAmt':'1'}]
@@ -38,7 +38,12 @@ class CopyExecutionTests(unittest.TestCase):
         with patch('app.FuturesClient',FakeExchange): self.monitor.execute_copy();self.monitor.execute_copy()
         self.assertEqual([x[0] for x in FakeExchange.calls],['place'])
         self.assertEqual(self.rows('SELECT * FROM copy_tasks')[0]['state'],'filled')
-        self.assertEqual(self.rows('SELECT * FROM copied_positions')[0]['quantity'],'1')
+        self.assertEqual(self.rows('SELECT * FROM copied_positions')[0]['quantity'],'0.999')
+        audit=self.rows('SELECT * FROM copy_task_audit')[0]
+        self.assertEqual(audit['available_balance'],'100')
+        self.assertEqual(audit['lead_balance'],'100.00')
+        self.assertEqual(audit['reference_price'],'100.1')
+        self.assertEqual(audit['planned_quantity'],'0.999')
     def test_open_then_proportional_close_uses_actual_position(self):
         row=order(101,'2');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
         with patch('app.FuturesClient',FakeExchange):
@@ -50,7 +55,7 @@ class CopyExecutionTests(unittest.TestCase):
         self.assertEqual(FakeExchange.calls[-1][1]['quantity'],'0.500')
         self.assertEqual(FakeExchange.calls[-1][1]['reduceOnly'],'true')
         self.assertEqual(self.rows('SELECT * FROM copied_positions')[0]['quantity'],'0.5')
-        FakeExchange.result={'status':'FILLED','executedQty':'1.000','orderId':1}
+        FakeExchange.result={'status':'FILLED','executedQty':'0.999','orderId':1}
 
     def test_timeout_is_queried_never_resent(self):
         row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)

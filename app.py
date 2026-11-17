@@ -210,6 +210,10 @@ class Store:
               lead_balance TEXT NOT NULL, client_id TEXT NOT NULL UNIQUE, state TEXT NOT NULL DEFAULT 'pending',
               quantity TEXT, result TEXT, error TEXT NOT NULL DEFAULT '', created INTEGER NOT NULL, next_check REAL NOT NULL DEFAULT 0,
               UNIQUE(account_id,target_id,order_key));
+            CREATE TABLE IF NOT EXISTS copy_task_audit (
+              task_id INTEGER PRIMARY KEY, balance_time INTEGER NOT NULL, asset TEXT NOT NULL,
+              wallet_balance TEXT, available_balance TEXT, lead_balance TEXT NOT NULL,
+              reference_price TEXT NOT NULL, planned_quantity TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS copied_positions (
               account_id INTEGER NOT NULL, target_id TEXT NOT NULL, symbol TEXT NOT NULL,
               position_side TEXT NOT NULL, quantity TEXT NOT NULL,
@@ -462,7 +466,13 @@ class Monitor:
                 try:
                     with self.store.db() as db:
                         old=db.execute('SELECT quantity FROM copied_positions WHERE account_id=? AND target_id=? AND symbol=? AND position_side=?',(task['account_id'],task['target_id'],row['symbol'],row['positionSide'])).fetchone()
-                    params=plan(row,task['action'],task['before_qty'],old['quantity'] if old else '0',task['lead_balance'],client.balance(),client.positions(),client.mode(),client.quote(row['symbol']),client.rules())
+                    balances=client.balance()
+                    balance_time=int(time.time()*1000)
+                    if not isinstance(balances,list): raise ValueError('账户余额响应格式错误')
+                    usdt=next((asset for asset in balances if asset.get('asset')=='USDT'),None)
+                    quote=client.quote(row['symbol'])
+                    params=plan(row,task['action'],task['before_qty'],old['quantity'] if old else '0',task['lead_balance'],balances,client.positions(),client.mode(),quote,client.rules())
+                    price=quote['askPrice'] if row['side']=='BUY' else quote['bidPrice']
                 except (ValueError,ExchangeError,KeyError,InvalidOperation) as exc:
                     with self.store.db() as db:
                         db.execute("UPDATE copy_tasks SET state='skipped',error=? WHERE id=?",(str(exc)[:250],task['id']))
@@ -470,7 +480,9 @@ class Monitor:
                     return
                 params['newClientOrderId']=task['client_id']
                 # Persist intent before touching the exchange, so process crashes cannot duplicate a POST.
-                with self.store.db() as db: db.execute("UPDATE copy_tasks SET state='submitted',quantity=? WHERE id=? AND state='pending'",(params['quantity'],task['id']))
+                with self.store.db() as db:
+                    db.execute('INSERT OR REPLACE INTO copy_task_audit(task_id,balance_time,asset,wallet_balance,available_balance,lead_balance,reference_price,planned_quantity) VALUES(?,?,?,?,?,?,?,?)', (task['id'],balance_time,'USDT',str(usdt['balance']) if usdt and 'balance' in usdt else None,str(usdt['availableBalance']) if usdt and 'availableBalance' in usdt else None,task['lead_balance'],str(price),params['quantity']))
+                    db.execute("UPDATE copy_tasks SET state='submitted',quantity=? WHERE id=? AND state='pending'",(params['quantity'],task['id']))
                 try: result=client.place(params)
                 except ExchangeError:
                     with self.store.db() as db:
@@ -487,7 +499,12 @@ class Monitor:
                 with self.store.db() as db: db.execute("UPDATE copy_tasks SET next_check=strftime('%s','now')+15 WHERE id=?", (task['id'],))
                 return
             executed=number(result.get('executedQty','0'))
-            if executed<0: return
+            with self.store.db() as db:
+                saved=db.execute('SELECT quantity FROM copy_tasks WHERE id=?', (task['id'],)).fetchone()
+            if not saved or not saved['quantity'] or executed<0 or executed>number(saved['quantity']) or (result.get('symbol') and result['symbol']!=row['symbol']) or (result.get('clientOrderId') and result['clientOrderId']!=task['client_id']):
+                with self.store.db() as db:
+                    db.execute("UPDATE copy_tasks SET error='订单响应与提交信息不一致，等待人工核对',next_check=strftime('%s','now')+15 WHERE id=?",(task['id'],))
+                return
             from virtual_position import decimal_string
             with self.store.db() as db:
                 current=db.execute('SELECT state FROM copy_tasks WHERE id=?',(task['id'],)).fetchone()
@@ -590,7 +607,7 @@ def handler_factory(store, monitor, token):
                         virtual_sessions = [dict(r) for r in db.execute('SELECT account_id,target_id,active,started_at FROM virtual_sessions')]
                         virtual_positions = [dict(r) for r in db.execute("SELECT account_id,target_id,symbol,position_side,quantity FROM virtual_positions WHERE quantity != '0'")]
                         copy_live = [dict(r) for r in db.execute('SELECT account_id,target_id,enabled FROM copy_live')]
-                        copy_tasks = [dict(r) for r in db.execute("SELECT id,account_id,target_id,state,error,created,result,body FROM copy_tasks ORDER BY id DESC LIMIT 50")]
+                        copy_tasks = [dict(r) for r in db.execute("SELECT c.id,c.account_id,c.target_id,c.state,c.error,c.created,c.result,c.body,a.balance_time,a.asset,a.wallet_balance,a.available_balance,a.lead_balance,a.reference_price,a.planned_quantity FROM copy_tasks c LEFT JOIN copy_task_audit a ON a.task_id=c.id ORDER BY c.id DESC LIMIT 50")]
                         virtual_events = [dict(r) for r in db.execute("SELECT account_id,target_id,symbol,position_side,stamp,action,quantity FROM virtual_events WHERE action='unmatched_close' ORDER BY stamp DESC LIMIT 20")]
                         counts = dict(db.execute('SELECT status,COUNT(*) FROM outbox GROUP BY status').fetchall())
                         errors = [dict(r) for r in db.execute("SELECT channel,attempts,error FROM outbox WHERE status='pending' AND error!='' ORDER BY id DESC LIMIT 5")]
