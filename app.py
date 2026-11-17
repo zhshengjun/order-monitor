@@ -219,6 +219,9 @@ class Store:
             CREATE TABLE IF NOT EXISTS futures_accounts (
               id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
               api_key TEXT NOT NULL, api_secret TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS display_order (
+              kind TEXT NOT NULL, item_id TEXT NOT NULL, position INTEGER NOT NULL,
+              PRIMARY KEY(kind, item_id));
             CREATE TABLE IF NOT EXISTS copy_bindings (
               account_id INTEGER NOT NULL, target_id TEXT NOT NULL,
               PRIMARY KEY(account_id, target_id));
@@ -270,6 +273,38 @@ class Store:
                 yield db
         finally:
             db.close()
+
+    @staticmethod
+    def ordered_rows(db, kind):
+        if kind == 'targets':
+            query = "SELECT t.* FROM targets t LEFT JOIN display_order d ON d.kind='targets' AND d.item_id=t.id ORDER BY d.position IS NULL,d.position,t.name,t.id"
+        elif kind == 'accounts':
+            query = "SELECT a.id,a.name FROM futures_accounts a LEFT JOIN display_order d ON d.kind='accounts' AND d.item_id=CAST(a.id AS TEXT) ORDER BY d.position IS NULL,d.position,a.id"
+        else:
+            raise ValueError('排序类型无效')
+        return db.execute(query).fetchall()
+
+    @staticmethod
+    def ordered_ids(db, kind):
+        return [str(row['id']) for row in Store.ordered_rows(db, kind)]
+
+    def reorder(self, kind, item_id, relative_id, side):
+        if kind not in ('targets', 'accounts') or side not in ('before', 'after'):
+            raise ValueError('排序参数无效')
+        if not isinstance(item_id, str) or not isinstance(relative_id, str) or not item_id.isdigit() or not relative_id.isdigit() or len(item_id) > 30 or len(relative_id) > 30:
+            raise ValueError('排序对象无效')
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            ids = self.ordered_ids(db, kind)
+            if item_id not in ids or relative_id not in ids:
+                raise ValueError('排序对象不存在，请刷新后重试')
+            if item_id == relative_id:
+                return
+            ids.remove(item_id)
+            index = ids.index(relative_id) + (side == 'after')
+            ids.insert(index, item_id)
+            db.execute('DELETE FROM display_order WHERE kind=?', (kind,))
+            db.executemany('INSERT INTO display_order(kind,item_id,position) VALUES(?,?,?)', ((kind, value, i) for i, value in enumerate(ids)))
 
     def settings(self, db=None):
         if db is not None:
@@ -728,10 +763,10 @@ def handler_factory(store, monitor, token):
                 query = urllib.parse.parse_qs(parsed.query)
                 if parsed.path == '/api/state':
                     with store.db() as db:
-                        targets = [dict(r) for r in db.execute('SELECT * FROM targets ORDER BY name')]
+                        targets = [dict(row) for row in store.ordered_rows(db, 'targets')]
                         for row in targets:
                             row['detail'] = json.loads(row['detail'])
-                        accounts = [dict(r) for r in db.execute("SELECT id,name FROM futures_accounts ORDER BY id")]
+                        accounts = [dict(row) for row in store.ordered_rows(db, 'accounts')]
                         bindings = [dict(r) for r in db.execute('SELECT account_id,target_id FROM copy_bindings')]
                         virtual_sessions = [dict(r) for r in db.execute('SELECT account_id,target_id,active,started_at FROM virtual_sessions')]
                         virtual_positions = [dict(r) for r in db.execute("SELECT account_id,target_id,symbol,position_side,quantity FROM virtual_positions WHERE quantity != '0'")]
@@ -830,7 +865,9 @@ def handler_factory(store, monitor, token):
                     return self.reply({'error': '请先登录'}, 401)
                 if self.path == '/api/logout':
                     return self.reply({'ok': True}, cookie='om_session=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/')
-                if self.path == '/api/targets':
+                if self.path == '/api/display-order':
+                    store.reorder(data.get('kind'), data.get('id'), data.get('relative_id'), data.get('side'))
+                elif self.path == '/api/targets':
                     monitor.add(data.get('id'))
                 elif self.path == '/api/toggle':
                     monitor.toggle(str(data.get('id')), data.get('enabled'))

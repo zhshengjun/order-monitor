@@ -121,6 +121,19 @@ class HTTPTests(unittest.TestCase):
             self.assertEqual([p['leverage'] for p in result['positions']], [None, None])
             self.assertEqual(len(result['balances']), 1)
 
+    def test_display_order_endpoint_requires_auth_and_returns_sorted_state(self):
+        with self.store.db() as db:
+            a=db.execute("INSERT INTO futures_accounts(name,api_key,api_secret) VALUES('sort-a','key','secret')").lastrowid
+            b=db.execute("INSERT INTO futures_accounts(name,api_key,api_secret) VALUES('sort-b','key','secret')").lastrowid
+        move={'kind':'accounts','id':str(b),'relative_id':str(a),'side':'before'}
+        self.assertEqual(self.request('/api/display-order', move, authenticated=False)[0],401)
+        self.assertEqual(self.request('/api/display-order', move)[0],200)
+        status, data=self.request('/api/state')
+        self.assertEqual(status,200)
+        ids=[x['id'] for x in data['futures_accounts']]
+        self.assertLess(ids.index(b),ids.index(a))
+        self.assertEqual(self.request('/api/display-order',{**move,'relative_id':'999999'})[0],400)
+
     def test_auth_required(self):
         self.assertEqual(self.request('/api/state', authenticated=False)[0], 401)
         self.assertEqual(self.request('/api/targets', {'id': '123'}, authenticated=False)[0], 401)
