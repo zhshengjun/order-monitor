@@ -625,10 +625,25 @@ def handler_factory(store, monitor, token):
                     balances = client.get('/fapi/v3/balance')
                     positions = client.get('/fapi/v3/positionRisk')
                     return self.reply({'balances': balances, 'positions': positions, 'queried_at': int(time.time() * 1000)})
+                if parsed.path == '/api/copy-tasks':
+                    account_id=int(query.get('account_id', ['0'])[0])
+                    page=max(1,min(100000,int(query.get('page',['1'])[0])))
+                    with store.db() as db:
+                        if not db.execute('SELECT 1 FROM futures_accounts WHERE id=?',(account_id,)).fetchone():
+                            raise ValueError('账号不存在')
+                        total=db.execute('SELECT COUNT(*) FROM copy_tasks WHERE account_id=?',(account_id,)).fetchone()[0]
+                        rows=[dict(r) for r in db.execute("SELECT c.id,c.target_id,c.state,c.error,c.created,c.result,c.body,a.asset,a.available_balance,a.lead_balance,a.planned_quantity,t.name AS target_name FROM copy_tasks c LEFT JOIN copy_task_audit a ON a.task_id=c.id LEFT JOIN targets t ON t.id=c.target_id WHERE c.account_id=? ORDER BY c.id DESC LIMIT 50 OFFSET ?",(account_id,(page-1)*50))]
+                    for row in rows:
+                        row['body']=json.loads(row['body'])
+                        row['result']=json.loads(row['result']) if row['result'] else None
+                        if row['result'] and row['result'].get('orderId') is not None:
+                            row['result']['orderId']=str(row['result']['orderId'])
+                    return self.reply({'list':rows,'total':total,'page':page})
                 if parsed.path == '/api/events':
                     page = max(1, int(query.get('page', ['1'])[0]))
                     target, kind = query.get('target', [''])[0], query.get('kind', [''])[0]
-                    where, args = "kind != 'balance'", []
+                    where, args = ("kind IN ('order','transfer')" if kind == 'leader' else "kind != 'balance'"), []
+                    if kind == 'leader': kind = ''
                     for column, value in [('target', target), ('kind', kind)]:
                         if value:
                             where += ' AND ' + column + '=?'

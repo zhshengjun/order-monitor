@@ -61,6 +61,34 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(self.request('/api/copy-live',{'account_id':account_id,'target_id':'4321','enabled':False})[0],200)
         self.assertEqual(self.request('/api/copy-live',{'account_id':account_id,'target_id':'4321','enabled':True})[0],200)
 
+    def test_account_copy_records_are_scoped_and_paginated(self):
+        with self.store.db() as db:
+            db.execute("INSERT INTO futures_accounts(name,api_key,api_secret) VALUES('records-a','private-a','private-secret-a')")
+            a=db.execute("SELECT id FROM futures_accounts WHERE name='records-a'").fetchone()[0]
+            db.execute("INSERT INTO futures_accounts(name,api_key,api_secret) VALUES('records-b','private-b','private-secret-b')")
+            b=db.execute("SELECT id FROM futures_accounts WHERE name='records-b'").fetchone()[0]
+            for account,count in ((a,52),(b,1)):
+                for i in range(count):
+                    db.execute("INSERT INTO copy_tasks(account_id,target_id,order_key,body,action,before_qty,lead_balance,client_id,created) VALUES(?,?,?,?,?,?,?,?,?)",(account,'123',str(i),json.dumps({'symbol':'BTCUSDT'}),'open','0','100',str(account)+'-'+str(i),i))
+        with self.store.db() as db:
+            db.execute("UPDATE copy_tasks SET result=? WHERE account_id=? AND order_key='51'", (json.dumps({'orderId':1234567890123456789}),a))
+        status,first=self.request('/api/copy-tasks?account_id=%s&page=1'%a)
+        self.assertEqual(status,200);self.assertEqual(first['total'],52);self.assertEqual(len(first['list']),50)
+        self.assertEqual(first['list'][0]['result']['orderId'],'1234567890123456789')
+        status,second=self.request('/api/copy-tasks?account_id=%s&page=2'%a)
+        self.assertEqual(status,200);self.assertEqual(len(second['list']),2)
+        status,other=self.request('/api/copy-tasks?account_id=%s&page=1'%b)
+        self.assertEqual(other['total'],1)
+        self.assertNotIn('private-secret',json.dumps(first))
+        self.assertEqual(self.request('/api/copy-tasks?account_id=%s'%a,authenticated=False)[0],401)
+
+    def test_leader_records_exclude_copy_notifications(self):
+        with self.store.db() as db:
+            for kind in ('order','transfer','copy'):
+                db.execute('INSERT INTO events(target,name,kind,body,stamp,historical) VALUES(?,?,?,?,?,0)',('separate','leader',kind,json.dumps({'side':'BUY','positionSide':'LONG'}),1))
+        status,data=self.request('/api/events?target=separate&kind=leader')
+        self.assertEqual(status,200);self.assertEqual({x['kind'] for x in data['list']},{'order','transfer'})
+
     def test_auth_required(self):
         self.assertEqual(self.request('/api/state', authenticated=False)[0], 401)
         self.assertEqual(self.request('/api/targets', {'id': '123'}, authenticated=False)[0], 401)
