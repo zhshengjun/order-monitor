@@ -449,11 +449,13 @@ class Monitor:
                     send_notification(channel, settings, title, message)
                     with self.store.db() as db:
                         db.execute("UPDATE outbox SET status='sent',error='' WHERE id=?", (task['task_id'],))
-                except Exception:
+                except Exception as exc:
                     attempts = task['attempts'] + 1
+                    reason = notification_error(exc)
+                    LOG.warning('notification channel=%s event=%s attempt=%s: %s', channel, task['id'], attempts, reason)
                     with self.store.db() as db:
                         db.execute('UPDATE outbox SET attempts=?,next_try=?,error=? WHERE id=?',
-                                   (attempts, time.time() + min(3600, 10 * 2 ** min(attempts, 8)), '发送失败，请检查通知凭证及网络', task['task_id']))
+                                   (attempts, time.time() + min(3600, 10 * 2 ** min(attempts, 8)), reason, task['task_id']))
 
     def copy_notice(self, db, task, message):
         name = db.execute('SELECT name FROM targets WHERE id=?', (task['target_id'],)).fetchone()
@@ -599,6 +601,27 @@ class Monitor:
             self.stop.wait(1)
 
 
+class NotificationError(Exception):
+    """Pre-sanitized notification failure, safe to show in the UI."""
+
+
+def notification_error(exc):
+    if isinstance(exc, NotificationError):
+        return str(exc)
+    if isinstance(exc, urllib.error.HTTPError):
+        return '通知服务 HTTP %d' % exc.code
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        return '通知服务连接超时'
+    if isinstance(reason, ssl.SSLError):
+        return '通知服务 TLS 连接失败'
+    if isinstance(reason, socket.gaierror):
+        return '通知服务域名解析失败'
+    if isinstance(reason, urllib.error.URLError) or isinstance(exc, urllib.error.URLError):
+        return '通知服务网络连接失败'
+    return '通知发送失败，请检查通知配置及服务器网络'
+
+
 def send_notification(channel, settings, title, message):
     if channel == 'telegram':
         url = 'https://api.telegram.org/bot' + settings['telegram_token'] + '/sendMessage'
@@ -608,9 +631,16 @@ def send_notification(channel, settings, title, message):
         body = {'device_key': settings['bark_key'], 'title': title, 'body': message, 'group': '订单监听'}
     request = urllib.request.Request(url, data=dumps(body).encode(), headers={'Content-Type': 'application/json'})
     with urllib.request.urlopen(request, timeout=15) as response:
-        result = json.loads(response.read(1_000_000))
+        try:
+            result = json.loads(response.read(1_000_000))
+        except (ValueError, UnicodeDecodeError):
+            raise NotificationError('通知服务响应不是有效 JSON') from None
+    if not isinstance(result, dict):
+        raise NotificationError('通知服务响应格式错误')
     if (channel == 'telegram' and result.get('ok') is not True) or (channel == 'bark' and result.get('code') != 200):
-        raise ValueError('通知服务拒绝请求')
+        code = result.get('code') if channel == 'bark' else result.get('error_code')
+        detail = '，错误码 %d' % code if type(code) is int and 0 <= code <= 999999 else ''
+        raise NotificationError('通知服务拒绝请求' + detail)
 
 
 def handler_factory(store, monitor, token):
@@ -844,8 +874,10 @@ def handler_factory(store, monitor, token):
                             raise ValueError('请填写 HTTPS Bark 服务地址和 Device Key')
                     try:
                         send_notification(channel, settings, '订单监听 · 测试通知', '通知配置正常，这是一条测试消息。')
-                    except Exception:
-                        raise ValueError('测试发送失败，请检查通知配置及服务器网络') from None
+                    except Exception as exc:
+                        reason = notification_error(exc)
+                        LOG.warning('notification test channel=%s: %s', channel, reason)
+                        raise ValueError('测试发送失败：' + reason) from None
                 elif self.path == '/api/settings':
                     store.save_settings(data)
                 else:

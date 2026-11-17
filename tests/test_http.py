@@ -6,6 +6,7 @@ import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 from app import Store, Monitor, handler_factory
 from test_monitor import FakeAPI
@@ -108,6 +109,14 @@ class HTTPTests(unittest.TestCase):
         self.assertTrue(data['settings']['telegram_token_configured'])
         self.assertNotIn('not-for-response', json.dumps(data))
         self.assertNotIn('private-key', json.dumps(data))
+
+    def test_bark_test_reports_http_status_without_credentials(self):
+        error = urllib.error.HTTPError('https://api.day.app/private-key', 403, 'forbidden', {}, None)
+        with patch('app.send_notification', side_effect=error):
+            status, body = self.request('/api/test-notification', {'channel': 'bark'})
+        self.assertEqual(status, 400)
+        self.assertIn('HTTP 403', body['error'])
+        self.assertNotIn('private-key', body['error'])
 
     def test_cross_origin_write_rejected(self):
         self.assertEqual(self.request('/api/settings', {'interval': 20}, headers={'Origin': 'https://untrusted.example'})[0], 403)

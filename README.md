@@ -72,7 +72,7 @@ python3 app.py
 
 ### Bark
 
-填写 Bark 服务根地址（默认 `https://api.day.app`）和 App 中的 Device Key，启用并保存。使用服务端 `/push` JSON 接口，可接入自建 HTTPS Bark 服务。
+填写 Bark 服务根地址（默认 `https://api.day.app`）和 App 中的 Device Key，启用并保存。使用服务端 `/push` JSON 接口，可接入自建 HTTPS Bark 服务。 测试和实际发送失败时，页面与服务日志显示脱敏错误类型或 HTTP 状态码；成功表示服务端已接受请求，不能单独证明手机已展示。
 
 ## 网络配置
 
