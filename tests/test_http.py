@@ -45,6 +45,22 @@ class HTTPTests(unittest.TestCase):
         with response:
             return response.status, json.loads(response.read())
 
+    def test_copy_switch_is_explicit_and_starts_zero_baseline(self):
+        from app import FuturesClient
+        with self.store.db() as db:
+            db.execute("INSERT INTO futures_accounts(name,api_key,api_secret) VALUES('copy-test','key','secret')")
+            account_id=db.execute("SELECT id FROM futures_accounts WHERE name='copy-test'").fetchone()[0]
+        self.assertEqual(self.request('/api/targets', {'id':'4321'})[0],200)
+        self.assertEqual(self.request('/api/copy-binding',{'account_id':account_id,'target_id':'4321','selected':True})[0],200)
+        self.assertEqual(self.request('/api/copy-live',{'account_id':account_id,'target_id':'4321','enabled':True})[0],400)
+        with self.store.db() as db: db.execute("UPDATE targets SET initialized=1 WHERE id='4321'")
+        self.assertEqual(self.request('/api/copy-live',{'account_id':account_id,'target_id':'4321','enabled':True})[0],200)
+        with self.store.db() as db:
+            self.assertEqual(db.execute('SELECT enabled FROM copy_live WHERE account_id=?',(account_id,)).fetchone()[0],1)
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM virtual_positions WHERE account_id=?',(account_id,)).fetchone()[0],0)
+        self.assertEqual(self.request('/api/copy-live',{'account_id':account_id,'target_id':'4321','enabled':False})[0],200)
+        self.assertEqual(self.request('/api/copy-live',{'account_id':account_id,'target_id':'4321','enabled':True})[0],200)
+
     def test_auth_required(self):
         self.assertEqual(self.request('/api/state', authenticated=False)[0], 401)
         self.assertEqual(self.request('/api/targets', {'id': '123'}, authenticated=False)[0], 401)

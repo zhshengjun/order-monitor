@@ -18,6 +18,8 @@ from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from virtual_position import transition
+from copy_executor import FuturesClient, ExchangeError, plan
+from fractions import Fraction
 
 ROOT = Path(__file__).parent
 API_PATH = '/bapi/futures/v1/friendly/future/copy-trade/'
@@ -199,6 +201,19 @@ class Store:
               symbol TEXT NOT NULL, position_side TEXT NOT NULL, stamp INTEGER NOT NULL,
               action TEXT NOT NULL, quantity TEXT NOT NULL, before_qty TEXT NOT NULL, after_qty TEXT NOT NULL,
               PRIMARY KEY(account_id,target_id,order_key));
+            CREATE TABLE IF NOT EXISTS copy_live (
+              account_id INTEGER NOT NULL, target_id TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 0,
+              started_at INTEGER NOT NULL, PRIMARY KEY(account_id,target_id));
+            CREATE TABLE IF NOT EXISTS copy_tasks (
+              id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER NOT NULL, target_id TEXT NOT NULL,
+              order_key TEXT NOT NULL, body TEXT NOT NULL, action TEXT NOT NULL, before_qty TEXT NOT NULL,
+              lead_balance TEXT NOT NULL, client_id TEXT NOT NULL UNIQUE, state TEXT NOT NULL DEFAULT 'pending',
+              quantity TEXT, result TEXT, error TEXT NOT NULL DEFAULT '', created INTEGER NOT NULL, next_check REAL NOT NULL DEFAULT 0,
+              UNIQUE(account_id,target_id,order_key));
+            CREATE TABLE IF NOT EXISTS copied_positions (
+              account_id INTEGER NOT NULL, target_id TEXT NOT NULL, symbol TEXT NOT NULL,
+              position_side TEXT NOT NULL, quantity TEXT NOT NULL,
+              PRIMARY KEY(account_id,target_id,symbol,position_side));
             CREATE TABLE IF NOT EXISTS outbox (
               id INTEGER PRIMARY KEY AUTOINCREMENT, event INTEGER NOT NULL, channel TEXT NOT NULL,
               status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
@@ -288,6 +303,9 @@ class Monitor:
                 raise ValueError('监听对象不存在')
             if not enabled:
                 db.execute("UPDATE outbox SET status='cancelled' WHERE status='pending' AND event IN (SELECT id FROM events WHERE target=?)", (pid,))
+                db.execute("UPDATE copy_tasks SET state='cancelled',error='监听已关闭' WHERE target_id=? AND state='pending'",(pid,))
+                db.execute('UPDATE copy_live SET enabled=0 WHERE target_id=?',(pid,))
+                db.execute('UPDATE virtual_sessions SET active=0 WHERE target_id=?',(pid,))
 
     def collect(self, pid, kind, initialized):
         with self.store.db() as db:
@@ -308,7 +326,7 @@ class Monitor:
                 return rows
         raise UpstreamError('新增记录超过 %s 条，未推进同步位置；可增加每页数量后重试' % (50 * page_size))
 
-    def virtual_apply(self, db, pid, key, row):
+    def virtual_apply(self, db, pid, key, row, lead_balance):
         sessions = db.execute('SELECT account_id,started_at FROM virtual_sessions WHERE target_id=? AND active=1', (pid,)).fetchall()
         for session in sessions:
             aid, started = session['account_id'], session['started_at']
@@ -320,6 +338,14 @@ class Monitor:
             position = db.execute('SELECT quantity FROM virtual_positions WHERE account_id=? AND target_id=? AND symbol=? AND position_side=?', (aid, pid, symbol, side)).fetchone()
             change = transition(position['quantity'] if position else '0', row['side'], side, row['executedQty'])
             db.execute('INSERT INTO virtual_events VALUES(?,?,?,?,?,?,?,?,?,?)', (aid, pid, key, symbol, side, int(row['orderTime']), change['action'], str(row['executedQty']), change['before'], change['after']))
+            live=db.execute('SELECT enabled,started_at FROM copy_live WHERE account_id=? AND target_id=?', (aid,pid)).fetchone()
+            if not live or not live['enabled'] or int(row['orderTime']) <= live['started_at']:
+                if change['action'] != 'unmatched_close':
+                    db.execute('INSERT OR REPLACE INTO virtual_positions VALUES(?,?,?,?,?)',(aid,pid,symbol,side,change['after']))
+                continue
+            client_id = 'cp_' + hashlib.sha256((str(aid)+':'+pid+':'+key).encode()).hexdigest()[:30]
+            db.execute('INSERT OR IGNORE INTO copy_tasks(account_id,target_id,order_key,body,action,before_qty,lead_balance,client_id,created) VALUES(?,?,?,?,?,?,?,?,?)',
+                       (aid,pid,key,dumps(row),change['action'],change['before'],str(lead_balance),client_id,int(time.time()*1000)))
             if change['action'] != 'unmatched_close':
                 db.execute('INSERT OR REPLACE INTO virtual_positions VALUES(?,?,?,?,?)', (aid,pid,symbol,side,change['after']))
 
@@ -348,6 +374,16 @@ class Monitor:
                             if kind == 'order':
                                 body.update(direction=direction(row), notional=decimal_text(number(row['executedQty']) * number(row['avgPrice'])), updated=bool(previous))
                             if previous:
+                                # A reused identity with different immutable execution fields is ambiguous.
+                                # Stop copying and cancel pending tasks rather than treating it as an update.
+                                old = json.loads(previous['body'])
+                                if kind == 'order' and any(str(old.get(field)) != str(row.get(field)) for field in ('executedQty','avgPrice')):
+                                    sessions = db.execute('SELECT account_id,target_id FROM copy_live WHERE target_id=? AND enabled=1', (pid,)).fetchall()
+                                    for session in sessions:
+                                        db.execute('UPDATE copy_live SET enabled=0 WHERE account_id=? AND target_id=?', (session['account_id'],pid))
+                                        db.execute('UPDATE virtual_sessions SET active=0 WHERE account_id=? AND target_id=?', (session['account_id'],pid))
+                                        db.execute("UPDATE copy_tasks SET state='cancelled',error='订单标识冲突' WHERE account_id=? AND target_id=? AND state='pending'", (session['account_id'],pid))
+                                        self.copy_notice(db, {'target_id':pid}, '%s 订单标识冲突，已关闭跟单，请核对记录' % row['symbol'])
                                 # Refresh the original display row; never enqueue an update as a new order.
                                 candidates = db.execute('SELECT id,body FROM events WHERE target=? AND kind=? AND stamp=?', (pid, kind, stamp)).fetchall()
                                 for event in candidates:
@@ -357,7 +393,7 @@ class Monitor:
                             historical = first or (watermark is not None and stamp < watermark)
                             self.store.event(db, pid, detail['nickname'], kind, body, stamp, historical, settings)
                             if kind == 'order' and not historical:
-                                self.virtual_apply(db, pid, key, row)
+                                self.virtual_apply(db, pid, key, row, detail['marginBalance'])
                     balance = decimal_text(detail['marginBalance'])
                     db.execute('UPDATE targets SET name=?,detail=?,balance=?,initialized=1,last_check=?,next_check=?,failures=0,error=\'\' WHERE id=?',
                                (detail['nickname'], dumps(detail), balance, time.time(), time.time() + settings['interval'], pid))
@@ -374,12 +410,14 @@ class Monitor:
         body = json.loads(event['body'])
         if event['kind'] == 'order':
             body['direction'] = direction(body)
-        title = event['name'] + ' · ' + {'order': '交易操作', 'transfer': '资金划转', 'balance': '余额变化'}[event['kind']]
+        title = event['name'] + ' · ' + {'order': '交易操作', 'transfer': '资金划转', 'balance': '余额变化', 'copy': '跟单结果'}[event['kind']]
         if event['kind'] == 'order':
             text = '%s %s%s\n数量：%s %s\n均价：%s %s\n成交金额：%s %s\n已实现盈亏：%s %s' % (
                 body['symbol'], body['direction'], '（记录更新）' if body.get('updated') else '',
                 body['executedQty'], body.get('baseAsset', ''), body['avgPrice'], body.get('quoteAsset', ''),
                 body['notional'], body.get('quoteAsset', ''), body.get('totalPnl', '—'), body.get('quoteAsset', ''))
+        elif event['kind'] == 'copy':
+            text = body['message']
         elif event['kind'] == 'transfer':
             text = '%s\n%s %s\n%s → %s' % (body['transType'], body['amount'], body['coin'], body.get('from', ''), body.get('to', ''))
         else:
@@ -409,6 +447,58 @@ class Monitor:
                         db.execute('UPDATE outbox SET attempts=?,next_try=?,error=? WHERE id=?',
                                    (attempts, time.time() + min(3600, 10 * 2 ** min(attempts, 8)), '发送失败，请检查通知凭证及网络', task['task_id']))
 
+    def copy_notice(self, db, task, message):
+        name = db.execute('SELECT name FROM targets WHERE id=?', (task['target_id'],)).fetchone()
+        self.store.event(db, task['target_id'], name['name'] if name else task['target_id'], 'copy', {'message':message}, int(time.time()*1000), False, self.store.settings(db))
+
+    def execute_copy(self):
+        # Serial worker: a submitted order with unknown outcome is reconciled, never re-sent.
+        with self.lock:
+            with self.store.db() as db:
+                task=db.execute("SELECT c.*,a.api_key,a.api_secret FROM copy_tasks c JOIN futures_accounts a ON a.id=c.account_id JOIN virtual_sessions s ON s.account_id=c.account_id AND s.target_id=c.target_id JOIN targets t ON t.id=c.target_id WHERE (c.state='submitted' AND c.next_check<=strftime('%s','now')) OR (c.state='pending' AND s.active=1 AND t.enabled=1 AND NOT EXISTS (SELECT 1 FROM copy_tasks u WHERE u.account_id=c.account_id AND u.state='submitted')) ORDER BY CASE WHEN c.state='submitted' THEN 0 ELSE 1 END,c.id LIMIT 1").fetchone()
+            if not task: return
+            client=FuturesClient(task['api_key'],task['api_secret']); row=json.loads(task['body'])
+            if task['state']=='pending':
+                try:
+                    with self.store.db() as db:
+                        old=db.execute('SELECT quantity FROM copied_positions WHERE account_id=? AND target_id=? AND symbol=? AND position_side=?',(task['account_id'],task['target_id'],row['symbol'],row['positionSide'])).fetchone()
+                    params=plan(row,task['action'],task['before_qty'],old['quantity'] if old else '0',task['lead_balance'],client.balance(),client.positions(),client.mode(),client.quote(row['symbol']),client.rules())
+                except (ValueError,ExchangeError,KeyError,InvalidOperation) as exc:
+                    with self.store.db() as db:
+                        db.execute("UPDATE copy_tasks SET state='skipped',error=? WHERE id=?",(str(exc)[:250],task['id']))
+                        self.copy_notice(db,task,'%s 跟单跳过：%s' % (row['symbol'],str(exc)[:200]))
+                    return
+                params['newClientOrderId']=task['client_id']
+                # Persist intent before touching the exchange, so process crashes cannot duplicate a POST.
+                with self.store.db() as db: db.execute("UPDATE copy_tasks SET state='submitted',quantity=? WHERE id=? AND state='pending'",(params['quantity'],task['id']))
+                try: result=client.place(params)
+                except ExchangeError:
+                    with self.store.db() as db:
+                        db.execute("UPDATE copy_tasks SET error='下单结果未知，等待查询确认',next_check=strftime('%s','now')+15 WHERE id=?",(task['id'],))
+                        self.copy_notice(db,task,'%s 下单结果未知，正在查询订单状态' % row['symbol'])
+                    return
+            else:
+                try: result=client.order(row['symbol'],task['client_id'])
+                except ExchangeError:
+                    with self.store.db() as db: db.execute("UPDATE copy_tasks SET error='订单结果未知，等待查询确认',next_check=strftime('%s','now')+15 WHERE id=?",(task['id'],))
+                    return
+            status=result.get('status')
+            if status not in ('FILLED','CANCELED','EXPIRED','REJECTED','EXPIRED_IN_MATCH'):
+                with self.store.db() as db: db.execute("UPDATE copy_tasks SET next_check=strftime('%s','now')+15 WHERE id=?", (task['id'],))
+                return
+            executed=number(result.get('executedQty','0'))
+            if executed<0: return
+            from virtual_position import decimal_string
+            with self.store.db() as db:
+                current=db.execute('SELECT state FROM copy_tasks WHERE id=?',(task['id'],)).fetchone()
+                if not current or current['state']!='submitted': return
+                pos=db.execute('SELECT quantity FROM copied_positions WHERE account_id=? AND target_id=? AND symbol=? AND position_side=?',(task['account_id'],task['target_id'],row['symbol'],row['positionSide'])).fetchone()
+                before=Fraction(number(pos['quantity'] if pos else '0')); filled=Fraction(executed)
+                after=before+filled if task['action']=='open' else max(Fraction(0),before-filled)
+                db.execute('INSERT OR REPLACE INTO copied_positions VALUES(?,?,?,?,?)',(task['account_id'],task['target_id'],row['symbol'],row['positionSide'],decimal_string(after)))
+                db.execute("UPDATE copy_tasks SET state=?,result=?,error='' WHERE id=?",('filled' if status=='FILLED' else 'finished',dumps({'status':status,'executedQty':str(executed),'orderId':result.get('orderId')}),task['id']))
+                self.copy_notice(db,task,'%s %s，状态 %s，实际成交 %s' % (row['symbol'],direction(row),status,executed))
+
     def run(self):
         while not self.stop.is_set():
             with self.store.db() as db:
@@ -418,6 +508,10 @@ class Monitor:
                     break
                 self.poll(pid)
             self.deliver()
+            try:
+                self.execute_copy()
+            except Exception:
+                LOG.exception('跟单任务处理异常，保留当前状态')
             self.stop.wait(1)
 
 
@@ -495,13 +589,15 @@ def handler_factory(store, monitor, token):
                         bindings = [dict(r) for r in db.execute('SELECT account_id,target_id FROM copy_bindings')]
                         virtual_sessions = [dict(r) for r in db.execute('SELECT account_id,target_id,active,started_at FROM virtual_sessions')]
                         virtual_positions = [dict(r) for r in db.execute("SELECT account_id,target_id,symbol,position_side,quantity FROM virtual_positions WHERE quantity != '0'")]
+                        copy_live = [dict(r) for r in db.execute('SELECT account_id,target_id,enabled FROM copy_live')]
+                        copy_tasks = [dict(r) for r in db.execute("SELECT id,account_id,target_id,state,error,created,result,body FROM copy_tasks ORDER BY id DESC LIMIT 50")]
                         virtual_events = [dict(r) for r in db.execute("SELECT account_id,target_id,symbol,position_side,stamp,action,quantity FROM virtual_events WHERE action='unmatched_close' ORDER BY stamp DESC LIMIT 20")]
                         counts = dict(db.execute('SELECT status,COUNT(*) FROM outbox GROUP BY status').fetchall())
                         errors = [dict(r) for r in db.execute("SELECT channel,attempts,error FROM outbox WHERE status='pending' AND error!='' ORDER BY id DESC LIMIT 5")]
                     settings = store.settings()
                     for key in SECRETS:
                         settings[key + '_configured'] = bool(settings.pop(key))
-                    return self.reply({'targets': targets, 'settings': settings, 'notifications': counts, 'notification_errors': errors, 'futures_accounts': accounts, 'copy_bindings': bindings, 'virtual_sessions': virtual_sessions, 'virtual_positions': virtual_positions, 'virtual_events': virtual_events})
+                    return self.reply({'targets': targets, 'settings': settings, 'notifications': counts, 'notification_errors': errors, 'futures_accounts': accounts, 'copy_bindings': bindings, 'virtual_sessions': virtual_sessions, 'virtual_positions': virtual_positions, 'virtual_events': virtual_events, 'copy_tasks': copy_tasks, 'copy_live': copy_live})
                 if parsed.path == '/api/futures-snapshot':
                     account_id = int(query.get('account_id', ['0'])[0])
                     with store.db() as db:
@@ -585,7 +681,9 @@ def handler_factory(store, monitor, token):
                         if selected:
                             db.execute('INSERT OR IGNORE INTO copy_bindings VALUES(?,?)', (account_id, target_id))
                         else:
+                            db.execute('UPDATE copy_live SET enabled=0 WHERE account_id=? AND target_id=?',(account_id,target_id))
                             db.execute('UPDATE virtual_sessions SET active=0 WHERE account_id=? AND target_id=?', (account_id,target_id))
+                            db.execute("UPDATE copy_tasks SET state='cancelled',error='跟单已关闭' WHERE account_id=? AND target_id=? AND state='pending'",(account_id,target_id))
                             db.execute('DELETE FROM copy_bindings WHERE account_id=? AND target_id=?', (account_id, target_id))
                 elif self.path == '/api/virtual-session':
                     account_id, target_id, active = data.get('account_id'), str(data.get('target_id', '')), data.get('active')
@@ -602,7 +700,28 @@ def handler_factory(store, monitor, token):
                                 raise ValueError('已有跟踪记录，不能重置为零')
                             db.execute('INSERT INTO virtual_sessions VALUES(?,?,?,1)', (account_id,target_id,int(time.time()*1000)))
                         else:
+                            db.execute('UPDATE copy_live SET enabled=0 WHERE account_id=? AND target_id=?',(account_id,target_id))
                             db.execute('UPDATE virtual_sessions SET active=0 WHERE account_id=? AND target_id=?', (account_id,target_id))
+                            db.execute("UPDATE copy_tasks SET state='cancelled',error='跟单已关闭' WHERE account_id=? AND target_id=? AND state='pending'",(account_id,target_id))
+                elif self.path == '/api/copy-live':
+                    account_id,target_id,enabled=data.get('account_id'),str(data.get('target_id','')),data.get('enabled')
+                    if not isinstance(account_id,int) or not isinstance(enabled,bool): raise ValueError('参数错误')
+                    with monitor.lock, store.db() as db:
+                        binding=db.execute('SELECT t.initialized,t.enabled FROM copy_bindings b JOIN targets t ON t.id=b.target_id WHERE b.account_id=? AND b.target_id=?',(account_id,target_id)).fetchone()
+                        if not binding: raise ValueError('请先关联带单员')
+                        if enabled:
+                            if not binding['initialized'] or not binding['enabled']: raise ValueError('请先开启监听并完成基线')
+                            if db.execute("SELECT 1 FROM copy_tasks WHERE account_id=? AND state='submitted'", (account_id,)).fetchone(): raise ValueError('该账号有结果未确认的订单，请先核对')
+                            positions=db.execute('SELECT quantity FROM copied_positions WHERE account_id=? AND target_id=?',(account_id,target_id)).fetchall()
+                            if any(number(x['quantity']) != 0 for x in positions): raise ValueError('该关联仍有跟单持仓，不能重置基线')
+                            now=int(time.time()*1000)
+                            db.execute('DELETE FROM virtual_positions WHERE account_id=? AND target_id=?',(account_id,target_id))
+                            db.execute('INSERT OR REPLACE INTO virtual_sessions VALUES(?,?,?,1)',(account_id,target_id,now))
+                            db.execute('INSERT OR REPLACE INTO copy_live VALUES(?,?,1,?)',(account_id,target_id,now))
+                        else:
+                            db.execute('UPDATE copy_live SET enabled=0 WHERE account_id=? AND target_id=?',(account_id,target_id))
+                            db.execute('UPDATE virtual_sessions SET active=0 WHERE account_id=? AND target_id=?',(account_id,target_id))
+                            db.execute("UPDATE copy_tasks SET state='cancelled',error='跟单已关闭' WHERE account_id=? AND target_id=? AND state='pending'",(account_id,target_id))
                 elif self.path == '/api/test-notification':
                     channel = data.get('channel')
                     if channel not in ('telegram', 'bark'):
