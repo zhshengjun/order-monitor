@@ -1,5 +1,6 @@
 """Single-process Binance lead portfolio monitor. Python standard library only."""
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import hmac
 import json
@@ -141,7 +142,7 @@ class FuturesAccount:
         self.api_key, self.api_secret = api_key, api_secret
 
     def get(self, path):
-        if path not in ('/fapi/v3/balance', '/fapi/v3/positionRisk'):
+        if path not in ('/fapi/v3/balance', '/fapi/v3/positionRisk', '/fapi/v2/account'):
             raise ValueError('不支持的查询')
         query = urllib.parse.urlencode({'timestamp': int(time.time() * 1000), 'recvWindow': 5000})
         signature = hmac.new(self.api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
@@ -159,7 +160,7 @@ class FuturesAccount:
             raise UpstreamError('Binance 合约查询失败：HTTP %s，错误码 %s' % (exc.code, code)) from None
         except Exception:
             raise UpstreamError('Binance 合约查询连接失败，请检查网络、代理和系统时间') from None
-        if not isinstance(result, list):
+        if not isinstance(result, dict if path == '/fapi/v2/account' else list):
             raise UpstreamError('Binance 合约查询响应格式异常')
         return result
 
@@ -218,6 +219,9 @@ class Store:
               account_id INTEGER NOT NULL, target_id TEXT NOT NULL, symbol TEXT NOT NULL,
               position_side TEXT NOT NULL, quantity TEXT NOT NULL,
               PRIMARY KEY(account_id,target_id,symbol,position_side));
+            CREATE TABLE IF NOT EXISTS margin_alert_state (
+              account_id INTEGER NOT NULL, risk_key TEXT NOT NULL, active INTEGER NOT NULL,
+              PRIMARY KEY(account_id, risk_key));
             CREATE TABLE IF NOT EXISTS outbox (
               id INTEGER PRIMARY KEY AUTOINCREMENT, event INTEGER NOT NULL, channel TEXT NOT NULL,
               status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
@@ -414,13 +418,13 @@ class Monitor:
         body = json.loads(event['body'])
         if event['kind'] == 'order':
             body['direction'] = direction(body)
-        title = event['name'] + ' · ' + {'order': '交易操作', 'transfer': '资金划转', 'balance': '余额变化', 'copy': '跟单结果'}[event['kind']]
+        title = event['name'] + ' · ' + {'order': '交易操作', 'transfer': '资金划转', 'balance': '余额变化', 'copy': '跟单结果', 'margin': '保证金风险'}[event['kind']]
         if event['kind'] == 'order':
             text = '%s %s%s\n数量：%s %s\n均价：%s %s\n成交金额：%s %s\n已实现盈亏：%s %s' % (
                 body['symbol'], body['direction'], '（记录更新）' if body.get('updated') else '',
                 body['executedQty'], body.get('baseAsset', ''), body['avgPrice'], body.get('quoteAsset', ''),
                 body['notional'], body.get('quoteAsset', ''), body.get('totalPnl', '—'), body.get('quoteAsset', ''))
-        elif event['kind'] == 'copy':
+        elif event['kind'] in ('copy', 'margin'):
             text = body['message']
         elif event['kind'] == 'transfer':
             text = '%s\n%s %s\n%s → %s' % (body['transType'], body['amount'], body['coin'], body.get('from', ''), body.get('to', ''))
@@ -515,6 +519,69 @@ class Monitor:
                 db.execute('INSERT OR REPLACE INTO copied_positions VALUES(?,?,?,?,?)',(task['account_id'],task['target_id'],row['symbol'],row['positionSide'],decimal_string(after)))
                 db.execute("UPDATE copy_tasks SET state=?,result=?,error='' WHERE id=?",('filled' if status=='FILLED' else 'finished',dumps({'status':status,'executedQty':str(executed),'orderId':result.get('orderId')}),task['id']))
                 self.copy_notice(db,task,'%s %s，状态 %s，实际成交 %s' % (row['symbol'],direction(row),status,executed))
+
+    def check_margin(self, account):
+        client = FuturesAccount(account['api_key'], account['api_secret'])
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            account_future = pool.submit(client.get, '/fapi/v2/account')
+            positions_future = pool.submit(client.get, '/fapi/v3/positionRisk')
+            info, positions = account_future.result(), positions_future.result()
+        details = {(p['symbol'], p['positionSide']): p for p in info['positions']}
+        ratios = {}
+        cross_maint = Decimal(0)
+        cross_found = False
+        for position in positions:
+            if number(position['positionAmt']) == 0:
+                continue
+            key = (position['symbol'], position['positionSide'])
+            detail = details.get(key)
+            if detail is None or not isinstance(detail.get('isolated'), bool):
+                raise ValueError('缺少持仓保证金模式')
+            maint = number(position['maintMargin'])
+            if maint < 0:
+                raise ValueError('维持保证金无效')
+            if detail['isolated']:
+                margin = number(position['isolatedMargin'])
+                risk_key = 'isolated:%s:%s' % key
+                ratios[risk_key] = (maint, margin, '%s %s 逐仓' % key)
+            else:
+                if position.get('marginAsset') != 'USDT':
+                    raise ValueError('暂不支持非 USDT 全仓保证金风险计算')
+                cross_found = True
+                cross_maint += maint
+        if cross_found:
+            if info.get('multiAssetsMargin') is not False:
+                raise ValueError('暂不支持多资产模式全仓保证金风险计算')
+            cross_margin = number(info['totalCrossWalletBalance']) + number(info['totalCrossUnPnl'])
+            ratios['cross:USDT'] = (cross_maint, cross_margin, 'USDT 全仓')
+        with self.store.db() as db:
+            settings = self.store.settings(db)
+            if not (settings['telegram_enabled'] or settings['bark_enabled']):
+                db.execute('DELETE FROM margin_alert_state WHERE account_id=?', (account['id'],))
+                return
+            previous = {r['risk_key']: r['active'] for r in db.execute('SELECT risk_key,active FROM margin_alert_state WHERE account_id=?', (account['id'],))}
+            for risk_key, (maint, margin, label) in ratios.items():
+                high = maint > 0 and (margin <= 0 or maint * 100 >= margin * 60)
+                if high and not previous.get(risk_key):
+                    ratio = '≥100%' if margin <= 0 else '%.2f%%' % (maint / margin * 100)
+                    message = '%s 保证金风险率 %s，达到 60%%\n维持保证金：%s\n保证金余额：%s' % (label, ratio, maint, margin)
+                    self.store.event(db, 'margin:%s' % account['id'], account['name'], 'margin', {'message': message}, int(time.time()*1000), False, settings)
+                db.execute('INSERT OR REPLACE INTO margin_alert_state VALUES(?,?,?)', (account['id'], risk_key, int(high)))
+            for old_key in previous.keys() - ratios.keys():
+                db.execute('DELETE FROM margin_alert_state WHERE account_id=? AND risk_key=?', (account['id'], old_key))
+
+    def margin_monitor(self):
+        while not self.stop.is_set():
+            with self.store.db() as db:
+                accounts = [dict(row) for row in db.execute('SELECT id,name,api_key,api_secret FROM futures_accounts')]
+            for account in accounts:
+                if self.stop.is_set():
+                    return
+                try:
+                    self.check_margin(account)
+                except Exception as exc:
+                    LOG.warning('账户 %s 保证金风险检查失败：%s', account['id'], str(exc)[:200])
+            self.stop.wait(30)
 
     def run(self):
         while not self.stop.is_set():
@@ -622,8 +689,10 @@ def handler_factory(store, monitor, token):
                     if not account:
                         raise ValueError('账号不存在')
                     client = FuturesAccount(account['api_key'], account['api_secret'])
-                    balances = client.get('/fapi/v3/balance')
-                    positions = client.get('/fapi/v3/positionRisk')
+                    with ThreadPoolExecutor(max_workers=2) as pool:
+                        balances_future = pool.submit(client.get, '/fapi/v3/balance')
+                        positions_future = pool.submit(client.get, '/fapi/v3/positionRisk')
+                        balances, positions = balances_future.result(), positions_future.result()
                     return self.reply({'balances': balances, 'positions': positions, 'queried_at': int(time.time() * 1000)})
                 if parsed.path == '/api/copy-tasks':
                     account_id=int(query.get('account_id', ['0'])[0])
@@ -643,7 +712,7 @@ def handler_factory(store, monitor, token):
                     page = max(1, min(100000, int(query.get('page', ['1'])[0])))
                     limit = max(1, min(50, int(query.get('limit', ['50'])[0])))
                     target, kind = query.get('target', [''])[0], query.get('kind', [''])[0]
-                    where, args = ("kind IN ('order','transfer')" if kind == 'leader' else "kind != 'balance'"), []
+                    where, args = ("kind IN ('order','transfer')" if kind == 'leader' else "kind IN ('order','transfer','copy')"), []
                     if kind == 'leader': kind = ''
                     for column, value in [('target', target), ('kind', kind)]:
                         if value:
@@ -802,6 +871,7 @@ def main():
     monitor = Monitor(store)
     worker = threading.Thread(target=monitor.run, daemon=True)
     worker.start()
+    threading.Thread(target=monitor.margin_monitor, daemon=True).start()
     server = ThreadingHTTPServer((os.environ.get('HOST', '127.0.0.1'), int(os.environ.get('PORT', '8080'))), handler_factory(store, monitor, token))
     LOG.info('订单监听服务已启动')
     try:
