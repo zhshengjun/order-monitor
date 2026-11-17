@@ -7,7 +7,7 @@ from copy_executor import plan, ExchangeError
 from test_monitor import FakeAPI, PID, order
 
 RULES={'symbols':[{'symbol':'BTCUSDT','status':'TRADING','filters':[{'filterType':'MARKET_LOT_SIZE','stepSize':'0.001','minQty':'0.001','maxQty':'1000'},{'filterType':'MIN_NOTIONAL','notional':'5'}]}]}
-BALANCES=[{'asset':'USDT','availableBalance':'100'}]
+BALANCES=[{'asset':'USDT','balance':'100','availableBalance':'100'}]
 QUOTE={'bidPrice':'99.9','askPrice':'100.1'}
 class FakeExchange:
     calls=[]
@@ -42,6 +42,7 @@ class CopyExecutionTests(unittest.TestCase):
         self.assertEqual(self.rows('SELECT * FROM copy_tasks')[0]['state'],'filled')
         self.assertEqual(self.rows('SELECT * FROM copied_positions')[0]['quantity'],'0.999')
         audit=self.rows('SELECT * FROM copy_task_audit')[0]
+        self.assertEqual(audit['wallet_balance'],'100')
         self.assertEqual(audit['available_balance'],'100')
         self.assertEqual(audit['lead_balance'],'100.00')
         self.assertEqual(audit['reference_price'],'100.1')
@@ -116,6 +117,42 @@ class CopyExecutionTests(unittest.TestCase):
         p=plan(row,'close','1','1','100',BALANCES,[{'symbol':'BTCUSDT','positionSide':'LONG','positionAmt':'1'}],{'dualSidePosition':True},QUOTE,RULES)
         self.assertEqual(p['positionSide'],'LONG');self.assertNotIn('reduceOnly',p)
 
+    def test_wallet_based_order_and_audit_use_distinct_available_balance(self):
+        row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
+        balances=[{'asset':'USDT','balance':'100','availableBalance':'20'}]
+        with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'balance',return_value=balances):
+            self.monitor.execute_copy()
+        self.assertEqual(FakeExchange.calls[0][1]['quantity'],'0.999')
+        audit=self.rows('SELECT wallet_balance,available_balance,planned_quantity FROM copy_task_audit')[0]
+        self.assertEqual((audit['wallet_balance'],audit['available_balance'],audit['planned_quantity']),('100','20','0.999'))
+
+    def test_wallet_based_order_is_not_submitted_with_insufficient_available_balance(self):
+        row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
+        balances=[{'asset':'USDT','balance':'100','availableBalance':'5'}]
+        with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'balance',return_value=balances):
+            self.monitor.execute_copy()
+        self.assertEqual(FakeExchange.calls,[])
+        task=self.rows('SELECT state,error FROM copy_tasks')[0]
+        self.assertEqual(task['state'],'skipped');self.assertIn('可用余额',task['error'])
+
+    def test_open_size_uses_wallet_balance_not_available_balance(self):
+        row=order(101,'1');row['avgPrice']='100'
+        balances=[{'asset':'USDT','balance':'100','availableBalance':'20'}]
+        params=plan(row,'open','0','0','100',balances,[],{'dualSidePosition':False},QUOTE,RULES,mark_price='100',leverage='10')
+        self.assertEqual(params['quantity'],'0.999')
+
+    def test_open_checks_available_balance_even_above_minimum(self):
+        row=order(101,'1');row['avgPrice']='100'
+        balances=[{'asset':'USDT','balance':'100','availableBalance':'5'}]
+        with self.assertRaisesRegex(ValueError,'可用余额'):
+            plan(row,'open','0','0','100',balances,[],{'dualSidePosition':False},QUOTE,RULES,mark_price='100',leverage='10')
+
+    def test_open_fails_when_wallet_balance_missing_or_invalid(self):
+        row=order(101,'1');row['avgPrice']='100'
+        for balances in ([{'asset':'USDT','availableBalance':'20'}],[{'asset':'USDT','balance':'NaN','availableBalance':'20'}]):
+            with self.assertRaises(ValueError):
+                plan(row,'open','0','0','100',balances,[],{'dualSidePosition':False},QUOTE,RULES,mark_price='100',leverage='10')
+
     def test_minimum_order_flows_through_executor_without_changing_leverage(self):
         row=order(101,'0.001');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
         with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'result',{'status':'FILLED','executedQty':'0.05','orderId':1}):
@@ -127,7 +164,7 @@ class CopyExecutionTests(unittest.TestCase):
 
     def test_small_open_uses_minimum_valid_market_order(self):
         row=order(101,'0.001');row['avgPrice']='100'
-        result=plan(row,'open','0','0','1000',[{'asset':'USDT','availableBalance':'10'}],[],{'dualSidePosition':False},QUOTE,RULES,mark_price='100',leverage='10')
+        result=plan(row,'open','0','0','1000',[{'asset':'USDT','balance':'10','availableBalance':'10'}],[],{'dualSidePosition':False},QUOTE,RULES,mark_price='100',leverage='10')
         self.assertEqual(result['quantity'],'0.050')
 
     def test_small_close_never_exceeds_owned_position(self):
@@ -141,8 +178,8 @@ class CopyExecutionTests(unittest.TestCase):
     def test_minimum_order_checks_actual_leverage_and_mark_price(self):
         row=order(101,'0.001');row['avgPrice']='100'
         with self.assertRaisesRegex(ValueError,'可用余额'):
-            plan(row,'open','0','0','1000',[{'asset':'USDT','availableBalance':'0.4'}],[],{'dualSidePosition':False},QUOTE,RULES,mark_price='99',leverage='10')
-        result=plan(row,'open','0','0','1000',[{'asset':'USDT','availableBalance':'1'}],[],{'dualSidePosition':False},QUOTE,RULES,mark_price='99',leverage='10')
+            plan(row,'open','0','0','1000',[{'asset':'USDT','balance':'0.4','availableBalance':'0.4'}],[],{'dualSidePosition':False},QUOTE,RULES,mark_price='99',leverage='10')
+        result=plan(row,'open','0','0','1000',[{'asset':'USDT','balance':'1','availableBalance':'1'}],[],{'dualSidePosition':False},QUOTE,RULES,mark_price='99',leverage='10')
         self.assertEqual(result['quantity'],'0.051')
 
     def test_minimum_open_is_skipped_when_it_exceeds_maximum(self):

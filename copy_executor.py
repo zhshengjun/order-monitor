@@ -96,8 +96,14 @@ def plan(row, action, before, attributed, lead_balance, balances, positions, mod
         if not hedged: params['reduceOnly']='true'
     elif action=='open':
         usdt=next((x for x in balances if x.get('asset')=='USDT'),None)
-        if not usdt: raise ValueError('未获取到 USDT 可用余额')
-        qty=opening_quantity(row['executedQty'],row['avgPrice'],lead_balance,usdt['availableBalance'],px,lot['stepSize'])
+        if not usdt: raise ValueError('未获取到 USDT 账户余额')
+        try:
+            wallet=Decimal(str(usdt['balance'])); available=Decimal(str(usdt['availableBalance']))
+        except (KeyError, ValueError, ArithmeticError):
+            raise ValueError('未获取到有效的 USDT 钱包余额或可用余额') from None
+        if not wallet.is_finite() or wallet<=0: raise ValueError('USDT 钱包余额必须大于零')
+        if not available.is_finite() or available<0: raise ValueError('USDT 可用余额无效')
+        qty=opening_quantity(row['executedQty'],row['avgPrice'],lead_balance,wallet,px,lot['stepSize'])
         try:
             mark=Decimal(str(mark_price)); actual_leverage=Decimal(str(leverage))
         except (ValueError, ArithmeticError):
@@ -111,9 +117,8 @@ def plan(row, action, before, attributed, lead_balance, balances, positions, mod
         minimum_qty=steps_quantity(Fraction(step)*min_steps,step)
         if qty<minimum_qty:
             qty=minimum_qty
-            estimated_margin=Fraction(qty)*max(Fraction(mark),Fraction(Decimal(px)))/Fraction(actual_leverage)
-            available=Decimal(str(usdt['availableBalance']))
-            if not available.is_finite() or estimated_margin>Fraction(available): raise ValueError('最低下单数量所需保证金超过可用余额')
+        estimated_margin=Fraction(qty)*max(Fraction(mark),Fraction(Decimal(px)))/Fraction(actual_leverage)
+        if estimated_margin>Fraction(available): raise ValueError('跟单所需保证金超过可用余额')
     else: raise ValueError('无效跟单操作')
     if qty<=0 or qty<min_qty: raise ValueError('跟单数量低于最小数量')
     if qty>max_qty: raise ValueError('跟单数量超过最大数量')

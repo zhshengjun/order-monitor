@@ -73,9 +73,12 @@ class HTTPTests(unittest.TestCase):
                     db.execute("INSERT INTO copy_tasks(account_id,target_id,order_key,body,action,before_qty,lead_balance,client_id,created) VALUES(?,?,?,?,?,?,?,?,?)",(account,'123',str(i),json.dumps({'symbol':'BTCUSDT'}),'open','0','100',str(account)+'-'+str(i),i))
         with self.store.db() as db:
             db.execute("UPDATE copy_tasks SET result=? WHERE account_id=? AND order_key='51'", (json.dumps({'orderId':1234567890123456789}),a))
+            task_id=db.execute("SELECT id FROM copy_tasks WHERE account_id=? AND order_key='51'", (a,)).fetchone()[0]
+            db.execute('INSERT INTO copy_task_audit VALUES(?,?,?,?,?,?,?,?)',(task_id,123,'USDT','100','20','1000','100','0.1'))
         status,first=self.request('/api/copy-tasks?account_id=%s&page=1'%a)
         self.assertEqual(status,200);self.assertEqual(first['total'],52);self.assertEqual(len(first['list']),50)
         self.assertEqual(first['list'][0]['result']['orderId'],'1234567890123456789')
+        self.assertEqual((first['list'][0]['wallet_balance'],first['list'][0]['available_balance']),('100','20'))
         status,second=self.request('/api/copy-tasks?account_id=%s&page=2'%a)
         self.assertEqual(status,200);self.assertEqual(len(second['list']),2)
         status,other=self.request('/api/copy-tasks?account_id=%s&page=1'%b)
