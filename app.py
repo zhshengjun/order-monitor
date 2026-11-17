@@ -132,6 +132,35 @@ class Binance:
         return data
 
 
+class FuturesAccount:
+    """Read-only USD-M futures account queries using HMAC API keys."""
+    def __init__(self, api_key, api_secret):
+        self.api_key, self.api_secret = api_key, api_secret
+
+    def get(self, path):
+        if path not in ('/fapi/v3/balance', '/fapi/v3/positionRisk'):
+            raise ValueError('不支持的查询')
+        query = urllib.parse.urlencode({'timestamp': int(time.time() * 1000), 'recvWindow': 5000})
+        signature = hmac.new(self.api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+        request = urllib.request.Request('https://fapi.binance.com' + path + '?' + query + '&signature=' + signature,
+            headers={'X-MBX-APIKEY': self.api_key})
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                result = json.loads(response.read(4000000), parse_float=str)
+        except urllib.error.HTTPError as exc:
+            try:
+                code = json.loads(exc.read(65536)).get('code', 'unknown')
+                if not isinstance(code, int): code = 'unknown'
+            except Exception:
+                code = 'unknown'
+            raise UpstreamError('Binance 合约查询失败：HTTP %s，错误码 %s' % (exc.code, code)) from None
+        except Exception:
+            raise UpstreamError('Binance 合约查询连接失败，请检查网络、代理和系统时间') from None
+        if not isinstance(result, list):
+            raise UpstreamError('Binance 合约查询响应格式异常')
+        return result
+
+
 class Store:
     def __init__(self, path):
         self.path = str(path)
@@ -441,6 +470,16 @@ def handler_factory(store, monitor, token):
                     for key in SECRETS:
                         settings[key + '_configured'] = bool(settings.pop(key))
                     return self.reply({'targets': targets, 'settings': settings, 'notifications': counts, 'notification_errors': errors, 'futures_accounts': accounts, 'copy_bindings': bindings})
+                if parsed.path == '/api/futures-snapshot':
+                    account_id = int(query.get('account_id', ['0'])[0])
+                    with store.db() as db:
+                        account = db.execute('SELECT api_key,api_secret FROM futures_accounts WHERE id=?', (account_id,)).fetchone()
+                    if not account:
+                        raise ValueError('账号不存在')
+                    client = FuturesAccount(account['api_key'], account['api_secret'])
+                    balances = client.get('/fapi/v3/balance')
+                    positions = client.get('/fapi/v3/positionRisk')
+                    return self.reply({'balances': balances, 'positions': positions, 'queried_at': int(time.time() * 1000)})
                 if parsed.path == '/api/events':
                     page = max(1, int(query.get('page', ['1'])[0]))
                     target, kind = query.get('target', [''])[0], query.get('kind', [''])[0]
