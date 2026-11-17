@@ -17,6 +17,7 @@ from decimal import Decimal, InvalidOperation
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from virtual_position import transition
 
 ROOT = Path(__file__).parent
 API_PATH = '/bapi/futures/v1/friendly/future/copy-trade/'
@@ -187,6 +188,17 @@ class Store:
             CREATE TABLE IF NOT EXISTS copy_bindings (
               account_id INTEGER NOT NULL, target_id TEXT NOT NULL,
               PRIMARY KEY(account_id, target_id));
+            CREATE TABLE IF NOT EXISTS virtual_sessions (
+              account_id INTEGER NOT NULL, target_id TEXT NOT NULL, started_at INTEGER NOT NULL,
+              active INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(account_id,target_id));
+            CREATE TABLE IF NOT EXISTS virtual_positions (
+              account_id INTEGER NOT NULL, target_id TEXT NOT NULL, symbol TEXT NOT NULL,
+              position_side TEXT NOT NULL, quantity TEXT NOT NULL, PRIMARY KEY(account_id,target_id,symbol,position_side));
+            CREATE TABLE IF NOT EXISTS virtual_events (
+              account_id INTEGER NOT NULL, target_id TEXT NOT NULL, order_key TEXT NOT NULL,
+              symbol TEXT NOT NULL, position_side TEXT NOT NULL, stamp INTEGER NOT NULL,
+              action TEXT NOT NULL, quantity TEXT NOT NULL, before_qty TEXT NOT NULL, after_qty TEXT NOT NULL,
+              PRIMARY KEY(account_id,target_id,order_key));
             CREATE TABLE IF NOT EXISTS outbox (
               id INTEGER PRIMARY KEY AUTOINCREMENT, event INTEGER NOT NULL, channel TEXT NOT NULL,
               status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
@@ -296,6 +308,21 @@ class Monitor:
                 return rows
         raise UpstreamError('新增记录超过 %s 条，未推进同步位置；可增加每页数量后重试' % (50 * page_size))
 
+    def virtual_apply(self, db, pid, key, row):
+        sessions = db.execute('SELECT account_id,started_at FROM virtual_sessions WHERE target_id=? AND active=1', (pid,)).fetchall()
+        for session in sessions:
+            aid, started = session['account_id'], session['started_at']
+            if int(row['orderTime']) <= started:
+                continue
+            if db.execute('SELECT 1 FROM virtual_events WHERE account_id=? AND target_id=? AND order_key=?', (aid, pid, key)).fetchone():
+                continue
+            symbol, side = row['symbol'], row['positionSide']
+            position = db.execute('SELECT quantity FROM virtual_positions WHERE account_id=? AND target_id=? AND symbol=? AND position_side=?', (aid, pid, symbol, side)).fetchone()
+            change = transition(position['quantity'] if position else '0', row['side'], side, row['executedQty'])
+            db.execute('INSERT INTO virtual_events VALUES(?,?,?,?,?,?,?,?,?,?)', (aid, pid, key, symbol, side, int(row['orderTime']), change['action'], str(row['executedQty']), change['before'], change['after']))
+            if change['action'] != 'unmatched_close':
+                db.execute('INSERT OR REPLACE INTO virtual_positions VALUES(?,?,?,?,?)', (aid,pid,symbol,side,change['after']))
+
     def poll(self, pid):
         with self.lock:
             with self.store.db() as db:
@@ -329,6 +356,8 @@ class Monitor:
                                 continue
                             historical = first or (watermark is not None and stamp < watermark)
                             self.store.event(db, pid, detail['nickname'], kind, body, stamp, historical, settings)
+                            if kind == 'order' and not historical:
+                                self.virtual_apply(db, pid, key, row)
                     balance = decimal_text(detail['marginBalance'])
                     db.execute('UPDATE targets SET name=?,detail=?,balance=?,initialized=1,last_check=?,next_check=?,failures=0,error=\'\' WHERE id=?',
                                (detail['nickname'], dumps(detail), balance, time.time(), time.time() + settings['interval'], pid))
@@ -464,12 +493,15 @@ def handler_factory(store, monitor, token):
                             row['detail'] = json.loads(row['detail'])
                         accounts = [dict(r) for r in db.execute("SELECT id,name FROM futures_accounts ORDER BY id")]
                         bindings = [dict(r) for r in db.execute('SELECT account_id,target_id FROM copy_bindings')]
+                        virtual_sessions = [dict(r) for r in db.execute('SELECT account_id,target_id,active,started_at FROM virtual_sessions')]
+                        virtual_positions = [dict(r) for r in db.execute("SELECT account_id,target_id,symbol,position_side,quantity FROM virtual_positions WHERE quantity != '0'")]
+                        virtual_events = [dict(r) for r in db.execute("SELECT account_id,target_id,symbol,position_side,stamp,action,quantity FROM virtual_events WHERE action='unmatched_close' ORDER BY stamp DESC LIMIT 20")]
                         counts = dict(db.execute('SELECT status,COUNT(*) FROM outbox GROUP BY status').fetchall())
                         errors = [dict(r) for r in db.execute("SELECT channel,attempts,error FROM outbox WHERE status='pending' AND error!='' ORDER BY id DESC LIMIT 5")]
                     settings = store.settings()
                     for key in SECRETS:
                         settings[key + '_configured'] = bool(settings.pop(key))
-                    return self.reply({'targets': targets, 'settings': settings, 'notifications': counts, 'notification_errors': errors, 'futures_accounts': accounts, 'copy_bindings': bindings})
+                    return self.reply({'targets': targets, 'settings': settings, 'notifications': counts, 'notification_errors': errors, 'futures_accounts': accounts, 'copy_bindings': bindings, 'virtual_sessions': virtual_sessions, 'virtual_positions': virtual_positions, 'virtual_events': virtual_events})
                 if parsed.path == '/api/futures-snapshot':
                     account_id = int(query.get('account_id', ['0'])[0])
                     with store.db() as db:
@@ -553,7 +585,24 @@ def handler_factory(store, monitor, token):
                         if selected:
                             db.execute('INSERT OR IGNORE INTO copy_bindings VALUES(?,?)', (account_id, target_id))
                         else:
+                            db.execute('UPDATE virtual_sessions SET active=0 WHERE account_id=? AND target_id=?', (account_id,target_id))
                             db.execute('DELETE FROM copy_bindings WHERE account_id=? AND target_id=?', (account_id, target_id))
+                elif self.path == '/api/virtual-session':
+                    account_id, target_id, active = data.get('account_id'), str(data.get('target_id', '')), data.get('active')
+                    if not isinstance(account_id, int) or not isinstance(active, bool):
+                        raise ValueError('参数错误')
+                    with monitor.lock, store.db() as db:
+                        binding = db.execute('SELECT t.initialized,t.enabled FROM copy_bindings b JOIN targets t ON t.id=b.target_id WHERE b.account_id=? AND b.target_id=?', (account_id,target_id)).fetchone()
+                        if not binding:
+                            raise ValueError('请先关联带单员')
+                        if active:
+                            if not binding['initialized'] or not binding['enabled']:
+                                raise ValueError('请先开启监听并完成首次同步')
+                            if db.execute('SELECT 1 FROM virtual_sessions WHERE account_id=? AND target_id=?', (account_id,target_id)).fetchone():
+                                raise ValueError('已有跟踪记录，不能重置为零')
+                            db.execute('INSERT INTO virtual_sessions VALUES(?,?,?,1)', (account_id,target_id,int(time.time()*1000)))
+                        else:
+                            db.execute('UPDATE virtual_sessions SET active=0 WHERE account_id=? AND target_id=?', (account_id,target_id))
                 elif self.path == '/api/test-notification':
                     channel = data.get('channel')
                     if channel not in ('telegram', 'bark'):
