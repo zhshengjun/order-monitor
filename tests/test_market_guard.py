@@ -4,10 +4,12 @@ from market_guard import check_price, close_position
 
 class MarketGuardTests(unittest.TestCase):
     def test_executable_side_and_exact_limit(self):
-        self.assertTrue(check_price('100','99.8','101','BUY')['allowed'])
-        self.assertFalse(check_price('100','99.8','101.00000000000000000001','BUY')['allowed'])
-        self.assertTrue(check_price('100','99','100.1','SELL')['allowed'])
-        self.assertFalse(check_price('100','98.99999999999999999999','100.1','SELL')['allowed'])
+        self.assertTrue(check_price('100','99.8','102','BUY')['allowed'])
+        self.assertTrue(check_price('100','98','100.1','SELL')['allowed'])
+        self.assertTrue(check_price('100','99.8','103','BUY')['allowed'])
+        self.assertFalse(check_price('100','99.8','103.00000000000000000001','BUY')['allowed'])
+        self.assertTrue(check_price('100','97','100.1','SELL')['allowed'])
+        self.assertFalse(check_price('100','96.99999999999999999999','100.1','SELL')['allowed'])
     def test_close_skips_missing_zero_and_opposite(self):
         positions=[{'symbol':'BTCUSDT','positionSide':'BOTH','positionAmt':'-0.01'}, {'symbol':'ETHUSDT','positionSide':'LONG','positionAmt':'0'}]
         self.assertEqual(close_position(positions,'BTCUSDT','LONG'),Decimal('0'))

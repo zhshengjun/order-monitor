@@ -111,8 +111,8 @@ class CopyExecutionTests(unittest.TestCase):
 
     def test_price_guard_and_hedge(self):
         row=order(101,'1');row['avgPrice']='100'
-        with self.assertRaisesRegex(ValueError,'1%'):
-            plan(row,'open','0','0','100',BALANCES,[],{'dualSidePosition':False},{'bidPrice':'100','askPrice':'101.01'},RULES)
+        with self.assertRaisesRegex(ValueError,'3%'):
+            plan(row,'open','0','0','100',BALANCES,[],{'dualSidePosition':False},{'bidPrice':'100','askPrice':'103.01'},RULES)
         row['side']='SELL'
         p=plan(row,'close','1','1','100',BALANCES,[{'symbol':'BTCUSDT','positionSide':'LONG','positionAmt':'1'}],{'dualSidePosition':True},QUOTE,RULES)
         self.assertEqual(p['positionSide'],'LONG');self.assertNotIn('reduceOnly',p)

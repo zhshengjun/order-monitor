@@ -69,7 +69,7 @@ def plan(row, action, before, attributed, lead_balance, balances, positions, mod
     if action=='unmatched_close': raise ValueError('虚拟仓位不足，跳过平仓')
     bid,ask=quote['bidPrice'],quote['askPrice']
     guard=check_price(row['avgPrice'],bid,ask,side)
-    if not guard['allowed']: raise ValueError('价格偏离超过 1%')
+    if not guard['allowed']: raise ValueError('价格偏离超过 3%')
     px=guard['price']; lot,min_notional=market_rule(exchange,symbol)
     step=Decimal(str(lot['stepSize'])); min_qty=Decimal(str(lot['minQty'])); max_qty=Decimal(str(lot['maxQty']))
     if not step.is_finite() or not min_qty.is_finite() or not max_qty.is_finite() or step<=0 or min_qty<0 or max_qty<=0: raise ValueError('市价单数量规则无效')

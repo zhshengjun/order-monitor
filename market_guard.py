@@ -13,7 +13,7 @@ def positive(value, name):
         raise ValueError(name + ' 必须是正的有限数值') from None
 
 
-def check_price(lead_price, bid, ask, side, limit='0.01'):
+def check_price(lead_price, bid, ask, side, limit='0.03'):
     reference = positive(lead_price, '带单成交均价')
     bid_text, ask_text = str(bid), str(ask)
     bid, ask = positive(bid, '买一价'), positive(ask, '卖一价')
