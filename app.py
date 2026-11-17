@@ -46,6 +46,37 @@ def decimal_text(value):
     return format(number(value), 'f')
 
 
+def notification_number(value):
+    """Format a finite decimal to at most four places without losing precision in storage."""
+    try:
+        value = Fraction(number(value))
+    except (ValueError, TypeError, InvalidOperation, OverflowError):
+        return '—'
+    negative = value < 0
+    scaled = abs(value) * 10000
+    units, remainder = divmod(scaled.numerator, scaled.denominator)
+    if remainder * 2 >= scaled.denominator:
+        units += 1
+    whole, fractional = divmod(units, 10000)
+    suffix = ('.%04d' % fractional).rstrip('0').rstrip('.')
+    return ('-' if negative and units else '') + str(whole) + suffix
+
+
+def actual_copy_notional(result, executed):
+    """Use exchange cumulative quote, or actual quantity and exchange average price."""
+    if executed == 0:
+        return '0'
+    from virtual_position import decimal_string
+    for field in ('cumQuote', 'avgPrice'):
+        try:
+            value = number(result[field])
+            if value > 0:
+                return decimal_string(Fraction(value) * (Fraction(executed) if field == 'avgPrice' else 1))
+        except (KeyError, ValueError, TypeError, InvalidOperation, OverflowError):
+            continue
+    return None
+
+
 def direction(row):
     return {('BUY', 'LONG'): '开多', ('SELL', 'LONG'): '平多',
             ('SELL', 'SHORT'): '开空', ('BUY', 'SHORT'): '平空'}.get(
@@ -422,15 +453,15 @@ class Monitor:
         if event['kind'] == 'order':
             text = '%s %s%s\n数量：%s %s\n均价：%s %s\n成交金额：%s %s\n已实现盈亏：%s %s' % (
                 body['symbol'], body['direction'], '（记录更新）' if body.get('updated') else '',
-                body['executedQty'], body.get('baseAsset', ''), body['avgPrice'], body.get('quoteAsset', ''),
-                body['notional'], body.get('quoteAsset', ''), body.get('totalPnl', '—'), body.get('quoteAsset', ''))
+                notification_number(body['executedQty']), body.get('baseAsset', ''), notification_number(body['avgPrice']), body.get('quoteAsset', ''),
+                notification_number(body['notional']), body.get('quoteAsset', ''), notification_number(body.get('totalPnl')), body.get('quoteAsset', ''))
         elif event['kind'] in ('copy', 'margin'):
             text = body['message']
         elif event['kind'] == 'transfer':
-            text = '%s\n%s %s\n%s → %s' % (body['transType'], body['amount'], body['coin'], body.get('from', ''), body.get('to', ''))
+            text = '%s\n%s %s\n%s → %s' % (body['transType'], notification_number(body['amount']), body['coin'], body.get('from', ''), body.get('to', ''))
         else:
             text = '%s → %s %s\n变动：%s\n余额快照差异，可能包含浮动盈亏。' % (body['before'], body['after'], body['coin'], body['delta'])
-        text += '\n时间（UTC）：' + time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(event['stamp'] / 1000))
+        text += '\n时间（UTC+8）：' + time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(event['stamp'] / 1000 + 8 * 3600))
         return title, text
 
     def deliver(self):
@@ -519,8 +550,9 @@ class Monitor:
                 before=Fraction(number(pos['quantity'] if pos else '0')); filled=Fraction(executed)
                 after=before+filled if task['action']=='open' else max(Fraction(0),before-filled)
                 db.execute('INSERT OR REPLACE INTO copied_positions VALUES(?,?,?,?,?)',(task['account_id'],task['target_id'],row['symbol'],row['positionSide'],decimal_string(after)))
-                db.execute("UPDATE copy_tasks SET state=?,result=?,error='' WHERE id=?",('filled' if status=='FILLED' else 'finished',dumps({'status':status,'executedQty':str(executed),'orderId':result.get('orderId')}),task['id']))
-                self.copy_notice(db,task,'%s %s，状态 %s，实际成交 %s' % (row['symbol'],direction(row),status,executed))
+                actual_notional = actual_copy_notional(result, executed)
+                db.execute("UPDATE copy_tasks SET state=?,result=?,error='' WHERE id=?",('filled' if status=='FILLED' else 'finished',dumps({'status':status,'executedQty':str(executed),'orderId':result.get('orderId'), 'cumQuote':actual_notional}),task['id']))
+                self.copy_notice(db,task,'%s %s，状态 %s\n实际成交数量：%s %s\n跟单金额：%s %s' % (row['symbol'],direction(row),status,notification_number(executed),row.get('baseAsset',''),notification_number(actual_notional),row.get('quoteAsset','USDT')))
 
     def check_margin(self, account):
         client = FuturesAccount(account['api_key'], account['api_secret'])

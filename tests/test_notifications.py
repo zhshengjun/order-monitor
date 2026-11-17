@@ -42,3 +42,24 @@ class NotificationFailureTests(unittest.TestCase):
         self.assertEqual(notification_error(error), '通知服务域名解析失败')
         error = urllib.error.URLError(TimeoutError('private-device-key'))
         self.assertEqual(notification_error(error), '通知服务连接超时')
+
+
+class NotificationFormattingTests(unittest.TestCase):
+    def test_order_notification_china_time_and_precision(self):
+        import json
+        event={'name':'带单员','kind':'order','stamp':0,'body':json.dumps({'symbol':'BTCUSDT','side':'BUY','positionSide':'LONG','executedQty':'596.18000000','baseAsset':'BTC','avgPrice':'160.64040800','quoteAsset':'USDT','notional':'95770.5984414400000000','totalPnl':'0.00000000'})}
+        _,text=Monitor.message(event)
+        for expected in ('数量：596.18 BTC','均价：160.6404 USDT','成交金额：95770.5984 USDT','已实现盈亏：0 USDT','时间（UTC+8）：1970-01-01 08:00:00'):
+            self.assertIn(expected,text)
+
+    def test_actual_notional_uses_only_exchange_fills(self):
+        from decimal import Decimal
+        from app import actual_copy_notional, notification_number
+        qty=Decimal('0.021')
+        self.assertEqual(actual_copy_notional({'cumQuote':'19.234500','avgPrice':'999'},qty),'19.2345')
+        self.assertEqual(actual_copy_notional({'avgPrice':'917.24'},qty),'19.26204')
+        self.assertIsNone(actual_copy_notional({'cumQuote':'0','avgPrice':'0'},qty))
+        self.assertEqual(actual_copy_notional({},Decimal('0')),'0')
+        self.assertEqual(notification_number('0.00005'),'0.0001')
+        self.assertEqual(notification_number('-1.23455'),'-1.2346')
+        self.assertEqual(notification_number('100000000000000000000.00000'),'100000000000000000000')

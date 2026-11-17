@@ -44,6 +44,20 @@ class CopyExecutionTests(unittest.TestCase):
         self.assertEqual(audit['lead_balance'],'100.00')
         self.assertEqual(audit['reference_price'],'100.1')
         self.assertEqual(audit['planned_quantity'],'0.999')
+    def test_notification_uses_actual_exchange_notional(self):
+        import json
+        row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
+        FakeExchange.result={'status':'FILLED','executedQty':'0.999','orderId':1,'cumQuote':'99.92500000','avgPrice':'100.0000'}
+        try:
+            with patch('app.FuturesClient',FakeExchange): self.monitor.execute_copy()
+            result=json.loads(self.rows('SELECT result FROM copy_tasks')[0]['result'])
+            self.assertEqual(result['cumQuote'], '99.925')
+            notice=json.loads(self.rows("SELECT body FROM events WHERE kind='copy'")[0]['body'])['message']
+            self.assertIn('实际成交数量：0.999 BTC',notice)
+            self.assertIn('跟单金额：99.925 USDT',notice)
+        finally:
+            FakeExchange.result={'status':'FILLED','executedQty':'0.999','orderId':1}
+
     def test_open_then_proportional_close_uses_actual_position(self):
         row=order(101,'2');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
         with patch('app.FuturesClient',FakeExchange):
