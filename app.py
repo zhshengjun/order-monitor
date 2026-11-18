@@ -91,10 +91,14 @@ def identity(kind, row):
 
 
 def history_identity(row):
+    def decimal_key(value):
+        text = format(number(value), 'f')
+        return text.rstrip('0').rstrip('.') if '.' in text else text
     return hashlib.sha256(dumps([str(row.get('symbol','')).strip().upper(),
                                   str(row.get('side','')).strip().upper(),
                                   str(row.get('positionSide','')).strip().upper(),
-                                  int(row['orderTime'])]).encode()).hexdigest()
+                                  int(row['orderTime']),decimal_key(row['executedQty']),
+                                  decimal_key(row['avgPrice']),decimal_key(row.get('totalPnl') or '0')]).encode()).hexdigest()
 
 
 def clean_history(row):
@@ -329,6 +333,18 @@ class Store:
                 db.execute('DELETE FROM leader_history_stage')
                 db.execute("UPDATE leader_history_sync SET page=1,complete=0,next_check=0,last_batch='',error=''")
                 db.execute("INSERT INTO app_migrations VALUES('history_page_size_100')")
+            if not db.execute("SELECT 1 FROM app_migrations WHERE name='history_identity_v4'").fetchone():
+                db.execute('CREATE TABLE IF NOT EXISTS leader_history_before_v4 AS SELECT * FROM leader_history')
+                saved = db.execute('SELECT target,body FROM leader_history').fetchall()
+                archived = db.execute('SELECT target,body FROM leader_history_before_v3').fetchall()
+                existing = db.execute("SELECT target,body FROM records WHERE kind='order'").fetchall()
+                db.execute('DELETE FROM leader_history')
+                for row in saved + archived + existing:
+                    cleaned = clean_history(json.loads(row['body']))
+                    db.execute('INSERT OR REPLACE INTO leader_history VALUES(?,?,?,?)',(row['target'],history_identity(cleaned),cleaned['orderTime'],dumps(cleaned)))
+                db.execute('DELETE FROM leader_history_stage')
+                db.execute("UPDATE leader_history_sync SET page=1,complete=0,next_check=0,last_batch='',error='' ")
+                db.execute("INSERT INTO app_migrations VALUES('history_identity_v4')")
             db.execute('INSERT OR IGNORE INTO baseline_watermarks SELECT r.target,r.kind,MAX(r.stamp) FROM records r JOIN targets t ON t.id=r.target WHERE t.initialized=1 GROUP BY r.target,r.kind')
         os.chmod(self.path, 0o600)
 
@@ -1069,6 +1085,26 @@ def handler_factory(store, monitor, token):
                     page = max(1, min(100000, int(query.get('page', ['1'])[0])))
                     limit = max(1, min(50, int(query.get('limit', ['50'])[0])))
                     target, kind = query.get('target', [''])[0], query.get('kind', [''])[0]
+                    if target and kind in ('leader','order','transfer'):
+                        with store.db() as db:
+                            exists = db.execute('SELECT name FROM targets WHERE id=?',(target,)).fetchone()
+                            if exists:
+                                parts, args = [], []
+                                if kind in ('leader','order'):
+                                    parts.append("SELECT h.target,t.name,'order' AS kind,h.body,h.stamp,0 AS historical,'h:'||h.key AS sort_key FROM leader_history h JOIN targets t ON t.id=h.target WHERE h.target=?")
+                                    args.append(target)
+                                if kind in ('leader','transfer'):
+                                    parts.append("SELECT target,name,kind,body,stamp,historical,'e:'||printf('%020d',id) AS sort_key FROM events WHERE target=? AND kind='transfer'")
+                                    args.append(target)
+                                combined=' UNION ALL '.join(parts)
+                                total=db.execute('SELECT COUNT(*) FROM ('+combined+')',args).fetchone()[0]
+                                rows=[dict(r) for r in db.execute('SELECT * FROM ('+combined+') ORDER BY stamp DESC,sort_key DESC LIMIT ? OFFSET ?',args+[limit,(page-1)*limit])]
+                                for row in rows:
+                                    row['body']=json.loads(row['body'])
+                                    if row['kind']=='order':
+                                        row['body']['direction']=direction(row['body'])
+                                        row['body']['notional']=decimal_text(number(row['body']['executedQty'])*number(row['body']['avgPrice']))
+                                return self.reply({'list':rows,'total':total,'page':page})
                     where, args = ("kind IN ('order','transfer')" if kind == 'leader' else "kind IN ('order','transfer','copy')"), []
                     if kind == 'leader': kind = ''
                     for column, value in [('target', target), ('kind', kind)]:

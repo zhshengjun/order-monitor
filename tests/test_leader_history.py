@@ -70,12 +70,13 @@ class LeaderHistoryTests(unittest.TestCase):
                 self.assertEqual(db.execute('SELECT complete FROM leader_history_sync').fetchone()[0],1)
             self.assertEqual([x[1] for x in api.calls], [1,2,3])
 
-    def test_history_deduplicates_by_symbol_direction_and_time(self):
+    def test_history_distinguishes_same_time_different_fills(self):
         with tempfile.TemporaryDirectory() as tmp:
             store=Store(Path(tmp)/'db');api=FakeAPI();monitor=Monitor(store,api);monitor.add(PID)
             a=order(1,'1');b=order(1,'2')
             self.assertEqual(identity('order',a),identity('order',b))
-            self.assertEqual(history_identity(a),history_identity(b))
+            self.assertNotEqual(history_identity(a),history_identity(b))
+            self.assertEqual(history_identity(a),history_identity(dict(a,executedQty='1.00000000',avgPrice='0.10000000')))
             variant=dict(a,symbol=' btcusdt ',side=' buy ',positionSide=' long ',orderTime='1')
             self.assertEqual(history_identity(a),history_identity(variant))
             self.assertNotEqual(history_identity(a),history_identity(dict(a,side='SELL')))
@@ -86,7 +87,21 @@ class LeaderHistoryTests(unittest.TestCase):
             monitor.sync_history(PID)
             store=Store(store.path)
             with store.db() as db:
-                self.assertEqual(db.execute('SELECT COUNT(*) FROM leader_history').fetchone()[0],1)
+                self.assertEqual(db.execute('SELECT COUNT(*) FROM leader_history').fetchone()[0],2)
+
+    def test_migration_recovers_distinct_fills_from_older_backup(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            store=Store(Path(tmp)/'db');a=order(10,'1');b=order(10,'2')
+            with store.db() as db:
+                db.execute("DELETE FROM app_migrations WHERE name='history_identity_v4'")
+                db.execute('DROP TABLE leader_history_before_v4')
+                db.execute('INSERT INTO leader_history VALUES(?,?,?,?)',(PID,'old',10,json.dumps(a)))
+                db.execute('INSERT INTO leader_history_before_v3 VALUES(?,?,?,?)',(PID,'other',10,json.dumps(b)))
+            store=Store(store.path)
+            with store.db() as db:
+                self.assertEqual(db.execute('SELECT COUNT(*) FROM leader_history').fetchone()[0],2)
+                self.assertEqual(db.execute('SELECT COUNT(*) FROM leader_history_before_v4').fetchone()[0],1)
 
     def test_failed_rebuild_keeps_previous_history_until_empty_page(self):
         import json
