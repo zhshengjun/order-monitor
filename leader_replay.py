@@ -12,10 +12,12 @@ def replay(rows):
             raise ValueError('交易方向无效，无法重放持仓')
         try:
             quantity, price = Decimal(str(row['executedQty'])), Decimal(str(row['avgPrice']))
-            if not quantity.is_finite() or not price.is_finite() or quantity <= 0 or price <= 0:
+            if not quantity.is_finite() or not price.is_finite() or quantity < 0 or (quantity > 0 and price <= 0):
                 raise ValueError
         except (InvalidOperation, ValueError, TypeError):
             raise ValueError('成交数量或价格无效，无法重放持仓') from None
+        if quantity == 0:
+            continue
         key = (symbol, position_side)
         position = positions.setdefault(key, {'qty': Fraction(0), 'cost': Fraction(0), 'uncertain': False})
         stamp_key = (symbol, position_side, int(row['orderTime']))

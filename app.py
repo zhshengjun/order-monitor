@@ -91,12 +91,22 @@ def identity(kind, row):
 
 
 def history_identity(row):
-    for field in ('orderId', 'tradeId'):
-        value = row.get(field)
-        if value is not None and str(value).strip() and str(value) != '0':
-            return hashlib.sha256(dumps([field,str(value),row.get('symbol')]).encode()).hexdigest()
-    fields = ('symbol','side','positionSide','type','orderTime','executedQty','avgPrice','totalPnl')
-    return hashlib.sha256(dumps([row.get(k) for k in fields]).encode()).hexdigest()
+    return hashlib.sha256(dumps([str(row.get('symbol','')).strip().upper(),
+                                  str(row.get('side','')).strip().upper(),
+                                  str(row.get('positionSide','')).strip().upper(),
+                                  int(row['orderTime'])]).encode()).hexdigest()
+
+
+def clean_history(row):
+    row = dict(row)
+    for field in ('symbol','side','positionSide'):
+        if not isinstance(row.get(field),str) or not row[field].strip():
+            raise ValueError('历史交易字段缺失：'+field)
+        row[field] = row[field].strip().upper()
+    row['orderTime'] = int(row['orderTime'])
+    if row['orderTime'] < 0:
+        raise ValueError('历史交易时间无效')
+    return row
 
 
 class UpstreamError(Exception):
@@ -226,6 +236,9 @@ class Store:
             CREATE TABLE IF NOT EXISTS leader_history (
               target TEXT NOT NULL, key TEXT NOT NULL, stamp INTEGER NOT NULL, body TEXT NOT NULL,
               PRIMARY KEY(target,key));
+            CREATE TABLE IF NOT EXISTS leader_history_stage (
+              target TEXT NOT NULL, key TEXT NOT NULL, stamp INTEGER NOT NULL, body TEXT NOT NULL,
+              PRIMARY KEY(target,key));
             CREATE INDEX IF NOT EXISTS leader_history_time ON leader_history(target,stamp);
             CREATE TABLE IF NOT EXISTS leader_history_sync (
               target TEXT PRIMARY KEY, page INTEGER NOT NULL DEFAULT 1, complete INTEGER NOT NULL DEFAULT 0,
@@ -290,14 +303,32 @@ class Store:
             sync_columns = {row['name'] for row in db.execute('PRAGMA table_info(leader_history_sync)')}
             if 'last_batch' not in sync_columns:
                 db.execute("ALTER TABLE leader_history_sync ADD COLUMN last_batch TEXT NOT NULL DEFAULT ''")
+            if 'started_at' not in sync_columns:
+                db.execute('ALTER TABLE leader_history_sync ADD COLUMN started_at INTEGER NOT NULL DEFAULT 0')
+            if 'failures' not in sync_columns:
+                db.execute('ALTER TABLE leader_history_sync ADD COLUMN failures INTEGER NOT NULL DEFAULT 0')
             if not db.execute("SELECT 1 FROM app_migrations WHERE name='history_identity_v2'").fetchone():
                 saved = db.execute('SELECT target,stamp,body FROM leader_history').fetchall()
                 existing_records = db.execute("SELECT target,stamp,body FROM records WHERE kind='order'").fetchall()
                 db.execute('DELETE FROM leader_history')
                 for row in saved + existing_records:
-                    db.execute('INSERT OR REPLACE INTO leader_history VALUES(?,?,?,?)',(row['target'],history_identity(json.loads(row['body'])),row['stamp'],row['body']))
+                    cleaned = clean_history(json.loads(row['body']))
+                    db.execute('INSERT OR REPLACE INTO leader_history VALUES(?,?,?,?)',(row['target'],history_identity(cleaned),cleaned['orderTime'],dumps(cleaned)))
                 db.execute("UPDATE leader_history_sync SET page=1,complete=0,next_check=0,last_batch='',error=''")
                 db.execute("INSERT INTO app_migrations VALUES('history_identity_v2')")
+            if not db.execute("SELECT 1 FROM app_migrations WHERE name='history_identity_v3'").fetchone():
+                db.execute('CREATE TABLE IF NOT EXISTS leader_history_before_v3 AS SELECT * FROM leader_history')
+                saved = db.execute('SELECT target,stamp,body FROM leader_history').fetchall()
+                db.execute('DELETE FROM leader_history')
+                for row in saved:
+                    cleaned = clean_history(json.loads(row['body']))
+                    db.execute('INSERT OR REPLACE INTO leader_history VALUES(?,?,?,?)',(row['target'],history_identity(cleaned),cleaned['orderTime'],dumps(cleaned)))
+                db.execute("UPDATE leader_history_sync SET page=1,complete=0,next_check=0,last_batch='',error=''")
+                db.execute("INSERT INTO app_migrations VALUES('history_identity_v3')")
+            if not db.execute("SELECT 1 FROM app_migrations WHERE name='history_page_size_100'").fetchone():
+                db.execute('DELETE FROM leader_history_stage')
+                db.execute("UPDATE leader_history_sync SET page=1,complete=0,next_check=0,last_batch='',error=''")
+                db.execute("INSERT INTO app_migrations VALUES('history_page_size_100')")
             db.execute('INSERT OR IGNORE INTO baseline_watermarks SELECT r.target,r.kind,MAX(r.stamp) FROM records r JOIN targets t ON t.id=r.target WHERE t.initialized=1 GROUP BY r.target,r.kind')
         os.chmod(self.path, 0o600)
 
@@ -491,7 +522,11 @@ class Monitor:
                     for row in sorted(rows, key=lambda r: int(r[time_key])):
                         key, stamp = identity(kind, row), int(row[time_key])
                         if kind == 'order':
-                            db.execute('INSERT OR REPLACE INTO leader_history VALUES(?,?,?,?)', (pid,history_identity(row),stamp,dumps(row)))
+                            cleaned = clean_history(row)
+                            db.execute('INSERT OR REPLACE INTO leader_history VALUES(?,?,?,?)', (pid,history_identity(cleaned),stamp,dumps(cleaned)))
+                            active = db.execute('SELECT 1 FROM leader_history_sync WHERE target=? AND complete=0 AND started_at>0',(pid,)).fetchone()
+                            if active:
+                                db.execute('INSERT OR REPLACE INTO leader_history_stage VALUES(?,?,?,?)', (pid,history_identity(cleaned),stamp,dumps(cleaned)))
                         previous = db.execute('SELECT body FROM records WHERE target=? AND kind=? AND key=?', (pid, kind, key)).fetchone()
                         if previous and json.loads(previous[0]) == row:
                             continue
@@ -794,22 +829,36 @@ class Monitor:
         if sync['next_check'] > time.time(): return
         page = sync['page']
         try:
-            data = self.api.history(pid,'order',page,20)
-            rows, total = data['list'], int(data['total'])
+            if page == 1:
+                with self.store.db() as db:
+                    db.execute('DELETE FROM leader_history_stage WHERE target=?',(pid,))
+                    db.execute('UPDATE leader_history_sync SET started_at=?,complete=0 WHERE target=?',(int(time.time()*1000),pid))
+            data = self.api.history(pid,'order',page,100)
+            rows, total = [clean_history(row) for row in data['list']], int(data['total'])
             if total < 0: raise ValueError('历史总数无效')
             fingerprint = hashlib.sha256(dumps([history_identity(row) for row in rows]).encode()).hexdigest() if rows else ''
             if page > 1 and fingerprint and fingerprint == sync['last_batch']:
                 raise UpstreamError('上游连续返回相同的历史页面，请检查分页接口；同步未完成')
             with self.store.db() as db:
                 for row in rows:
-                    db.execute('INSERT OR REPLACE INTO leader_history VALUES(?,?,?,?)', (pid,history_identity(row),int(row['orderTime']),dumps(row)))
+                    db.execute('INSERT OR REPLACE INTO leader_history_stage VALUES(?,?,?,?)', (pid,history_identity(row),int(row['orderTime']),dumps(row)))
                 complete = not rows
-                db.execute('UPDATE leader_history_sync SET page=?,complete=?,total=?,next_check=?,error=?,updated=?,last_batch=? WHERE target=?',
-                           (1 if complete else page+1,int(complete),total,time.time()+(3600 if complete else 1),'',time.time(),fingerprint,pid))
+                if complete:
+                    started = db.execute('SELECT started_at FROM leader_history_sync WHERE target=?',(pid,)).fetchone()[0]
+                    for live in db.execute("SELECT body FROM records WHERE target=? AND kind='order' AND stamp>=?",(pid,started)).fetchall():
+                        recent = clean_history(json.loads(live['body']))
+                        db.execute('INSERT OR REPLACE INTO leader_history_stage VALUES(?,?,?,?)',(pid,history_identity(recent),recent['orderTime'],dumps(recent)))
+                    db.execute('DELETE FROM leader_history WHERE target=?',(pid,))
+                    db.execute('INSERT INTO leader_history SELECT * FROM leader_history_stage WHERE target=?',(pid,))
+                    db.execute('DELETE FROM leader_history_stage WHERE target=?',(pid,))
+                db.execute('UPDATE leader_history_sync SET page=?,complete=?,total=?,next_check=?,error=?,updated=?,last_batch=?,failures=0 WHERE target=?',
+                           (1 if complete else page+1,int(complete),total,time.time()+(3600 if complete else 5),'',time.time(),fingerprint,pid))
         except Exception as exc:
             reason = str(exc)[:200] if isinstance(exc,(UpstreamError,ValueError)) else '历史同步失败'
             with self.store.db() as db:
-                db.execute('UPDATE leader_history_sync SET error=?,next_check=? WHERE target=?',(reason,time.time()+60,pid))
+                failures = sync['failures'] + 1
+                delay = min(900,60 * 2**min(failures-1,4))
+                db.execute('UPDATE leader_history_sync SET error=?,next_check=?,failures=? WHERE target=?',(reason,time.time()+delay,failures,pid))
             LOG.warning('portfolio %s history sync: %s',pid,reason)
 
     def history_worker(self):
@@ -822,6 +871,7 @@ class Monitor:
                     self.sync_history(pid)
                 except Exception:
                     LOG.exception('portfolio %s history worker failed',pid)
+                if self.stop.wait(5): return
             self.stop.wait(1)
 
     def run(self):
@@ -841,15 +891,15 @@ class Monitor:
                     LOG.exception('通知任务处理异常')
                 self.stop.wait(1)
 
-        threading.Thread(target=copies, daemon=True).start()
-        threading.Thread(target=notifications, daemon=True).start()
-        threading.Thread(target=self.history_worker, daemon=True).start()
+        workers = [threading.Thread(target=target, daemon=True) for target in (copies, notifications, self.history_worker)]
+        for worker in workers: worker.start()
         while not self.stop.is_set():
             with self.store.db() as db:
                 ids = [r[0] for r in db.execute('SELECT id FROM targets WHERE enabled=1 AND next_check<=? ORDER BY next_check', (time.time(),))]
             with ThreadPoolExecutor(max_workers=4) as pool:
                 list(pool.map(self.poll, ids))
             self.stop.wait(1)
+        for worker in workers: worker.join(timeout=25)
 
 
 class NotificationError(Exception):
@@ -998,8 +1048,9 @@ def handler_factory(store, monitor, token):
                         if not db.execute('SELECT 1 FROM targets WHERE id=?',(pid,)).fetchone():
                             raise ValueError('带单员不存在')
                         rows = [json.loads(r['body']) for r in db.execute('SELECT body FROM leader_history WHERE target=? ORDER BY stamp,key',(pid,))]
-                        sync = db.execute('SELECT page,complete,total,error,updated FROM leader_history_sync WHERE target=?',(pid,)).fetchone()
-                    return self.reply({'positions':replay(rows), 'count':len(rows), 'sync':dict(sync) if sync else None})
+                        sync = db.execute('SELECT page,complete,total,error,updated,next_check,failures FROM leader_history_sync WHERE target=?',(pid,)).fetchone()
+                        staged = db.execute('SELECT COUNT(*) FROM leader_history_stage WHERE target=?',(pid,)).fetchone()[0]
+                    return self.reply({'positions':replay(rows), 'count':len(rows), 'staged':staged, 'sync':dict(sync) if sync else None})
                 if parsed.path == '/api/copy-tasks':
                     account_id=int(query.get('account_id', ['0'])[0])
                     page=max(1,min(100000,int(query.get('page',['1'])[0])))
@@ -1075,7 +1126,8 @@ def handler_factory(store, monitor, token):
                     with monitor.history_lock, store.db() as db:
                         if not db.execute('SELECT 1 FROM targets WHERE id=? AND enabled=1',(pid,)).fetchone():
                             raise ValueError('请先开启该带单员的监听')
-                        db.execute("INSERT INTO leader_history_sync(target,page,complete,total,next_check,error,last_batch) VALUES(?,1,0,0,0,'','') ON CONFLICT(target) DO UPDATE SET page=1,complete=0,total=0,next_check=0,error='',last_batch=''",(pid,))
+                        db.execute('DELETE FROM leader_history_stage WHERE target=?',(pid,))
+                        db.execute("INSERT INTO leader_history_sync(target,page,complete,total,next_check,error,last_batch,failures) VALUES(?,1,0,0,0,'','',0) ON CONFLICT(target) DO UPDATE SET page=1,complete=0,total=0,next_check=0,error='',last_batch='',failures=0",(pid,))
                 elif self.path == '/api/toggle':
                     monitor.toggle(str(data.get('id')), data.get('enabled'))
                 elif self.path == '/api/futures-account':
