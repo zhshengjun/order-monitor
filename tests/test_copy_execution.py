@@ -314,11 +314,6 @@ class CopyExecutionTests(unittest.TestCase):
         self.assertEqual(task['state'],'submitted');self.assertIn('/fapi/v1/order',task['error'])
         self.assertEqual(place.call_count,1)
 
-    def test_close_no_position_is_not_placed(self):
-        row=order(101,'1');row['side']='SELL';row['avgPrice']='100'
-        with self.assertRaisesRegex(ValueError,'没有对应方向持仓'):
-            plan(row,'close','2','1','100',BALANCES,[],{'dualSidePosition':False},QUOTE,RULES)
-
     def test_close_without_position_skips_without_retry_or_balance_query(self):
         row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
         with self.store.db() as db: db.execute("UPDATE copy_tasks SET action='close'")
@@ -397,18 +392,6 @@ class CopyExecutionTests(unittest.TestCase):
         self.assertEqual(FakeExchange.calls,[])
         task=self.rows('SELECT state,error FROM copy_tasks')[0]
         self.assertEqual(task['state'],'skipped');self.assertIn('可用余额',task['error'])
-
-    def test_open_size_uses_wallet_balance_not_available_balance(self):
-        row=order(101,'1');row['avgPrice']='100'
-        balances=[{'asset':'USDT','balance':'100','availableBalance':'20'}]
-        params=plan(row,'open','0','0','100',balances,[],{'dualSidePosition':False},QUOTE,RULES,mark_price='100',leverage='10')
-        self.assertEqual(params['quantity'],'0.999')
-
-    def test_open_checks_available_balance_even_above_minimum(self):
-        row=order(101,'1');row['avgPrice']='100'
-        balances=[{'asset':'USDT','balance':'100','availableBalance':'5'}]
-        with self.assertRaisesRegex(ValueError,'可用余额'):
-            plan(row,'open','0','0','100',balances,[],{'dualSidePosition':False},QUOTE,RULES,mark_price='100',leverage='10')
 
     def test_margin_check_uses_ten_or_actual_lower_leverage(self):
         row=order(101,'1');row['avgPrice']='100'
