@@ -97,7 +97,7 @@ class MonitorTests(unittest.TestCase):
         self.api.calls.clear()
         self.api.orders.insert(0, order(3001))
         self.monitor.poll(PID)
-        self.assertEqual(self.api.calls, [('order', 1), ('order', 2), ('transfer', 1)])
+        self.assertEqual(self.api.calls, [('order', 1), ('transfer', 1)])
         self.assertEqual(len([r for r in self.rows('events') if not r['historical']]), 1)
 
     def test_restart_deduplicates(self):
@@ -220,23 +220,23 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(len(self.rows('events')), 1)
         self.assertEqual(self.rows('outbox'), [])
 
-    def test_page_size_five_catches_more_than_one_page(self):
+    def test_order_poll_continues_when_page_has_no_saved_records(self):
         self.baseline()
         self.api.orders = [order(x) for x in range(113, 98, -1)]
         self.monitor.poll(PID)
         self.assertEqual(len([e for e in self.rows('events') if not e['historical']]), 13)
-        self.assertIn(('order', 3), self.api.calls)
+        self.assertIn(('order', 2), self.api.calls)
         self.assertEqual(len(self.rows('outbox')), 26)
         self.monitor.poll(PID)
         self.assertEqual(len(self.rows('outbox')), 26)
 
-    def test_backfill_multiple_pages_no_historical_alert(self):
+    def test_order_poll_continues_until_known_page(self):
         self.baseline()
         self.api.orders = [order(x) for x in range(145, 80, -1)]
         self.monitor.poll(PID)
         new = [e for e in self.rows('events') if not e['historical']]
         self.assertEqual(len(new), 45)
-        self.assertIn(('order', 3), self.api.calls)
+        self.assertIn(('order', 2), self.api.calls)
 
     def test_failed_batch_does_not_advance_baseline(self):
         self.api.history = lambda *args: (_ for _ in ()).throw(UpstreamError('failed'))

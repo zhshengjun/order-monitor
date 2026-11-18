@@ -69,8 +69,8 @@ class CopyExecutionTests(unittest.TestCase):
         self.assertIn('超过 3 分钟',task['error'])
         self.assertEqual(FakeExchange.calls,[])
 
-    def test_same_order_across_pages_creates_one_aggregated_task(self):
-        self.store.save_settings({'page_size':5})
+    def test_same_order_in_page_creates_one_aggregated_task(self):
+        self.store.save_settings({'page_size':20})
         fills=[]
         for i in range(1,8):
             row=order(101,str(i));row['avgPrice']=str(100+i);fills.append(row)

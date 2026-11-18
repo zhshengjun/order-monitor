@@ -582,6 +582,20 @@ class Monitor:
             page_size = self.store.settings(db)['page_size'] if initialized else 20
             if not initialized and kind == 'order':
                 watermark = db.execute('SELECT MIN(started_at) FROM copy_live WHERE target_id=? AND enabled=1',(pid,)).fetchone()[0]
+        if kind == 'order':
+            rows=[]
+            for page in range(1,51):
+                batch=self.api.history(pid,kind,page,page_size)['list']
+                rows.extend(batch)
+                if not batch or len(batch)<page_size or (not initialized and watermark is None): return rows
+                if initialized:
+                    key=history_identity(clean_history(batch[-1]))
+                    with self.store.db() as db:
+                        known=db.execute('SELECT 1 FROM leader_history WHERE target=? AND key=?',(pid,key)).fetchone()
+                    if known: return rows
+                elif min(int(x['orderTime']) for x in batch)<=watermark:
+                    return rows
+            raise UpstreamError('新增记录超过 %s 条，未推进同步位置；请检查监听间隔' % (50*page_size))
         rows = []
         time_key = 'orderTime' if kind == 'order' else 'time'
         crossed = False
