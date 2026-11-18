@@ -65,6 +65,20 @@ class CopyExecutionTests(unittest.TestCase):
         self.assertEqual(row['avgPrice'],'105')
         self.assertEqual(self.rows('SELECT enabled FROM copy_live')[0]['enabled'],1)
         self.assertEqual(len(self.rows('SELECT * FROM leader_history WHERE stamp=101')),7)
+
+    def test_first_poll_follows_only_trades_after_enable(self):
+        with self.store.db() as db:
+            db.execute('UPDATE targets SET initialized=0 WHERE id=?',(PID,))
+            db.execute('DELETE FROM records WHERE target=?',(PID,))
+            db.execute('UPDATE copy_live SET started_at=100 WHERE target_id=?',(PID,))
+            db.execute('UPDATE virtual_sessions SET started_at=100 WHERE target_id=?',(PID,))
+        self.api.orders=[order(x,'1') for x in range(125,98,-1)]
+        self.monitor.poll(PID)
+        tasks=self.rows('SELECT body FROM copy_tasks')
+        import json
+        self.assertEqual(len(tasks),25)
+        self.assertEqual(min(json.loads(x['body'])['orderTime'] for x in tasks),101)
+        self.assertIn(('order',2),self.api.calls)
     def test_notification_uses_actual_exchange_notional(self):
         import json
         row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)

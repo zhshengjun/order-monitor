@@ -53,14 +53,22 @@ class HTTPTests(unittest.TestCase):
             account_id=db.execute("SELECT id FROM futures_accounts WHERE name='copy-test'").fetchone()[0]
         self.assertEqual(self.request('/api/targets', {'id':'4321'})[0],200)
         self.assertEqual(self.request('/api/copy-binding',{'account_id':account_id,'target_id':'4321','selected':True})[0],200)
-        self.assertEqual(self.request('/api/copy-live',{'account_id':account_id,'target_id':'4321','enabled':True})[0],400)
-        with self.store.db() as db: db.execute("UPDATE targets SET initialized=1 WHERE id='4321'")
         self.assertEqual(self.request('/api/copy-live',{'account_id':account_id,'target_id':'4321','enabled':True})[0],200)
         with self.store.db() as db:
             self.assertEqual(db.execute('SELECT enabled FROM copy_live WHERE account_id=?',(account_id,)).fetchone()[0],1)
             self.assertEqual(db.execute('SELECT COUNT(*) FROM virtual_positions WHERE account_id=?',(account_id,)).fetchone()[0],0)
-        self.assertEqual(self.request('/api/copy-live',{'account_id':account_id,'target_id':'4321','enabled':False})[0],200)
+            before=db.execute('SELECT started_at FROM copy_live WHERE account_id=?',(account_id,)).fetchone()[0]
         self.assertEqual(self.request('/api/copy-live',{'account_id':account_id,'target_id':'4321','enabled':True})[0],200)
+        with self.store.db() as db:
+            self.assertEqual(db.execute('SELECT started_at FROM copy_live WHERE account_id=?',(account_id,)).fetchone()[0],before)
+        self.assertEqual(self.request('/api/copy-live',{'account_id':account_id,'target_id':'4321','enabled':False})[0],200)
+        with self.store.db() as db:
+            db.execute("INSERT INTO copied_positions VALUES(?,?,?,?,?)",(account_id,'4321','BTCUSDT','LONG','1'))
+            db.execute("INSERT INTO virtual_positions VALUES(?,?,?,?,?)",(account_id,'4321','BTCUSDT','LONG','10'))
+        self.assertEqual(self.request('/api/copy-live',{'account_id':account_id,'target_id':'4321','enabled':True})[0],200)
+        with self.store.db() as db:
+            self.assertEqual(db.execute('SELECT quantity FROM virtual_positions WHERE account_id=?',(account_id,)).fetchone()[0],'10')
+            self.assertEqual(db.execute('SELECT quantity FROM copied_positions WHERE account_id=?',(account_id,)).fetchone()[0],'1')
 
     def test_account_copy_records_are_scoped_and_paginated(self):
         with self.store.db() as db:

@@ -506,6 +506,8 @@ class Monitor:
             stamps = db.execute('SELECT MAX(stamp) FROM records WHERE target=? AND kind=?', (pid, kind)).fetchone()
             watermark = stamps[0]
             page_size = self.store.settings(db)['page_size'] if initialized else 20
+            if not initialized and kind == 'order':
+                watermark = db.execute('SELECT MIN(started_at) FROM copy_live WHERE target_id=? AND enabled=1',(pid,)).fetchone()[0]
         rows = []
         time_key = 'orderTime' if kind == 'order' else 'time'
         crossed = False
@@ -513,7 +515,7 @@ class Monitor:
             data = self.api.history(pid, kind, page, page_size)
             batch = data['list']
             rows.extend(batch)
-            if not initialized:
+            if not initialized and watermark is None:
                 return rows  # Initial page is a baseline, not a notification backlog.
             if not batch:
                 return rows
@@ -605,7 +607,8 @@ class Monitor:
                                 if identity(kind, json.loads(event['body'])) == key:
                                     db.execute('UPDATE events SET body=? WHERE id=?', (dumps(body), event['id']))
                             continue
-                        historical = first or (baseline is not None and stamp <= baseline['stamp'])
+                        live_started = db.execute('SELECT 1 FROM copy_live WHERE target_id=? AND enabled=1 AND started_at<? LIMIT 1',(pid,stamp)).fetchone() if first and kind == 'order' else None
+                        historical = (first and not live_started) or (not first and baseline is not None and stamp <= baseline['stamp'])
                         self.store.event(db, pid, detail['nickname'], kind, body, stamp, historical, settings)
                         if kind == 'order' and not historical:
                             self.virtual_apply(db, pid, key, row, detail['marginBalance'])
@@ -1249,14 +1252,15 @@ def handler_factory(store, monitor, token):
                         binding=db.execute('SELECT t.initialized,t.enabled FROM copy_bindings b JOIN targets t ON t.id=b.target_id WHERE b.account_id=? AND b.target_id=?',(account_id,target_id)).fetchone()
                         if not binding: raise ValueError('请先关联带单员')
                         if enabled:
-                            if not binding['initialized'] or not binding['enabled']: raise ValueError('请先开启监听并完成基线')
+                            if not binding['enabled']: raise ValueError('请先开启监听')
+                            current_live=db.execute('SELECT enabled FROM copy_live WHERE account_id=? AND target_id=?',(account_id,target_id)).fetchone()
+                            if current_live and current_live['enabled']:
+                                return self.reply({'ok': True})
                             if db.execute("SELECT 1 FROM copy_tasks WHERE account_id=? AND state='submitted'", (account_id,)).fetchone(): raise ValueError('该账号有结果未确认的订单，请先核对')
-                            positions=db.execute('SELECT quantity FROM copied_positions WHERE account_id=? AND target_id=?',(account_id,target_id)).fetchall()
-                            if any(number(x['quantity']) != 0 for x in positions): raise ValueError('该关联仍有跟单持仓，不能重置基线')
                             now=int(time.time()*1000)
-                            db.execute('DELETE FROM virtual_positions WHERE account_id=? AND target_id=?',(account_id,target_id))
                             db.execute('INSERT OR REPLACE INTO virtual_sessions VALUES(?,?,?,1)',(account_id,target_id,now))
                             db.execute('INSERT OR REPLACE INTO copy_live VALUES(?,?,1,?)',(account_id,target_id,now))
+                            db.execute('UPDATE targets SET next_check=0 WHERE id=?',(target_id,))
                         else:
                             db.execute('UPDATE copy_live SET enabled=0 WHERE account_id=? AND target_id=?',(account_id,target_id))
                             db.execute('UPDATE virtual_sessions SET active=0 WHERE account_id=? AND target_id=?',(account_id,target_id))
