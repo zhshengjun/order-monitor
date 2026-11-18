@@ -220,3 +220,28 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(self.request('/api/targets', {'id': '123'})[0], 200)
         self.assertEqual(self.request('/api/toggle', {'id': '123', 'enabled': False})[0], 200)
         self.assertEqual(self.request('/api/events?page=1')[0], 200)
+
+    def test_edit_futures_account_preserves_or_replaces_credentials(self):
+        with self.store.db() as db:
+            account=db.execute("INSERT INTO futures_accounts(name,api_key,api_secret) VALUES('edit-test','old-key','old-secret')").lastrowid
+        self.assertEqual(self.request('/api/futures-account',{'account_id':account,'name':'edited'})[0],200)
+        with self.store.db() as db:
+            self.assertEqual(tuple(db.execute('SELECT name,api_key,api_secret FROM futures_accounts WHERE id=?',(account,)).fetchone()),('edited','old-key','old-secret'))
+        self.assertEqual(self.request('/api/futures-account',{'account_id':account,'name':'edited','api_key':'new-key','api_secret':'new-secret'})[0],200)
+        with self.store.db() as db:
+            self.assertEqual(tuple(db.execute('SELECT api_key,api_secret FROM futures_accounts WHERE id=?',(account,)).fetchone()),('new-key','new-secret'))
+            db.execute('INSERT INTO copied_positions VALUES(?,?,?,?,?)',(account,'leader','BTCUSDT','LONG','1'))
+        self.assertEqual(self.request('/api/futures-account',{'account_id':account,'name':'edited','api_key':'other','api_secret':'other-secret'})[0],400)
+
+    def test_delete_objects_checks_positions_and_removes_bindings(self):
+        with self.store.db() as db:
+            account=db.execute("INSERT INTO futures_accounts(name,api_key,api_secret) VALUES('delete-test','key','secret')").lastrowid
+            db.execute("INSERT INTO targets(id,name) VALUES('98765','delete-target')")
+            db.execute('INSERT INTO copy_bindings VALUES(?,?)',(account,'98765'))
+            db.execute('INSERT INTO copied_positions VALUES(?,?,?,?,?)',(account,'98765','BTCUSDT','LONG','1'))
+        self.assertEqual(self.request('/api/delete-account',{'id':account})[0],400)
+        self.assertEqual(self.request('/api/delete-target',{'id':'98765'})[0],400)
+        with self.store.db() as db: db.execute('DELETE FROM copied_positions WHERE account_id=?',(account,))
+        self.assertEqual(self.request('/api/delete-target',{'id':'98765'})[0],200)
+        with self.store.db() as db: self.assertIsNone(db.execute('SELECT 1 FROM copy_bindings WHERE account_id=?',(account,)).fetchone())
+        self.assertEqual(self.request('/api/delete-account',{'id':account})[0],200)

@@ -168,14 +168,18 @@ class UpstreamError(Exception):
 class Binance:
     def __init__(self, base=None):
         self.base = (base or os.environ.get('BINANCE_BASE_URL', 'https://www.binance.com')).rstrip('/')
+        self.order_history_lock = threading.Lock()
+        self.order_history_next = 0.0
         if not self.base.startswith('https://'):
             raise ValueError('BINANCE_BASE_URL 必须为 HTTPS')
 
     def call(self, endpoint, body=None):
         url = self.base + API_PATH + endpoint
+        headers={'Content-Type':'application/json'}
+        if endpoint.split('?')[0] != 'lead-portfolio/order-history':
+            headers.update({'clienttype':'web','User-Agent':'Mozilla/5.0 OrderMonitor/1.0'})
         request = urllib.request.Request(url, data=dumps(body).encode() if body is not None else None,
-                                         headers={'Content-Type': 'application/json', 'clienttype': 'web',
-                                                  'User-Agent': 'Mozilla/5.0 OrderMonitor/1.0'})
+                                         headers=headers)
         try:
             with urllib.request.urlopen(request, timeout=20) as response:
                 result = json.loads(response.read(8_000_000), parse_float=str)
@@ -229,7 +233,17 @@ class Binance:
 
     def history(self, pid, kind, page, page_size=20):
         name = 'order-history' if kind == 'order' else 'transfer-history'
-        data = self.call('lead-portfolio/' + name, {'portfolioId': pid, 'pageSize': page_size, 'pageNumber': page})
+        body={'portfolioId': pid, 'pageSize': page_size, 'pageNumber': page}
+        if kind == 'order':
+            with self.order_history_lock:
+                delay=self.order_history_next-time.monotonic()
+                if delay>0: time.sleep(delay)
+                try:
+                    data=self.call('lead-portfolio/'+name,body)
+                finally:
+                    self.order_history_next=time.monotonic()+1.5
+        else:
+            data=self.call('lead-portfolio/'+name,body)
         if not isinstance(data, dict) or not isinstance(data.get('list'), list) or 'total' not in data:
             raise UpstreamError('历史响应结构异常，未推进同步位置')
         for row in data['list']:
@@ -547,15 +561,16 @@ class Monitor:
     def toggle(self, pid, enabled):
         if not isinstance(enabled, bool):
             raise ValueError('enabled 必须是布尔值')
+        LOG.info('monitor switch requested target=%s enabled=%s',pid,enabled)
         with self.lock, self.store.db() as db:
             if not db.execute('UPDATE targets SET enabled=?,next_check=0 WHERE id=?', (int(enabled), pid)).rowcount:
                 raise ValueError('监听对象不存在')
-            LOG.info('monitor switch target=%s enabled=%s',pid,enabled)
             if not enabled:
                 db.execute("UPDATE outbox SET status='cancelled' WHERE status='pending' AND event IN (SELECT id FROM events WHERE target=?)", (pid,))
                 db.execute("UPDATE copy_tasks SET state='cancelled',error='监听已关闭' WHERE target_id=? AND state='pending'",(pid,))
                 db.execute('UPDATE copy_live SET enabled=0 WHERE target_id=?',(pid,))
                 db.execute('UPDATE virtual_sessions SET active=0 WHERE target_id=?',(pid,))
+        LOG.info('monitor switch saved target=%s enabled=%s next_check=%s',pid,enabled,'immediate' if enabled else 'disabled')
 
     def collect(self, pid, kind, initialized):
         with self.store.db() as db:
@@ -1443,13 +1458,56 @@ def handler_factory(store, monitor, token):
                         LOG.info('history sync requested target=%s',pid)
                 elif self.path == '/api/toggle':
                     monitor.toggle(str(data.get('id')), data.get('enabled'))
+                elif self.path in ('/api/delete-target','/api/delete-account'):
+                    is_target=self.path=='/api/delete-target'
+                    item=data.get('id')
+                    if is_target:
+                        if not isinstance(item,str) or not item.isdigit(): raise ValueError('带单员参数错误')
+                    elif not isinstance(item,int) or isinstance(item,bool) or item<=0:
+                        raise ValueError('账号参数错误')
+                    column='target_id' if is_target else 'account_id'
+                    with monitor.history_lock, monitor.lock, store.db() as db:
+                        table='targets' if is_target else 'futures_accounts'
+                        if not db.execute('SELECT 1 FROM '+table+' WHERE id=?',(item,)).fetchone(): raise ValueError('对象不存在')
+                        if db.execute("SELECT 1 FROM copy_tasks WHERE "+column+"=? AND state IN ('pending','submitted') LIMIT 1",(item,)).fetchone(): raise ValueError('存在待执行或待确认订单，无法删除')
+                        positions=db.execute('SELECT quantity FROM copied_positions WHERE '+column+'=?',(item,)).fetchall()
+                        if any(number(row['quantity'])!=0 for row in positions): raise ValueError('存在跟单持仓，请先核对并处理后再删除')
+                        db.execute('DELETE FROM copy_task_audit WHERE task_id IN (SELECT id FROM copy_tasks WHERE '+column+'=?)',(item,))
+                        for name in ('copy_tasks','copied_positions','copy_bindings','copy_live','virtual_sessions','virtual_positions','virtual_events'):
+                            db.execute('DELETE FROM '+name+' WHERE '+column+'=?',(item,))
+                        if is_target:
+                            db.execute('DELETE FROM outbox WHERE event IN (SELECT id FROM events WHERE target=?)',(item,))
+                            for name in ('records','events','leader_history','leader_history_stage','leader_history_sync','baseline_watermarks','monitor_start'):
+                                db.execute('DELETE FROM '+name+' WHERE target=?',(item,))
+                            monitor.history_active.discard(item)
+                        else:
+                            db.execute('DELETE FROM margin_alert_state WHERE account_id=?',(item,))
+                        db.execute('DELETE FROM display_order WHERE kind=? AND item_id=?',('targets' if is_target else 'accounts',str(item)))
+                        db.execute('DELETE FROM '+table+' WHERE id=?',(item,))
+                    LOG.info('monitor object deleted kind=%s id=%s','target' if is_target else 'account',item)
                 elif self.path == '/api/futures-account':
                     name, key, secret = (data.get(k, '').strip() for k in ('name', 'api_key', 'api_secret'))
-                    if not all((name, key, secret)) or any(len(x) > 256 for x in (name, key, secret)):
-                        raise ValueError('请填写账号名称、API Key 和 Secret Key')
-                    with store.db() as db:
+                    account_id=data.get('account_id')
+                    if not name or any(len(x) > 256 for x in (name, key, secret)) or bool(key)!=bool(secret):
+                        raise ValueError('请填写账号名称；更新密钥时须同时填写 API Key 和 Secret Key')
+                    if account_id is None and not key:
+                        raise ValueError('请填写 API Key 和 Secret Key')
+                    if account_id is not None and (not isinstance(account_id,int) or isinstance(account_id,bool) or account_id<=0):
+                        raise ValueError('账号参数错误')
+                    with monitor.lock, store.db() as db:
                         try:
-                            db.execute('INSERT INTO futures_accounts(name,api_key,api_secret) VALUES(?,?,?)', (name, key, secret))
+                            if account_id is None:
+                                db.execute('INSERT INTO futures_accounts(name,api_key,api_secret) VALUES(?,?,?)', (name, key, secret))
+                            else:
+                                if not db.execute('SELECT 1 FROM futures_accounts WHERE id=?',(account_id,)).fetchone(): raise ValueError('账号不存在')
+                                if key:
+                                    active=db.execute("SELECT 1 FROM copy_live WHERE account_id=? AND enabled=1 UNION ALL SELECT 1 FROM copy_tasks WHERE account_id=? AND state IN ('pending','submitted') LIMIT 1",(account_id,account_id)).fetchone()
+                                    positions=db.execute('SELECT quantity FROM copied_positions WHERE account_id=?',(account_id,)).fetchall()
+                                    if active or any(number(row['quantity'])!=0 for row in positions):
+                                        raise ValueError('请先停止跟单并核对未完成订单及跟单持仓，再更换密钥')
+                                    db.execute('UPDATE futures_accounts SET name=?,api_key=?,api_secret=? WHERE id=?',(name,key,secret,account_id))
+                                else:
+                                    db.execute('UPDATE futures_accounts SET name=? WHERE id=?',(name,account_id))
                         except sqlite3.IntegrityError:
                             raise ValueError('账号名称已存在') from None
                 elif self.path == '/api/copy-binding':

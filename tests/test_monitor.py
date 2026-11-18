@@ -55,6 +55,24 @@ class MonitorTests(unittest.TestCase):
     def baseline(self):
         self.monitor.poll(PID)
 
+    def test_order_history_requests_for_different_leaders_are_serialized(self):
+        from app import Binance
+        client=Binance(); active=0; peak=0; gate=threading.Lock()
+        with patch.object(client,'call'),patch('app.time.sleep',return_value=None):
+            # Use Event.wait for overlap while the production spacing sleep is mocked.
+            def slow_call(endpoint,body):
+                nonlocal active,peak
+                with gate:
+                    active+=1;peak=max(peak,active)
+                threading.Event().wait(0.02)
+                with gate: active-=1
+                return {'list':[],'total':0}
+            client.call.side_effect=slow_call
+            threads=[threading.Thread(target=client.history,args=(pid,'order',1)) for pid in ('1','2','3')]
+            for thread in threads: thread.start()
+            for thread in threads: thread.join()
+        self.assertEqual(peak,1)
+
     def test_upgrade_sets_poll_page_size_to_twenty(self):
         with self.store.db() as db:
             settings=self.store.settings(db);settings['page_size']=100
