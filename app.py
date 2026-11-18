@@ -527,6 +527,7 @@ class Monitor:
         self.store, self.api = store, api or Binance()
         self.lock = threading.RLock()
         self.history_lock = threading.RLock()
+        self.history_active = set()
         self.stop = threading.Event()
         self.now_ms = lambda: int(time.time()*1000)
         self.transfer_queue = queue.Queue()
@@ -571,6 +572,7 @@ class Monitor:
         for page in range(1, 51):
             data = self.api.history(pid, kind, page, page_size)
             batch = data['list']
+            LOG.debug('poll page target=%s kind=%s page=%s size=%s received=%s watermark=%s',pid,kind,page,page_size,len(batch),watermark)
             rows.extend(batch)
             if not initialized and watermark is None:
                 return rows  # Initial page is a baseline, not a notification backlog.
@@ -656,6 +658,8 @@ class Monitor:
         if not target or not target['enabled']:
             return
         LOG.info('poll start target=%s initialized=%s',pid,target['initialized'])
+        started_at=time.monotonic()
+        inserted=updated=historical_count=0
         try:
             detail_error = ''
             try:
@@ -702,6 +706,7 @@ class Monitor:
                         if kind == 'order':
                             body.update(direction=direction(row), notional=row.get('notional',decimal_text(number(row['executedQty']) * number(row['avgPrice']))), updated=bool(previous))
                         if previous:
+                            updated += 1
                             # The interface has no unique execution id: an order keeps the same
                             # identity while its cumulative fills grow. Follow the difference
                             # instead of treating a later detailed fill as a conflicting order.
@@ -726,6 +731,8 @@ class Monitor:
                         monitor_started = db.execute('SELECT started_at FROM monitor_start WHERE target=?',(pid,)).fetchone() if kind == 'order' else None
                         after_start = bool(live_started or (monitor_started and stamp > monitor_started['started_at']))
                         historical = ((first_kind or (baseline is not None and stamp <= baseline['stamp'])) and not after_start)
+                        inserted += 1
+                        historical_count += int(historical)
                         self.store.event(db, pid, detail['nickname'], kind, body, stamp, historical, settings)
                         if kind == 'order' and not historical:
                             self.virtual_apply(db, pid, key, row, detail['marginBalance'])
@@ -735,15 +742,17 @@ class Monitor:
                 saved_detail = dumps(detail) if not detail_error else target['detail']
                 db.execute('UPDATE targets SET name=?,detail=?,balance=?,initialized=1,last_check=?,next_check=?,failures=0,error=? WHERE id=?',
                            (detail['nickname'], saved_detail, balance, time.time(), time.time() + settings['interval'], detail_error, pid))
-            LOG.info('poll orders complete target=%s orders=%s',pid,len(histories['order']))
+            LOG.info('poll orders complete target=%s raw=%s new=%s updated=%s historical=%s detail_ok=%s duration_ms=%s',pid,len(histories['order']),inserted,updated,historical_count,not bool(detail_error),int((time.monotonic()-started_at)*1000))
             self.schedule_transfers(pid,detail['nickname'])
         except Exception as exc:
             message = str(exc) if isinstance(exc, (UpstreamError, ValueError, InvalidOperation)) else '同步失败，保留原同步位置'
+            if not isinstance(exc, (UpstreamError, ValueError, InvalidOperation)):
+                LOG.exception('portfolio %s unexpected polling failure', pid)
             with self.store.db() as db:
                 failures = target['failures'] + 1
                 delay = min(3600, self.store.settings(db)['interval'] * 2 ** min(failures, 6))
                 db.execute('UPDATE targets SET error=?,failures=?,next_check=? WHERE id=?', (message[:300], failures, time.time() + delay, pid))
-            LOG.warning('portfolio %s: %s', pid, message)
+            LOG.warning('poll failed target=%s failures=%s retry_in_seconds=%s reason=%s',pid,failures,delay,message)
 
     def poll_transfers(self, pid, name):
         try:
@@ -955,6 +964,7 @@ class Monitor:
                             self.copy_notice(db,task,'%s 跟单跳过：%s' % (row['symbol'],reason))
                     return
                 params['newClientOrderId']=task['client_id']
+                LOG.info('copy preflight passed task=%s account=%s target=%s symbol=%s action=%s quantity=%s',task['id'],task['account_id'],task['target_id'],row['symbol'],task['action'],params['quantity'])
                 # Persist intent before touching the exchange, so process crashes cannot duplicate a POST.
                 with self.store.db() as db:
                     db.execute('INSERT OR REPLACE INTO copy_task_audit(task_id,balance_time,asset,wallet_balance,available_balance,lead_balance,reference_price,planned_quantity) VALUES(?,?,?,?,?,?,?,?)', (task['id'],balance_time,'USDT',str(usdt['balance']) if usdt and 'balance' in usdt else None,str(usdt['availableBalance']) if usdt and 'availableBalance' in usdt else None,lead_balance,str(price),params['quantity']))
@@ -989,6 +999,7 @@ class Monitor:
                     return
             status=result.get('status')
             if status not in ('FILLED','CANCELED','EXPIRED','REJECTED','EXPIRED_IN_MATCH'):
+                LOG.info('copy awaiting confirmation task=%s account=%s symbol=%s status=%s',task['id'],task['account_id'],row['symbol'],status)
                 with self.store.db() as db: db.execute("UPDATE copy_tasks SET next_check=strftime('%s','now')+15 WHERE id=?", (task['id'],))
                 return
             executed=number(result.get('executedQty','0'))
@@ -1090,6 +1101,8 @@ class Monitor:
             sync = db.execute('SELECT * FROM leader_history_sync WHERE target=?',(pid,)).fetchone()
         if sync['next_check'] > time.time(): return
         page = sync['page']
+        started_at=time.monotonic()
+        LOG.info('history sync page start target=%s page=%s',pid,page)
         try:
             if page == 1:
                 with self.store.db() as db:
@@ -1115,22 +1128,35 @@ class Monitor:
                     db.execute('DELETE FROM leader_history_stage WHERE target=?',(pid,))
                 db.execute('UPDATE leader_history_sync SET page=?,complete=?,total=?,next_check=?,error=?,updated=?,last_batch=?,failures=0 WHERE target=?',
                            (1 if complete else page+1,int(complete),total,time.time()+(3600 if complete else 5),'',time.time(),fingerprint,pid))
+                saved=db.execute('SELECT COUNT(*) FROM '+('leader_history' if complete else 'leader_history_stage')+' WHERE target=?',(pid,)).fetchone()[0]
+            LOG.info('history sync page complete target=%s page=%s received=%s saved=%s upstream_total=%s complete=%s duration_ms=%s',pid,page,len(rows),saved,total,complete,int((time.monotonic()-started_at)*1000))
+            if complete:
+                self.history_active.discard(pid)
         except Exception as exc:
             reason = str(exc)[:200] if isinstance(exc,(UpstreamError,ValueError)) else '历史同步失败'
+            if not isinstance(exc,(UpstreamError,ValueError)):
+                LOG.exception('history sync unexpected failure target=%s page=%s',pid,page)
             with self.store.db() as db:
                 failures = sync['failures'] + 1
                 delay = min(900,60 * 2**min(failures-1,4))
                 db.execute('UPDATE leader_history_sync SET error=?,next_check=?,failures=? WHERE target=?',(reason,time.time()+delay,failures,pid))
-            LOG.warning('portfolio %s history sync: %s',pid,reason)
+            LOG.warning('history sync failed target=%s page=%s failures=%s retry_in_seconds=%s reason=%s',pid,page,failures,delay,reason)
 
     def history_worker(self):
         while not self.stop.is_set():
-            with self.store.db() as db:
-                ids = [r[0] for r in db.execute('SELECT id FROM targets WHERE enabled=1')]
+            with self.history_lock:
+                ids = list(self.history_active)
             for pid in ids:
                 if self.stop.is_set(): return
                 try:
-                    self.sync_history(pid)
+                    with self.history_lock:
+                        if pid in self.history_active:
+                            with self.store.db() as db:
+                                enabled=db.execute('SELECT enabled FROM targets WHERE id=?',(pid,)).fetchone()
+                            if enabled and enabled['enabled']:
+                                self._sync_history(pid)
+                            else:
+                                self.history_active.discard(pid)
                 except Exception:
                     LOG.exception('portfolio %s history worker failed',pid)
                 if self.stop.wait(5): return
@@ -1311,12 +1337,15 @@ def handler_factory(store, monitor, token):
                 if parsed.path == '/api/leader-positions':
                     pid = query.get('target', [''])[0]
                     with store.db() as db:
-                        if not db.execute('SELECT 1 FROM targets WHERE id=?',(pid,)).fetchone():
+                        target = db.execute('SELECT enabled,error,last_check FROM targets WHERE id=?',(pid,)).fetchone()
+                        if not target:
                             raise ValueError('带单员不存在')
                         rows = [json.loads(r['body']) for r in db.execute('SELECT body FROM leader_history WHERE target=? ORDER BY stamp,key',(pid,))]
                         sync = db.execute('SELECT page,complete,total,error,updated,next_check,failures FROM leader_history_sync WHERE target=?',(pid,)).fetchone()
                         staged = db.execute('SELECT COUNT(*) FROM leader_history_stage WHERE target=?',(pid,)).fetchone()[0]
-                    return self.reply({'positions':replay(rows), 'count':len(rows), 'staged':staged, 'sync':dict(sync) if sync else None})
+                    with monitor.history_lock:
+                        active = pid in monitor.history_active
+                    return self.reply({'positions':replay(rows), 'count':len(rows), 'staged':staged, 'sync':dict(sync) if sync else None, 'monitor':dict(target), 'history_active':active})
                 if parsed.path == '/api/copy-tasks':
                     account_id=int(query.get('account_id', ['0'])[0])
                     page=max(1,min(100000,int(query.get('page',['1'])[0])))
@@ -1410,6 +1439,8 @@ def handler_factory(store, monitor, token):
                             raise ValueError('请先开启该带单员的监听')
                         db.execute('DELETE FROM leader_history_stage WHERE target=?',(pid,))
                         db.execute("INSERT INTO leader_history_sync(target,page,complete,total,next_check,error,last_batch,failures) VALUES(?,1,0,0,0,'','',0) ON CONFLICT(target) DO UPDATE SET page=1,complete=0,total=0,next_check=0,error='',last_batch='',failures=0",(pid,))
+                        monitor.history_active.add(pid)
+                        LOG.info('history sync requested target=%s',pid)
                 elif self.path == '/api/toggle':
                     monitor.toggle(str(data.get('id')), data.get('enabled'))
                 elif self.path == '/api/futures-account':

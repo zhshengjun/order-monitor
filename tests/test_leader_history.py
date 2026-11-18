@@ -8,6 +8,22 @@ from test_monitor import FakeAPI, PID, order
 
 
 class LeaderHistoryTests(unittest.TestCase):
+    def test_history_worker_only_runs_after_manual_request_and_not_after_restart(self):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as tmp:
+            store=Store(Path(tmp)/'db');api=FakeAPI();monitor=Monitor(store,api);monitor.add(PID)
+            monitor.stop=Mock();monitor.stop.is_set.side_effect=[False,True];monitor.stop.wait.return_value=True
+            monitor.history_worker()
+            self.assertEqual(api.calls,[])
+            monitor.history_active.add(PID)
+            monitor.stop.is_set.side_effect=[False,False,True]
+            monitor.history_worker()
+            self.assertEqual(api.calls,[('order',1)])
+            restarted=Monitor(Store(store.path),api)
+            restarted.stop=Mock();restarted.stop.is_set.side_effect=[False,True];restarted.stop.wait.return_value=True
+            restarted.history_worker()
+            self.assertEqual(api.calls,[('order',1)])
+
     def test_merge_distinct_fills_and_ignore_duplicate(self):
         a=order(1,'1');a['avgPrice']='100'
         b=order(1,'1');b['avgPrice']='130'
