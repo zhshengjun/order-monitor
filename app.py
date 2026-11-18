@@ -526,7 +526,6 @@ class Store:
             if settings['bark_enabled'] and not settings['bark_key']:
                 raise ValueError('启用 Bark 需要 Device Key')
             db.execute('UPDATE settings SET value=? WHERE id=1', (dumps(settings),))
-            db.execute('UPDATE targets SET next_check=MIN(next_check,?)', (time.time() + settings['interval'],))
 
     def event(self, db, pid, name, kind, body, stamp, historical, settings):
         eid = db.execute('INSERT INTO events(target,name,kind,body,stamp,historical) VALUES(?,?,?,?,?,?)',
@@ -547,6 +546,7 @@ class Monitor:
         self.now_ms = lambda: int(time.time()*1000)
         self.transfer_queue = queue.Queue()
         self.transfer_pending = set()
+        self.transfer_next = {}
         self.transfer_lock = threading.Lock()
         self.transfer_background = False
 
@@ -777,7 +777,7 @@ class Monitor:
                 balance = decimal_text(detail['marginBalance']) if detail['marginBalance'] is not None else target['balance']
                 saved_detail = dumps(detail) if not detail_error else target['detail']
                 db.execute('UPDATE targets SET name=?,detail=?,balance=?,initialized=1,last_check=?,next_check=?,failures=0,error=? WHERE id=?',
-                           (detail['nickname'], saved_detail, balance, time.time(), time.time() + settings['interval'], detail_error, pid))
+                           (detail['nickname'], saved_detail, balance, time.time(), time.time(), detail_error, pid))
             LOG.info('poll orders complete target=%s raw=%s new=%s updated=%s historical=%s detail_ok=%s duration_ms=%s',pid,len(histories['order']),inserted,updated,historical_count,not bool(detail_error),int((time.monotonic()-started_at)*1000))
             self.schedule_transfers(pid,detail['nickname'])
         except Exception as exc:
@@ -821,8 +821,9 @@ class Monitor:
             self.poll_transfers(pid,name)
             return
         with self.transfer_lock:
-            if pid in self.transfer_pending: return
+            if pid in self.transfer_pending or time.monotonic()<self.transfer_next.get(pid,0): return
             self.transfer_pending.add(pid)
+            self.transfer_next[pid]=time.monotonic()+60
             self.transfer_queue.put((pid,name))
 
     def transfer_worker(self):
@@ -1223,11 +1224,14 @@ class Monitor:
         self.transfer_background = True
         workers = [threading.Thread(target=target, daemon=True) for target in (copies, notifications, self.history_worker,self.transfer_worker)]
         for worker in workers: worker.start()
+        with self.store.db() as db:
+            db.execute('UPDATE targets SET next_check=0 WHERE failures=0')
         while not self.stop.is_set():
             with self.store.db() as db:
-                ids = [r[0] for r in db.execute('SELECT id FROM targets WHERE enabled=1 AND next_check<=? ORDER BY next_check', (time.time(),))]
-            with ThreadPoolExecutor(max_workers=4) as pool:
-                list(pool.map(self.poll, ids))
+                ids = [r[0] for r in db.execute('SELECT id FROM targets WHERE enabled=1 AND next_check<=? ORDER BY next_check,id', (time.time(),))]
+            for pid in ids:
+                if self.stop.is_set(): break
+                self.poll(pid)
             self.stop.wait(1)
         for worker in workers: worker.join(timeout=25)
 

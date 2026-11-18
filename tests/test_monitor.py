@@ -184,6 +184,18 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(transfers[0]['historical'],1)
         self.assertEqual(self.rows('outbox'),[])
 
+    def test_enabled_leaders_cycle_sequentially_without_minute_delay(self):
+        with self.store.db() as db:
+            db.execute("INSERT INTO targets(id,name) VALUES('999999','other')")
+        seen=[]
+        def polling(pid):
+            seen.append(pid)
+            if len(seen)==4: self.monitor.stop.set()
+        with patch.object(self.monitor,'poll',side_effect=polling),patch.object(self.monitor,'execute_copy'),patch.object(self.monitor,'deliver'):
+            worker=threading.Thread(target=self.monitor.run);worker.start();worker.join(5)
+            if worker.is_alive(): self.monitor.stop.set();worker.join(3)
+        self.assertEqual(seen,[PID,'999999',PID,'999999'])
+
     def test_slow_poll_does_not_block_copy_worker(self):
         entered, release, copied = threading.Event(), threading.Event(), threading.Event()
         def slow_poll(_pid):
