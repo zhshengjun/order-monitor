@@ -6,6 +6,7 @@ import hmac
 import json
 import logging
 import os
+import queue
 import sqlite3
 import socket
 import ssl
@@ -97,8 +98,7 @@ def history_identity(row):
     return hashlib.sha256(dumps([str(row.get('symbol','')).strip().upper(),
                                   str(row.get('side','')).strip().upper(),
                                   str(row.get('positionSide','')).strip().upper(),
-                                  int(row['orderTime']),decimal_key(row['executedQty']),
-                                  decimal_key(row['avgPrice']),decimal_key(row.get('totalPnl') or '0')]).encode()).hexdigest()
+                                  int(row['orderTime']),decimal_key(row['executedQty'])]).encode()).hexdigest()
 
 
 def clean_history(row):
@@ -297,6 +297,7 @@ class Store:
             CREATE TABLE IF NOT EXISTS baseline_watermarks (
               target TEXT NOT NULL, kind TEXT NOT NULL, stamp INTEGER NOT NULL,
               PRIMARY KEY(target,kind));
+            CREATE TABLE IF NOT EXISTS monitor_start (target TEXT PRIMARY KEY, started_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS events (
               id INTEGER PRIMARY KEY AUTOINCREMENT, target TEXT NOT NULL, name TEXT NOT NULL,
               kind TEXT NOT NULL, body TEXT NOT NULL, stamp INTEGER NOT NULL, historical INTEGER NOT NULL);
@@ -401,7 +402,21 @@ class Store:
                 current['page_size'] = 20
                 db.execute('UPDATE settings SET value=? WHERE id=1',(dumps(current),))
                 db.execute("INSERT INTO app_migrations VALUES('poll_page_size_20')")
+            if not db.execute("SELECT 1 FROM app_migrations WHERE name='history_identity_v5'").fetchone():
+                db.execute('CREATE TABLE IF NOT EXISTS leader_history_before_v5 AS SELECT * FROM leader_history')
+                saved=db.execute('SELECT target,body FROM leader_history').fetchall()
+                db.execute('DELETE FROM leader_history')
+                for row in saved:
+                    cleaned=clean_history(json.loads(row['body']))
+                    db.execute('INSERT OR REPLACE INTO leader_history VALUES(?,?,?,?)',(row['target'],history_identity(cleaned),cleaned['orderTime'],dumps(cleaned)))
+                db.execute('DELETE FROM leader_history_stage')
+                db.execute("UPDATE leader_history_sync SET page=1,complete=0,next_check=0,last_batch='',error=''")
+                db.execute("INSERT INTO app_migrations VALUES('history_identity_v5')")
+            db.execute('INSERT OR IGNORE INTO monitor_start SELECT id,? FROM targets',(int(time.time()*1000),))
             db.execute('INSERT OR IGNORE INTO baseline_watermarks SELECT r.target,r.kind,MAX(r.stamp) FROM records r JOIN targets t ON t.id=r.target WHERE t.initialized=1 GROUP BY r.target,r.kind')
+            if not db.execute("SELECT 1 FROM app_migrations WHERE name='transfer_baseline_initialized'").fetchone():
+                db.execute("INSERT OR IGNORE INTO baseline_watermarks SELECT id,'transfer',0 FROM targets WHERE initialized=1")
+                db.execute("INSERT INTO app_migrations VALUES('transfer_baseline_initialized')")
         os.chmod(self.path, 0o600)
 
     @contextlib.contextmanager
@@ -501,6 +516,10 @@ class Monitor:
         self.lock = threading.RLock()
         self.history_lock = threading.RLock()
         self.stop = threading.Event()
+        self.transfer_queue = queue.Queue()
+        self.transfer_pending = set()
+        self.transfer_lock = threading.Lock()
+        self.transfer_background = False
 
     def add(self, pid):
         if not isinstance(pid, str) or not pid.isdigit() or not 1 <= len(pid) <= 30:
@@ -509,6 +528,7 @@ class Monitor:
         with self.lock, self.store.db() as db:
             db.execute('INSERT OR IGNORE INTO targets(id,name,detail) VALUES(?,?,?)',
                        (pid, detail['nickname'], dumps(detail)))
+            db.execute('INSERT OR IGNORE INTO monitor_start VALUES(?,?)',(pid,int(time.time()*1000)))
 
     def toggle(self, pid, enabled):
         if not isinstance(enabled, bool):
@@ -527,6 +547,8 @@ class Monitor:
         with self.store.db() as db:
             stamps = db.execute('SELECT MAX(stamp) FROM records WHERE target=? AND kind=?', (pid, kind)).fetchone()
             watermark = stamps[0]
+            if kind == 'transfer':
+                initialized = bool(db.execute("SELECT 1 FROM baseline_watermarks WHERE target=? AND kind='transfer'",(pid,)).fetchone())
             page_size = self.store.settings(db)['page_size'] if initialized else 20
             if not initialized and kind == 'order':
                 watermark = db.execute('SELECT MIN(started_at) FROM copy_live WHERE target_id=? AND enabled=1',(pid,)).fetchone()[0]
@@ -623,7 +645,7 @@ class Monitor:
         LOG.info('poll start target=%s initialized=%s',pid,target['initialized'])
         try:
             detail = self.api.detail(pid)
-            histories = {kind: self.collect(pid, kind, target['initialized']) for kind in ('order', 'transfer')}
+            histories = {'order': self.collect(pid,'order',target['initialized'])}
             with self.lock, self.store.db() as db:
                 current = db.execute('SELECT initialized,enabled FROM targets WHERE id=?', (pid,)).fetchone()
                 if not current or not current['enabled'] or current['initialized'] != target['initialized']:
@@ -633,6 +655,7 @@ class Monitor:
                 for kind, rows in histories.items():
                     time_key = 'orderTime' if kind == 'order' else 'time'
                     baseline = db.execute('SELECT stamp FROM baseline_watermarks WHERE target=? AND kind=?', (pid,kind)).fetchone()
+                    first_kind = first or (kind == 'transfer' and baseline is None)
                     if kind == 'order':
                         for raw in rows:
                             cleaned = clean_history(raw)
@@ -672,17 +695,20 @@ class Monitor:
                                 if identity(kind, json.loads(event['body'])) == key:
                                     db.execute('UPDATE events SET body=? WHERE id=?', (dumps(body), event['id']))
                             continue
-                        live_started = db.execute('SELECT 1 FROM copy_live WHERE target_id=? AND enabled=1 AND started_at<? LIMIT 1',(pid,stamp)).fetchone() if first and kind == 'order' else None
-                        historical = (first and not live_started) or (not first and baseline is not None and stamp <= baseline['stamp'])
+                        live_started = db.execute('SELECT 1 FROM copy_live WHERE target_id=? AND enabled=1 AND started_at<? LIMIT 1',(pid,stamp)).fetchone() if kind == 'order' else None
+                        monitor_started = db.execute('SELECT started_at FROM monitor_start WHERE target=?',(pid,)).fetchone() if kind == 'order' else None
+                        after_start = bool(live_started or (monitor_started and stamp > monitor_started['started_at']))
+                        historical = ((first_kind or (baseline is not None and stamp <= baseline['stamp'])) and not after_start)
                         self.store.event(db, pid, detail['nickname'], kind, body, stamp, historical, settings)
                         if kind == 'order' and not historical:
                             self.virtual_apply(db, pid, key, row, detail['marginBalance'])
-                    if first and rows:
-                        db.execute('INSERT OR REPLACE INTO baseline_watermarks VALUES(?,?,?)', (pid,kind,max(int(r[time_key]) for r in rows)))
+                    if first_kind:
+                        db.execute('INSERT OR REPLACE INTO baseline_watermarks VALUES(?,?,?)', (pid,kind,max((int(r[time_key]) for r in rows),default=0)))
                 balance = decimal_text(detail['marginBalance'])
                 db.execute('UPDATE targets SET name=?,detail=?,balance=?,initialized=1,last_check=?,next_check=?,failures=0,error=\'\' WHERE id=?',
                            (detail['nickname'], dumps(detail), balance, time.time(), time.time() + settings['interval'], pid))
-            LOG.info('poll complete target=%s orders=%s transfers=%s',pid,len(histories['order']),len(histories['transfer']))
+            LOG.info('poll orders complete target=%s orders=%s',pid,len(histories['order']))
+            self.schedule_transfers(pid,detail['nickname'])
         except Exception as exc:
             message = str(exc) if isinstance(exc, (UpstreamError, ValueError, InvalidOperation)) else '同步失败，保留原同步位置'
             with self.store.db() as db:
@@ -690,6 +716,54 @@ class Monitor:
                 delay = min(3600, self.store.settings(db)['interval'] * 2 ** min(failures, 6))
                 db.execute('UPDATE targets SET error=?,failures=?,next_check=? WHERE id=?', (message[:300], failures, time.time() + delay, pid))
             LOG.warning('portfolio %s: %s', pid, message)
+
+    def poll_transfers(self, pid, name):
+        try:
+            rows = self.collect(pid,'transfer',True)
+            with self.lock, self.store.db() as db:
+                target = db.execute('SELECT enabled FROM targets WHERE id=?',(pid,)).fetchone()
+                if not target or not target['enabled']: return
+                baseline = db.execute("SELECT stamp FROM baseline_watermarks WHERE target=? AND kind='transfer'",(pid,)).fetchone()
+                first = baseline is None
+                settings = self.store.settings(db)
+                for row in sorted(rows,key=lambda r:int(r['time'])):
+                    key,stamp=identity('transfer',row),int(row['time'])
+                    previous=db.execute("SELECT body FROM records WHERE target=? AND kind='transfer' AND key=?",(pid,key)).fetchone()
+                    if previous and json.loads(previous[0])==row: continue
+                    db.execute('INSERT OR REPLACE INTO records VALUES(?,?,?,?,?)',(pid,'transfer',key,dumps(row),stamp))
+                    if previous: continue
+                    historical=first or (baseline is not None and stamp<=baseline['stamp'])
+                    self.store.event(db,pid,name,'transfer',row,stamp,historical,settings)
+                if first:
+                    db.execute("INSERT OR REPLACE INTO baseline_watermarks VALUES(?,'transfer',?)",(pid,max((int(r['time']) for r in rows),default=0)))
+            LOG.info('poll transfers complete target=%s transfers=%s',pid,len(rows))
+        except Exception as exc:
+            reason = str(exc)[:240] if isinstance(exc,(UpstreamError,ValueError,InvalidOperation)) else '划转记录同步失败'
+            with self.store.db() as db:
+                db.execute('UPDATE targets SET error=? WHERE id=?',(reason,pid))
+            LOG.warning('portfolio %s transfer history failed: %s',pid,reason)
+
+    def schedule_transfers(self, pid, name):
+        if not self.transfer_background:
+            self.poll_transfers(pid,name)
+            return
+        with self.transfer_lock:
+            if pid in self.transfer_pending: return
+            self.transfer_pending.add(pid)
+            self.transfer_queue.put((pid,name))
+
+    def transfer_worker(self):
+        while not self.stop.is_set():
+            try:
+                pid,name = self.transfer_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+            try:
+                self.poll_transfers(pid,name)
+            finally:
+                with self.transfer_lock:
+                    self.transfer_pending.discard(pid)
+                self.transfer_queue.task_done()
 
     @staticmethod
     def message(event):
@@ -1026,7 +1100,8 @@ class Monitor:
                     LOG.exception('通知任务处理异常')
                 self.stop.wait(1)
 
-        workers = [threading.Thread(target=target, daemon=True) for target in (copies, notifications, self.history_worker)]
+        self.transfer_background = True
+        workers = [threading.Thread(target=target, daemon=True) for target in (copies, notifications, self.history_worker,self.transfer_worker)]
         for worker in workers: worker.start()
         while not self.stop.is_set():
             with self.store.db() as db:

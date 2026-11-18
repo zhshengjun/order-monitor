@@ -86,6 +86,7 @@ class LeaderHistoryTests(unittest.TestCase):
             self.assertEqual(identity('order',a),identity('order',b))
             self.assertNotEqual(history_identity(a),history_identity(b))
             self.assertEqual(history_identity(a),history_identity(dict(a,executedQty='1.00000000',avgPrice='0.10000000')))
+            self.assertEqual(history_identity(a),history_identity(dict(a,avgPrice='999',totalPnl='42')))
             variant=dict(a,symbol=' btcusdt ',side=' buy ',positionSide=' long ',orderTime='1')
             self.assertEqual(history_identity(a),history_identity(variant))
             self.assertNotEqual(history_identity(a),history_identity(dict(a,side='SELL')))

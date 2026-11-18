@@ -95,6 +95,76 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(events[101]['historical'], 0)
         self.assertEqual(len(self.rows('outbox')), 4)
 
+    def test_late_open_after_monitor_start_is_not_silenced_by_initial_watermark(self):
+        with self.store.db() as db:
+            db.execute('UPDATE monitor_start SET started_at=100 WHERE target=?',(PID,))
+        self.api.orders=[order(105),order(99)]
+        self.monitor.poll(PID)
+        self.api.orders.insert(1,order(102))
+        self.monitor.poll(PID);self.monitor.poll(PID)
+        events={e['stamp']:e for e in self.rows('events')}
+        self.assertEqual(events[99]['historical'],1)
+        self.assertEqual(events[102]['historical'],0)
+        self.assertEqual(events[105]['historical'],0)
+        self.assertEqual(len(self.rows('outbox')),4)
+
+    def test_transfer_failure_does_not_discard_new_order(self):
+        self.baseline()
+        self.api.orders.insert(0,order(101))
+        history=self.api.history
+        def failing_transfer(pid,kind,page,page_size=20):
+            if kind == 'transfer': raise UpstreamError('划转接口失败')
+            return history(pid,kind,page,page_size)
+        self.api.history=failing_transfer
+        self.monitor.poll(PID)
+        self.assertTrue(any(row['stamp']==101 and not row['historical'] for row in self.rows('events')))
+        self.assertEqual(len(self.rows('outbox')),2)
+        self.assertIn('划转接口失败',self.rows('targets')[0]['error'])
+
+    def test_slow_transfer_does_not_delay_saving_new_order(self):
+        self.baseline();self.api.orders.insert(0,order(101))
+        original=self.api.history;entered=threading.Event();release=threading.Event()
+        def slow(pid,kind,page,page_size=20):
+            if kind=='transfer': entered.set();release.wait(3)
+            return original(pid,kind,page,page_size)
+        self.api.history=slow
+        worker=threading.Thread(target=self.monitor.poll,args=(PID,));worker.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            self.assertTrue(any(e['stamp']==101 and not e['historical'] for e in self.rows('events')))
+            self.assertEqual(len(self.rows('outbox')),2)
+        finally:
+            release.set();worker.join(3)
+
+    def test_background_transfer_delay_does_not_block_subsequent_order_poll(self):
+        self.baseline(); original=self.api.history;entered=threading.Event();release=threading.Event()
+        def slow(pid,kind,page,page_size=20):
+            if kind=='transfer': entered.set();release.wait(3)
+            return original(pid,kind,page,page_size)
+        self.api.history=slow;self.monitor.transfer_background=True
+        worker=threading.Thread(target=self.monitor.transfer_worker);worker.start()
+        try:
+            self.api.orders.insert(0,order(101));self.monitor.poll(PID)
+            self.assertTrue(entered.wait(2))
+            self.api.orders.insert(0,order(102));self.monitor.poll(PID)
+            self.assertEqual({e['stamp'] for e in self.rows('events') if not e['historical']},{101,102})
+        finally:
+            self.monitor.stop.set();release.set();worker.join(3)
+
+    def test_first_transfer_failure_recovers_without_replaying_old_transfers(self):
+        original=self.api.history
+        self.api.history=lambda pid,kind,page,page_size=20: (_ for _ in ()).throw(UpstreamError('划转接口失败')) if kind=='transfer' else original(pid,kind,page,page_size)
+        self.monitor.poll(PID)
+        self.assertEqual(self.rows('targets')[0]['initialized'],1)
+        self.api.transfers=[dict(time=99,coin='USDT',amount='10',transType='LEAD_DEPOSIT')]
+        self.api.history=original
+        self.monitor=Monitor(Store(self.store.path),self.api)
+        self.monitor.poll(PID)
+        transfers=[e for e in self.rows('events') if e['kind']=='transfer']
+        self.assertEqual(len(transfers),1)
+        self.assertEqual(transfers[0]['historical'],1)
+        self.assertEqual(self.rows('outbox'),[])
+
     def test_slow_poll_does_not_block_copy_worker(self):
         entered, release, copied = threading.Event(), threading.Event(), threading.Event()
         def slow_poll(_pid):
