@@ -36,6 +36,8 @@ def replay(rows):
         else:
             position['qty'] = qty - amount
             position['cost'] = cost * (qty - amount) / qty
+            if position['qty'] == 0 and not simultaneous:
+                position['uncertain'] = False
     result = []
     for (symbol, side), pos in sorted(positions.items()):
         if not pos['qty'] and not pos['uncertain']:

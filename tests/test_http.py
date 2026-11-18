@@ -105,17 +105,18 @@ class HTTPTests(unittest.TestCase):
     def test_synced_leader_history_appears_in_records_without_duplicate_events(self):
         from app import history_identity
         from test_monitor import order
-        pid='history-visible';a=order(100,'2');b=order(101,'1')
+        pid='history-visible';a=order(100,'2');b=order(101,'1');c=order(101,'2')
         with self.store.db() as db:
             db.execute('INSERT INTO targets(id,name) VALUES(?,?)',(pid,'leader'))
-            for row in (a,b):
+            for row in (a,b,c):
                 db.execute('INSERT INTO leader_history VALUES(?,?,?,?)',(pid,history_identity(row),row['orderTime'],json.dumps(row)))
             db.execute('INSERT INTO events(target,name,kind,body,stamp,historical) VALUES(?,?,?,?,?,0)',(pid,'leader','order',json.dumps(b),101))
             db.execute('INSERT INTO events(target,name,kind,body,stamp,historical) VALUES(?,?,?,?,?,0)',(pid,'leader','transfer','{}',102))
         status,data=self.request('/api/events?target=history-visible&kind=leader&limit=10')
         self.assertEqual(status,200);self.assertEqual(data['total'],3)
         self.assertEqual([x['stamp'] for x in data['list']],[102,101,100])
-        self.assertEqual(data['list'][1]['body']['notional'],'0.1')
+        self.assertEqual(data['list'][1]['body']['executedQty'],'3')
+        self.assertEqual(data['list'][1]['body']['notional'],'0.3')
 
     def test_snapshot_shows_exchange_leverage_and_keeps_positions_on_config_error(self):
         from app import UpstreamError

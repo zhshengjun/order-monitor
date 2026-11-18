@@ -14,7 +14,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -25,7 +25,7 @@ from fractions import Fraction
 
 ROOT = Path(__file__).parent
 API_PATH = '/bapi/futures/v1/friendly/future/copy-trade/'
-DEFAULTS = {'interval': 60, 'page_size': 5, 'balance_threshold': '0', 'telegram_enabled': False,
+DEFAULTS = {'interval': 60, 'page_size': 100, 'balance_threshold': '0', 'telegram_enabled': False,
             'telegram_token': '', 'telegram_chat': '', 'bark_enabled': False,
             'bark_url': 'https://api.day.app', 'bark_key': ''}
 SECRETS = ('telegram_token', 'bark_key')
@@ -111,6 +111,31 @@ def clean_history(row):
     if row['orderTime'] < 0:
         raise ValueError('历史交易时间无效')
     return row
+
+
+def merge_order_fills(rows):
+    """Merge executions from the same symbol, side and order timestamp."""
+    groups = {}
+    for row in rows:
+        row = clean_history(row)
+        key = (row['symbol'],row['side'],row['positionSide'],row['orderTime'])
+        groups.setdefault(key, {})[history_identity(row)] = row
+    merged = []
+    for entries in groups.values():
+        fills = sorted(entries.values(), key=lambda r:(str(r.get('type','')),history_identity(r)))
+        if len(fills) == 1:
+            merged.append(fills[0]); continue
+        qty = sum((Fraction(number(r['executedQty'])) for r in fills),Fraction(0))
+        if qty <= 0: raise ValueError('合并成交数量无效')
+        cost = sum((Fraction(number(r['executedQty']))*Fraction(number(r['avgPrice'])) for r in fills),Fraction(0))
+        pnl = sum((Fraction(number(r.get('totalPnl') or '0')) for r in fills),Fraction(0))
+        from virtual_position import decimal_string
+        with localcontext() as ctx:
+            ctx.prec = 40
+            average = cost/qty
+            avg = format(Decimal(average.numerator)/Decimal(average.denominator),'f')
+        merged.append({**fills[0], 'executedQty':decimal_string(qty), 'avgPrice':avg, 'totalPnl':decimal_string(pnl)})
+    return sorted(merged,key=lambda r:(r['orderTime'],r['symbol'],r['side'],r['positionSide']))
 
 
 class UpstreamError(Exception):
@@ -345,6 +370,11 @@ class Store:
                 db.execute('DELETE FROM leader_history_stage')
                 db.execute("UPDATE leader_history_sync SET page=1,complete=0,next_check=0,last_batch='',error='' ")
                 db.execute("INSERT INTO app_migrations VALUES('history_identity_v4')")
+            if not db.execute("SELECT 1 FROM app_migrations WHERE name='poll_page_size_100'").fetchone():
+                current = json.loads(db.execute('SELECT value FROM settings WHERE id=1').fetchone()[0])
+                current['page_size'] = 100
+                db.execute('UPDATE settings SET value=? WHERE id=1',(dumps(current),))
+                db.execute("INSERT INTO app_migrations VALUES('poll_page_size_100')")
             db.execute('INSERT OR IGNORE INTO baseline_watermarks SELECT r.target,r.kind,MAX(r.stamp) FROM records r JOIN targets t ON t.id=r.target WHERE t.initialized=1 GROUP BY r.target,r.kind')
         os.chmod(self.path, 0o600)
 
@@ -409,8 +439,8 @@ class Store:
             if not 10 <= settings['interval'] <= 86400:
                 raise ValueError('监听频率必须为 10～86400 秒')
             settings['page_size'] = int(settings['page_size'])
-            if not 1 <= settings['page_size'] <= 20:
-                raise ValueError('轮询每页数量必须为 1～20 条')
+            if not 1 <= settings['page_size'] <= 100:
+                raise ValueError('轮询每页数量必须为 1～100 条')
             settings['balance_threshold'] = decimal_text(settings['balance_threshold'])
             if number(settings['balance_threshold']) < 0:
                 raise ValueError('余额通知阈值不能为负数')
@@ -480,7 +510,7 @@ class Monitor:
             rows.extend(batch)
             if not initialized:
                 return rows  # Initial page is a baseline, not a notification backlog.
-            if not batch or len(rows) >= int(data['total']):
+            if not batch:
                 return rows
             if crossed:
                 return rows
@@ -535,14 +565,17 @@ class Monitor:
                 for kind, rows in histories.items():
                     time_key = 'orderTime' if kind == 'order' else 'time'
                     baseline = db.execute('SELECT stamp FROM baseline_watermarks WHERE target=? AND kind=?', (pid,kind)).fetchone()
-                    for row in sorted(rows, key=lambda r: int(r[time_key])):
-                        key, stamp = identity(kind, row), int(row[time_key])
-                        if kind == 'order':
-                            cleaned = clean_history(row)
+                    if kind == 'order':
+                        for raw in rows:
+                            cleaned = clean_history(raw)
+                            stamp = int(cleaned['orderTime'])
                             db.execute('INSERT OR REPLACE INTO leader_history VALUES(?,?,?,?)', (pid,history_identity(cleaned),stamp,dumps(cleaned)))
                             active = db.execute('SELECT 1 FROM leader_history_sync WHERE target=? AND complete=0 AND started_at>0',(pid,)).fetchone()
                             if active:
                                 db.execute('INSERT OR REPLACE INTO leader_history_stage VALUES(?,?,?,?)', (pid,history_identity(cleaned),stamp,dumps(cleaned)))
+                        rows = merge_order_fills(rows)
+                    for row in sorted(rows, key=lambda r: int(r[time_key])):
+                        key, stamp = identity(kind, row), int(row[time_key])
                         previous = db.execute('SELECT body FROM records WHERE target=? AND kind=? AND key=?', (pid, kind, key)).fetchone()
                         if previous and json.loads(previous[0]) == row:
                             continue
@@ -690,8 +723,9 @@ class Monitor:
                         with self.store.db() as db:
                             sync = db.execute('SELECT complete FROM leader_history_sync WHERE target=?',(task['target_id'],)).fetchone()
                             earlier = [json.loads(x['body']) for x in db.execute('SELECT body FROM leader_history WHERE target=? AND stamp<? ORDER BY stamp,key',(task['target_id'],int(row['orderTime'])))] if sync and sync['complete'] else []
-                            same_time = db.execute('SELECT COUNT(*) FROM leader_history WHERE target=? AND stamp=?',(task['target_id'],int(row['orderTime']))).fetchone()[0]
-                        prior = next((p for p in replay(earlier) if p['symbol']==row['symbol'] and p['side']==row['positionSide']),None) if earlier and same_time==1 else None
+                            simultaneous = [json.loads(x['body']) for x in db.execute('SELECT body FROM leader_history WHERE target=? AND stamp=?',(task['target_id'],int(row['orderTime'])))]
+                            ambiguous = any(x['symbol']==row['symbol'] and x['positionSide']==row['positionSide'] and x['side']!=row['side'] for x in simultaneous)
+                        prior = next((p for p in replay(earlier) if p['symbol']==row['symbol'] and p['side']==row['positionSide']),None) if earlier and not ambiguous else None
                         if prior and not prior['uncertain'] and number(prior['quantity'])>=number(row['executedQty']):
                             from market_guard import close_position
                             unmatched = plan_action == 'unmatched_close'
@@ -1089,22 +1123,18 @@ def handler_factory(store, monitor, token):
                         with store.db() as db:
                             exists = db.execute('SELECT name FROM targets WHERE id=?',(target,)).fetchone()
                             if exists:
-                                parts, args = [], []
+                                rows = []
                                 if kind in ('leader','order'):
-                                    parts.append("SELECT h.target,t.name,'order' AS kind,h.body,h.stamp,0 AS historical,'h:'||h.key AS sort_key FROM leader_history h JOIN targets t ON t.id=h.target WHERE h.target=?")
-                                    args.append(target)
+                                    raw = [json.loads(r['body']) for r in db.execute('SELECT body FROM leader_history WHERE target=? ORDER BY stamp,key',(target,))]
+                                    for body in merge_order_fills(raw):
+                                        body['direction']=direction(body)
+                                        body['notional']=decimal_text(number(body['executedQty'])*number(body['avgPrice']))
+                                        rows.append({'target':target,'name':exists['name'],'kind':'order','body':body,'stamp':int(body['orderTime']),'historical':0})
                                 if kind in ('leader','transfer'):
-                                    parts.append("SELECT target,name,kind,body,stamp,historical,'e:'||printf('%020d',id) AS sort_key FROM events WHERE target=? AND kind='transfer'")
-                                    args.append(target)
-                                combined=' UNION ALL '.join(parts)
-                                total=db.execute('SELECT COUNT(*) FROM ('+combined+')',args).fetchone()[0]
-                                rows=[dict(r) for r in db.execute('SELECT * FROM ('+combined+') ORDER BY stamp DESC,sort_key DESC LIMIT ? OFFSET ?',args+[limit,(page-1)*limit])]
-                                for row in rows:
-                                    row['body']=json.loads(row['body'])
-                                    if row['kind']=='order':
-                                        row['body']['direction']=direction(row['body'])
-                                        row['body']['notional']=decimal_text(number(row['body']['executedQty'])*number(row['body']['avgPrice']))
-                                return self.reply({'list':rows,'total':total,'page':page})
+                                    for row in db.execute("SELECT target,name,kind,body,stamp,historical FROM events WHERE target=? AND kind='transfer'",(target,)):
+                                        entry=dict(row);entry['body']=json.loads(entry['body']);rows.append(entry)
+                                rows.sort(key=lambda r:(r['stamp'],r['kind'],str(r['body'].get('symbol',''))),reverse=True)
+                                return self.reply({'list':rows[(page-1)*limit:page*limit],'total':len(rows),'page':page})
                     where, args = ("kind IN ('order','transfer')" if kind == 'leader' else "kind IN ('order','transfer','copy')"), []
                     if kind == 'leader': kind = ''
                     for column, value in [('target', target), ('kind', kind)]:

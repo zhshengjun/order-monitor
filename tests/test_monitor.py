@@ -42,7 +42,7 @@ class MonitorTests(unittest.TestCase):
         self.api = FakeAPI()
         self.monitor = Monitor(self.store, self.api)
         self.monitor.add(PID)
-        self.store.save_settings({'telegram_enabled': True, 'telegram_token': 'test-token', 'telegram_chat': '123',
+        self.store.save_settings({'page_size':5,'telegram_enabled': True, 'telegram_token': 'test-token', 'telegram_chat': '123',
                                   'bark_enabled': True, 'bark_key': 'test-key'})
 
     def tearDown(self):
@@ -203,7 +203,7 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(self.store.settings()['telegram_token'], 'test-token')
         self.store.save_settings({'telegram_enabled': False, 'clear_telegram_token': True})
         self.assertEqual(self.store.settings()['telegram_token'], '')
-        for patch_data in [{'page_size': 0}, {'page_size': 21}, {'interval': 0}, {'balance_threshold': '-1'}, {'balance_threshold': 'NaN'}, {'bark_url': 'http://example.com'}]:
+        for patch_data in [{'page_size': 0}, {'page_size': 101}, {'interval': 0}, {'balance_threshold': '-1'}, {'balance_threshold': 'NaN'}, {'bark_url': 'http://example.com'}]:
             with self.assertRaises(ValueError):
                 self.store.save_settings(patch_data)
 

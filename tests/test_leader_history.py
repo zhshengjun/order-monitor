@@ -38,6 +38,15 @@ class LeaderHistoryTests(unittest.TestCase):
         self.assertEqual(result[0]['quantity'],'3')
         self.assertEqual(result[0]['avg_price'],'120')
 
+    def test_full_close_clears_previous_uncertainty(self):
+        a=order(1,'2');b=order(1,'1');b['side']='SELL'
+        c=order(2,'1');c['side']='SELL'
+        d=order(3,'1');d['avgPrice']='120'
+        result=replay([a,b,c,d])
+        self.assertEqual(result[0]['quantity'],'1')
+        self.assertEqual(result[0]['avg_price'],'120')
+        self.assertFalse(result[0]['uncertain'])
+
     def test_background_backfill_persists_without_notifications_or_copy_tasks(self):
         with tempfile.TemporaryDirectory() as tmp:
             store=Store(Path(tmp)/'db'); api=FakeAPI(); monitor=Monitor(store,api)

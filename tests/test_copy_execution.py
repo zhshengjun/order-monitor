@@ -49,6 +49,22 @@ class CopyExecutionTests(unittest.TestCase):
         self.assertEqual(audit['lead_balance'],'100.00')
         self.assertEqual(audit['reference_price'],'100.1')
         self.assertEqual(audit['planned_quantity'],'0.999')
+
+    def test_same_order_across_pages_creates_one_aggregated_task(self):
+        self.store.save_settings({'page_size':5})
+        fills=[]
+        for i in range(1,8):
+            row=order(101,str(i));row['avgPrice']=str(100+i);fills.append(row)
+        self.api.orders=fills+[order(100)]
+        self.monitor.poll(PID);self.monitor.poll(PID)
+        tasks=self.rows('SELECT * FROM copy_tasks')
+        self.assertEqual(len(tasks),1)
+        import json
+        row=json.loads(tasks[0]['body'])
+        self.assertEqual(row['executedQty'],'28')
+        self.assertEqual(row['avgPrice'],'105')
+        self.assertEqual(self.rows('SELECT enabled FROM copy_live')[0]['enabled'],1)
+        self.assertEqual(len(self.rows('SELECT * FROM leader_history WHERE stamp=101')),7)
     def test_notification_uses_actual_exchange_notional(self):
         import json
         row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
