@@ -210,7 +210,7 @@ class Binance:
         if result.get('success') is not True or str(result.get('code')) != '000000':
             code = str(result.get('code', 'unknown'))[:40]
             LOG.warning('Binance request failed endpoint=%s business_code=%s', endpoint.split('?')[0], code)
-            raise UpstreamError('上游业务错误 %s' % code)
+            raise UpstreamError('上游业务错误 %s；接口 %s' % (code, endpoint.split('?')[0]))
         if result.get('data') is None:
             raise UpstreamError('上游缺少 data，未推进同步位置')
         return result['data']
