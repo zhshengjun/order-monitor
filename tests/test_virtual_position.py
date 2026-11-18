@@ -22,10 +22,12 @@ class VirtualPersistenceTests(unittest.TestCase):
         from test_monitor import FakeAPI, PID, order
         with tempfile.TemporaryDirectory() as tmp:
             store=Store(Path(tmp)/'data.db'); api=FakeAPI(); monitor=Monitor(store,api); monitor.add(PID); monitor.poll(PID)
+            monitor.now_ms=lambda:100
             with store.db() as db:
                 db.execute('INSERT INTO virtual_sessions VALUES(?,?,?,1)', (1,PID,100))
             api.orders.insert(0,order(101,'2'))
-            monitor.poll(PID); Monitor(Store(store.path),api).poll(PID)
+            monitor.poll(PID)
+            restarted=Monitor(Store(store.path),api); restarted.now_ms=lambda:100; restarted.poll(PID)
             close=order(102,'1'); close['side']='SELL'; api.orders.insert(0,close); monitor.poll(PID)
             excess=order(103,'3'); excess['side']='SELL'; api.orders.insert(0,excess); monitor.poll(PID)
             with store.db() as db:
