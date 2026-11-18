@@ -27,6 +27,7 @@ class FakeExchange:
 class CopyExecutionTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory(); self.store=Store(Path(self.tmp.name)/'db'); self.api=FakeAPI();self.monitor=Monitor(self.store,self.api);self.monitor.add(PID);self.monitor.poll(PID);FakeExchange.calls=[]
+        self.monitor.now_ms=lambda:100
         with self.store.db() as db:
             db.execute('INSERT INTO futures_accounts VALUES(1,?,?,?)',('test','key','secret'))
             db.execute('INSERT INTO copy_bindings VALUES(?,?)',(1,PID))
@@ -49,6 +50,15 @@ class CopyExecutionTests(unittest.TestCase):
         self.assertEqual(audit['lead_balance'],'100.00')
         self.assertEqual(audit['reference_price'],'100.1')
         self.assertEqual(audit['planned_quantity'],'0.999')
+
+    def test_first_execution_skips_stale_open_without_placing_order(self):
+        row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
+        self.monitor.now_ms=lambda:180102
+        with patch('app.FuturesClient',FakeExchange): self.monitor.execute_copy()
+        task=self.rows('SELECT state,error FROM copy_tasks')[0]
+        self.assertEqual(task['state'],'skipped')
+        self.assertIn('超过 3 分钟',task['error'])
+        self.assertEqual(FakeExchange.calls,[])
 
     def test_same_order_across_pages_creates_one_aggregated_task(self):
         self.store.save_settings({'page_size':5})

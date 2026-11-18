@@ -516,6 +516,7 @@ class Monitor:
         self.lock = threading.RLock()
         self.history_lock = threading.RLock()
         self.stop = threading.Event()
+        self.now_ms = lambda: int(time.time()*1000)
         self.transfer_queue = queue.Queue()
         self.transfer_pending = set()
         self.transfer_lock = threading.Lock()
@@ -821,6 +822,13 @@ class Monitor:
             client=FuturesClient(task['api_key'],task['api_secret']); row=json.loads(task['body'])
             LOG.info('copy task id=%s account=%s target=%s symbol=%s action=%s state=%s retries=%s',task['id'],task['account_id'],task['target_id'],row.get('symbol'),task['action'],task['state'],task['retry_count'])
             if task['state']=='pending':
+                if task['action']=='open' and self.now_ms()-int(row['orderTime']) > 180000:
+                    reason='带单员开仓操作超过 3 分钟，取消跟单'
+                    with self.store.db() as db:
+                        db.execute("UPDATE copy_tasks SET state='skipped',error=? WHERE id=? AND state='pending'",(reason,task['id']))
+                        self.copy_notice(db,task,'%s 跟单跳过：%s' % (row['symbol'],reason))
+                    LOG.warning('copy task id=%s symbol=%s result=stale_open',task['id'],row['symbol'])
+                    return
                 if task['action']=='open' and task['retry_count']:
                     with self.store.db() as db:
                         if int(time.time()*1000) - int(row['orderTime']) > 180000:
