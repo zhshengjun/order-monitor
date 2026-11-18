@@ -41,6 +41,7 @@ class MonitorTests(unittest.TestCase):
         self.store = Store(Path(self.temp.name) / 'monitor.db')
         self.api = FakeAPI()
         self.monitor = Monitor(self.store, self.api)
+        self.monitor.now_ms = lambda: 100
         self.monitor.add(PID)
         self.store.save_settings({'page_size':5,'telegram_enabled': True, 'telegram_token': 'test-token', 'telegram_chat': '123',
                                   'bark_enabled': True, 'bark_key': 'test-key'})
@@ -292,6 +293,18 @@ class MonitorTests(unittest.TestCase):
             self.monitor.deliver()
         self.assertEqual(send.call_count, 1)
         self.assertTrue(all(r['status'] == 'sent' for r in self.rows('outbox')))
+
+    def test_old_order_is_saved_without_notification_and_pending_order_expires(self):
+        self.baseline()
+        self.api.orders.insert(0,order(101));self.monitor.poll(PID)
+        self.monitor.now_ms=lambda:180103
+        with patch('app.send_notification') as send: self.monitor.deliver()
+        send.assert_not_called()
+        self.assertTrue(all(x['status']=='cancelled' for x in self.rows('outbox')))
+        self.api.orders.insert(0,order(102));self.monitor.poll(PID)
+        old=next(x for x in self.rows('events') if x['stamp']==102)
+        self.assertEqual(old['historical'],1)
+        self.assertEqual(len(self.rows('outbox')),2)
 
     def test_settings_secrets_preserved_and_explicit_clear(self):
         self.store.save_settings({'telegram_token': '', 'interval': 15})

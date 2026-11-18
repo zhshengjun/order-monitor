@@ -60,6 +60,15 @@ class CopyExecutionTests(unittest.TestCase):
         self.assertIn('超过 3 分钟',task['error'])
         self.assertEqual(FakeExchange.calls,[])
 
+    def test_pending_stale_close_is_not_placed(self):
+        row=order(101,'1');row.update(side='SELL',avgPrice='100');self.api.orders.insert(0,row);self.monitor.poll(PID)
+        self.monitor.now_ms=lambda:180102
+        with patch('app.FuturesClient',FakeExchange): self.monitor.execute_copy()
+        task=self.rows('SELECT state,error FROM copy_tasks')[0]
+        self.assertEqual(task['state'],'skipped')
+        self.assertIn('超过 3 分钟',task['error'])
+        self.assertEqual(FakeExchange.calls,[])
+
     def test_same_order_across_pages_creates_one_aggregated_task(self):
         self.store.save_settings({'page_size':5})
         fills=[]
@@ -160,6 +169,7 @@ class CopyExecutionTests(unittest.TestCase):
 
     def test_copy_switch_survives_store_restart(self):
         monitor=Monitor(Store(self.store.path),self.api)
+        monitor.now_ms=lambda:100
         row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row)
         with self.assertLogs('monitor',level='INFO') as captured: monitor.poll(PID)
         self.assertEqual(self.rows('SELECT state FROM copy_tasks')[0]['state'],'pending')

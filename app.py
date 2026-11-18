@@ -31,6 +31,7 @@ DEFAULTS = {'interval': 60, 'page_size': 20, 'balance_threshold': '0', 'telegram
             'bark_url': 'https://api.day.app', 'bark_key': ''}
 SECRETS = ('telegram_token', 'bark_key')
 LOG = logging.getLogger('monitor')
+MAX_ORDER_AGE_MS = 180000
 
 
 def dumps(value):
@@ -600,6 +601,9 @@ class Monitor:
         raise UpstreamError('新增记录超过 %s 条，未推进同步位置；可增加每页数量后重试' % (50 * page_size))
 
     def virtual_apply(self, db, pid, key, row, lead_balance):
+        if self.now_ms()-int(row['orderTime']) > MAX_ORDER_AGE_MS:
+            LOG.info('copy decision target=%s symbol=%s order_time=%s result=stale',pid,row['symbol'],row['orderTime'])
+            return
         states = db.execute('SELECT b.account_id,COALESCE(l.enabled,0) AS enabled,l.started_at AS live_start,v.active,v.started_at AS session_start FROM copy_bindings b LEFT JOIN copy_live l ON l.account_id=b.account_id AND l.target_id=b.target_id LEFT JOIN virtual_sessions v ON v.account_id=b.account_id AND v.target_id=b.target_id WHERE b.target_id=?',(pid,)).fetchall()
         for state in states:
             aid=state['account_id']
@@ -746,6 +750,9 @@ class Monitor:
                         monitor_started = db.execute('SELECT started_at FROM monitor_start WHERE target=?',(pid,)).fetchone() if kind == 'order' else None
                         after_start = bool(live_started or (monitor_started and stamp > monitor_started['started_at']))
                         historical = ((first_kind or (baseline is not None and stamp <= baseline['stamp'])) and not after_start)
+                        if kind == 'order' and self.now_ms()-stamp > MAX_ORDER_AGE_MS:
+                            historical = True
+                            LOG.info('poll order target=%s symbol=%s order_time=%s result=stale_saved',pid,row['symbol'],stamp)
                         inserted += 1
                         historical_count += int(historical)
                         self.store.event(db, pid, detail['nickname'], kind, body, stamp, historical, settings)
@@ -843,6 +850,11 @@ class Monitor:
             tasks = db.execute("SELECT o.id AS task_id,o.channel,o.attempts,e.* FROM outbox o JOIN events e ON e.id=o.event WHERE o.status='pending' AND e.kind != 'balance' AND o.next_try<=? ORDER BY o.id LIMIT 10", (time.time(),)).fetchall()
         for task in tasks:
             channel = task['channel']
+            if task['kind']=='order' and self.now_ms()-task['stamp'] > MAX_ORDER_AGE_MS:
+                with self.store.db() as db:
+                    db.execute("UPDATE outbox SET status='cancelled',error='订单通知已过期' WHERE id=? AND status='pending'",(task['task_id'],))
+                LOG.info('notification expired event=%s channel=%s order_time=%s',task['id'],channel,task['stamp'])
+                continue
             if not settings[channel + '_enabled']:
                 with self.store.db() as db:
                     db.execute("UPDATE outbox SET status='cancelled' WHERE id=?", (task['task_id'],))
@@ -873,12 +885,12 @@ class Monitor:
             client=FuturesClient(task['api_key'],task['api_secret']); row=json.loads(task['body'])
             LOG.info('copy task id=%s account=%s target=%s symbol=%s action=%s state=%s retries=%s',task['id'],task['account_id'],task['target_id'],row.get('symbol'),task['action'],task['state'],task['retry_count'])
             if task['state']=='pending':
-                if task['action']=='open' and self.now_ms()-int(row['orderTime']) > 180000:
-                    reason='带单员开仓操作超过 3 分钟，取消跟单'
+                if self.now_ms()-int(row['orderTime']) > MAX_ORDER_AGE_MS:
+                    reason='带单员交易操作超过 3 分钟，取消跟单'
                     with self.store.db() as db:
                         db.execute("UPDATE copy_tasks SET state='skipped',error=? WHERE id=? AND state='pending'",(reason,task['id']))
                         self.copy_notice(db,task,'%s 跟单跳过：%s' % (row['symbol'],reason))
-                    LOG.warning('copy task id=%s symbol=%s result=stale_open',task['id'],row['symbol'])
+                    LOG.warning('copy task id=%s symbol=%s action=%s result=stale_order',task['id'],row['symbol'],task['action'])
                     return
                 if task['action']=='open' and task['retry_count']:
                     with self.store.db() as db:
