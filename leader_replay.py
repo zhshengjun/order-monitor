@@ -5,7 +5,7 @@ from fractions import Fraction
 
 def replay(rows):
     positions = {}
-    stamps = set()
+    stamps = {}
     for row in sorted(rows, key=lambda r: int(r['orderTime'])):
         symbol, side, position_side = row['symbol'], row['side'], row['positionSide']
         if (side, position_side) not in (('BUY','LONG'),('SELL','LONG'),('SELL','SHORT'),('BUY','SHORT')):
@@ -19,12 +19,14 @@ def replay(rows):
         key = (symbol, position_side)
         position = positions.setdefault(key, {'qty': Fraction(0), 'cost': Fraction(0), 'uncertain': False})
         stamp_key = (symbol, position_side, int(row['orderTime']))
-        simultaneous = stamp_key in stamps
+        opening = (side, position_side) in (('BUY','LONG'),('SELL','SHORT'))
+        previous_action = stamps.get(stamp_key)
+        simultaneous = previous_action is not None and previous_action != opening
         if simultaneous:
             position['uncertain'] = True  # No stable ordering within the same millisecond.
-        stamps.add(stamp_key)
+        stamps[stamp_key] = opening
         qty, cost, amount = position['qty'], position['cost'], Fraction(quantity)
-        if (side, position_side) in (('BUY','LONG'),('SELL','SHORT')):
+        if opening:
             position['qty'] = qty + amount
             position['cost'] = cost + amount * Fraction(price)
         elif amount > qty:

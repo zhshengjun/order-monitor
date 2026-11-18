@@ -27,8 +27,16 @@ class LeaderHistoryTests(unittest.TestCase):
         self.assertEqual(replay([close]),[])
 
     def test_same_timestamp_is_unknown(self):
-        a=order(3,'1'); b=order(3,'2')
+        a=order(3,'1'); b=order(3,'2'); b['side']='SELL'
         self.assertTrue(replay([a,b])[0]['uncertain'])
+
+    def test_same_timestamp_same_action_is_deterministic(self):
+        a=order(3,'1');a['avgPrice']='100'
+        b=order(3,'2');b['avgPrice']='130'
+        result=replay([a,b])
+        self.assertFalse(result[0]['uncertain'])
+        self.assertEqual(result[0]['quantity'],'3')
+        self.assertEqual(result[0]['avg_price'],'120')
 
     def test_background_backfill_persists_without_notifications_or_copy_tasks(self):
         with tempfile.TemporaryDirectory() as tmp:
