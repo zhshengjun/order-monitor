@@ -25,7 +25,7 @@ from fractions import Fraction
 
 ROOT = Path(__file__).parent
 API_PATH = '/bapi/futures/v1/friendly/future/copy-trade/'
-DEFAULTS = {'interval': 60, 'page_size': 100, 'balance_threshold': '0', 'telegram_enabled': False,
+DEFAULTS = {'interval': 60, 'page_size': 20, 'balance_threshold': '0', 'telegram_enabled': False,
             'telegram_token': '', 'telegram_chat': '', 'bark_enabled': False,
             'bark_url': 'https://api.day.app', 'bark_key': ''}
 SECRETS = ('telegram_token', 'bark_key')
@@ -375,6 +375,11 @@ class Store:
                 current['page_size'] = 100
                 db.execute('UPDATE settings SET value=? WHERE id=1',(dumps(current),))
                 db.execute("INSERT INTO app_migrations VALUES('poll_page_size_100')")
+            if not db.execute("SELECT 1 FROM app_migrations WHERE name='poll_page_size_20'").fetchone():
+                current = json.loads(db.execute('SELECT value FROM settings WHERE id=1').fetchone()[0])
+                current['page_size'] = 20
+                db.execute('UPDATE settings SET value=? WHERE id=1',(dumps(current),))
+                db.execute("INSERT INTO app_migrations VALUES('poll_page_size_20')")
             db.execute('INSERT OR IGNORE INTO baseline_watermarks SELECT r.target,r.kind,MAX(r.stamp) FROM records r JOIN targets t ON t.id=r.target WHERE t.initialized=1 GROUP BY r.target,r.kind')
         os.chmod(self.path, 0o600)
 
@@ -439,8 +444,8 @@ class Store:
             if not 10 <= settings['interval'] <= 86400:
                 raise ValueError('监听频率必须为 10～86400 秒')
             settings['page_size'] = int(settings['page_size'])
-            if not 1 <= settings['page_size'] <= 100:
-                raise ValueError('轮询每页数量必须为 1～100 条')
+            if not 1 <= settings['page_size'] <= 20:
+                raise ValueError('轮询每页数量必须为 1～20 条')
             settings['balance_threshold'] = decimal_text(settings['balance_threshold'])
             if number(settings['balance_threshold']) < 0:
                 raise ValueError('余额通知阈值不能为负数')

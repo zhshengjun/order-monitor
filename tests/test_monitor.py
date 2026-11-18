@@ -55,6 +55,13 @@ class MonitorTests(unittest.TestCase):
     def baseline(self):
         self.monitor.poll(PID)
 
+    def test_upgrade_sets_poll_page_size_to_twenty(self):
+        with self.store.db() as db:
+            settings=self.store.settings(db);settings['page_size']=100
+            db.execute('UPDATE settings SET value=? WHERE id=1',(json.dumps(settings),))
+            db.execute("DELETE FROM app_migrations WHERE name='poll_page_size_20'")
+        self.assertEqual(Store(self.store.path).settings()['page_size'],20)
+
     def test_baseline_silent_and_decimal_exact(self):
         self.baseline()
         self.assertEqual(len(self.rows('events')), 1)
@@ -203,7 +210,7 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(self.store.settings()['telegram_token'], 'test-token')
         self.store.save_settings({'telegram_enabled': False, 'clear_telegram_token': True})
         self.assertEqual(self.store.settings()['telegram_token'], '')
-        for patch_data in [{'page_size': 0}, {'page_size': 101}, {'interval': 0}, {'balance_threshold': '-1'}, {'balance_threshold': 'NaN'}, {'bark_url': 'http://example.com'}]:
+        for patch_data in [{'page_size': 0}, {'page_size': 21}, {'interval': 0}, {'balance_threshold': '-1'}, {'balance_threshold': 'NaN'}, {'bark_url': 'http://example.com'}]:
             with self.assertRaises(ValueError):
                 self.store.save_settings(patch_data)
 
