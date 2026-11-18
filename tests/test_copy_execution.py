@@ -133,9 +133,38 @@ class CopyExecutionTests(unittest.TestCase):
         reason='HTTP 451; code 0; 接口 /fapi/v3/balance；请检查容器代理与合约 API 出口'
         with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'balance',side_effect=ExchangeError(reason)):
             self.monitor.execute_copy()
-        task=self.rows('SELECT state,error FROM copy_tasks')[0]
-        self.assertEqual(task['state'],'skipped');self.assertIn('/fapi/v3/balance',task['error'])
+        task=self.rows('SELECT state,error,retry_count FROM copy_tasks')[0]
+        self.assertEqual(task['state'],'pending');self.assertEqual(task['retry_count'],1);self.assertIn('/fapi/v3/balance',task['error'])
         self.assertEqual(FakeExchange.calls,[])
+
+    def test_precheck_retries_three_times_then_stops(self):
+        row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
+        with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'balance',side_effect=ExchangeError('HTTP 451',451,0)) as balance:
+            for _ in range(4):
+                with self.store.db() as db: db.execute('UPDATE copy_tasks SET next_check=0')
+                self.monitor.execute_copy()
+        task=self.rows('SELECT state,error,retry_count FROM copy_tasks')[0]
+        self.assertEqual(balance.call_count,4)
+        self.assertEqual((task['state'],task['retry_count']),('skipped',3))
+        self.assertIn('重试 3 次',task['error'])
+        self.assertEqual(FakeExchange.calls,[])
+
+    def test_precheck_network_recovery_retries_original_task(self):
+        row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
+        with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'balance',side_effect=[ExchangeError('timeout'),BALANCES]):
+            self.monitor.execute_copy()
+            with self.store.db() as db: db.execute('UPDATE copy_tasks SET next_check=0')
+            self.monitor.execute_copy()
+        self.assertEqual(self.rows('SELECT state,retry_count FROM copy_tasks')[0]['state'],'filled')
+        self.assertEqual([x[0] for x in FakeExchange.calls],['place'])
+
+    def test_precheck_retry_waits_and_blocks_later_same_account(self):
+        row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
+        row2=order(102,'1');row2['avgPrice']='100';self.api.orders.insert(0,row2);self.monitor.poll(PID)
+        with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'balance',side_effect=ExchangeError('timeout')) as balance:
+            self.monitor.execute_copy();self.monitor.execute_copy()
+        self.assertEqual(balance.call_count,1)
+        self.assertEqual([x['state'] for x in self.rows('SELECT state FROM copy_tasks ORDER BY id')],['pending','pending'])
 
     def test_http_451_on_submit_keeps_pending_reconciliation(self):
         row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
@@ -149,6 +178,17 @@ class CopyExecutionTests(unittest.TestCase):
         row=order(101,'1');row['side']='SELL';row['avgPrice']='100'
         with self.assertRaisesRegex(ValueError,'没有对应方向持仓'):
             plan(row,'close','2','1','100',BALANCES,[],{'dualSidePosition':False},QUOTE,RULES)
+
+    def test_close_without_position_skips_without_retry_or_balance_query(self):
+        row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
+        with self.store.db() as db: db.execute("UPDATE copy_tasks SET action='close'")
+        with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'positions',return_value=[]), patch.object(FakeExchange,'balance') as balance:
+            self.monitor.execute_copy()
+        balance.assert_not_called()
+        task=self.rows('SELECT state,error,retry_count FROM copy_tasks')[0]
+        self.assertEqual((task['state'],task['retry_count']),('skipped',0))
+        self.assertIn('没有对应方向持仓',task['error'])
+        self.assertEqual(FakeExchange.calls,[])
     def test_reduce_only_not_blocked_by_opening_minimum_notional(self):
         row=order(101,'0.01');row['avgPrice']='100';row['side']='SELL'
         p=plan(row,'close','0.01','0.01','100',BALANCES,[{'symbol':'BTCUSDT','positionSide':'BOTH','positionAmt':'0.01'}],{'dualSidePosition':False},QUOTE,RULES)

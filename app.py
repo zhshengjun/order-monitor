@@ -265,6 +265,9 @@ class Store:
               status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
               next_try REAL NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '', UNIQUE(event,channel));
             ''')
+            columns = {row['name'] for row in db.execute('PRAGMA table_info(copy_tasks)')}
+            if 'retry_count' not in columns:
+                db.execute('ALTER TABLE copy_tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0')
             db.execute('INSERT OR IGNORE INTO settings VALUES(1,?)', (dumps(DEFAULTS),))
             db.execute('INSERT OR IGNORE INTO baseline_watermarks SELECT r.target,r.kind,MAX(r.stamp) FROM records r JOIN targets t ON t.id=r.target WHERE t.initialized=1 GROUP BY r.target,r.kind')
         os.chmod(self.path, 0o600)
@@ -549,13 +552,20 @@ class Monitor:
         # Serial worker: a submitted order with unknown outcome is reconciled, never re-sent.
         with self.lock:
             with self.store.db() as db:
-                task=db.execute("SELECT c.*,a.api_key,a.api_secret FROM copy_tasks c JOIN futures_accounts a ON a.id=c.account_id JOIN virtual_sessions s ON s.account_id=c.account_id AND s.target_id=c.target_id JOIN targets t ON t.id=c.target_id WHERE (c.state='submitted' AND c.next_check<=strftime('%s','now')) OR (c.state='pending' AND s.active=1 AND t.enabled=1 AND NOT EXISTS (SELECT 1 FROM copy_tasks u WHERE u.account_id=c.account_id AND u.state='submitted')) ORDER BY CASE WHEN c.state='submitted' THEN 0 ELSE 1 END,c.id LIMIT 1").fetchone()
+                task=db.execute("SELECT c.*,a.api_key,a.api_secret FROM copy_tasks c JOIN futures_accounts a ON a.id=c.account_id JOIN virtual_sessions s ON s.account_id=c.account_id AND s.target_id=c.target_id JOIN targets t ON t.id=c.target_id WHERE (c.state='submitted' AND c.next_check<=strftime('%s','now')) OR (c.state='pending' AND c.next_check<=strftime('%s','now') AND s.active=1 AND t.enabled=1 AND NOT EXISTS (SELECT 1 FROM copy_tasks u WHERE u.account_id=c.account_id AND (u.state='submitted' OR (u.state='pending' AND u.id<c.id)))) ORDER BY CASE WHEN c.state='submitted' THEN 0 ELSE 1 END,c.id LIMIT 1").fetchone()
             if not task: return
             client=FuturesClient(task['api_key'],task['api_secret']); row=json.loads(task['body'])
             if task['state']=='pending':
                 try:
                     with self.store.db() as db:
                         old=db.execute('SELECT quantity FROM copied_positions WHERE account_id=? AND target_id=? AND symbol=? AND position_side=?',(task['account_id'],task['target_id'],row['symbol'],row['positionSide'])).fetchone()
+                    positions = None
+                    if task['action'] == 'close':
+                        from market_guard import close_position
+                        positions = client.positions()
+                        if not isinstance(positions, list): raise ValueError('账户持仓响应格式错误')
+                        if close_position(positions,row['symbol'],row['positionSide']) <= 0:
+                            raise ValueError('没有对应方向持仓，跳过平仓')
                     balances=client.balance()
                     balance_time=int(time.time()*1000)
                     if not isinstance(balances,list): raise ValueError('账户余额响应格式错误')
@@ -569,7 +579,8 @@ class Monitor:
                         config = next((c for c in configs if isinstance(c,dict) and c.get('symbol') == row['symbol']), None)
                         if not config: raise ValueError('未获取到交易对杠杆配置')
                         mark_price, leverage = mark.get('markPrice'), config.get('leverage')
-                    positions, mode, rules = client.positions(), client.mode(), client.rules()
+                    if positions is None: positions = client.positions()
+                    mode, rules = client.mode(), client.rules()
                     if task['action'] == 'close':
                         from market_guard import close_position
                         with self.store.db() as db:
@@ -583,8 +594,16 @@ class Monitor:
                 except (ValueError,ExchangeError,KeyError,InvalidOperation) as exc:
                     LOG.warning('跟单预检查失败 account=%s symbol=%s: %s', task['account_id'], row.get('symbol',''), str(exc)[:200])
                     with self.store.db() as db:
-                        db.execute("UPDATE copy_tasks SET state='skipped',error=? WHERE id=?",(str(exc)[:250],task['id']))
-                        self.copy_notice(db,task,'%s 跟单跳过：%s' % (row['symbol'],str(exc)[:200]))
+                        transient = isinstance(exc, ExchangeError) and (exc.status is None or exc.status in (408, 418, 429, 451) or 500 <= exc.status <= 599)
+                        retries = task['retry_count']
+                        if transient and retries < 3:
+                            retries += 1
+                            reason = '预检查网络错误，等待第 %s/3 次重试：%s' % (retries,str(exc)[:180])
+                            db.execute("UPDATE copy_tasks SET retry_count=?,next_check=?,error=? WHERE id=? AND state='pending'",(retries,time.time()+5*2**(retries-1),reason,task['id']))
+                        else:
+                            reason = ('预检查重试 3 次后失败：' if transient else '') + str(exc)[:200]
+                            db.execute("UPDATE copy_tasks SET state='skipped',error=? WHERE id=? AND state='pending'",(reason,task['id']))
+                            self.copy_notice(db,task,'%s 跟单跳过：%s' % (row['symbol'],reason))
                     return
                 params['newClientOrderId']=task['client_id']
                 # Persist intent before touching the exchange, so process crashes cannot duplicate a POST.
