@@ -51,6 +51,24 @@ class CopyExecutionTests(unittest.TestCase):
         self.assertEqual(audit['reference_price'],'100.1')
         self.assertEqual(audit['planned_quantity'],'0.999')
 
+    def test_timing_links_signal_execution_and_notification(self):
+        self.store.save_settings({'bark_enabled':True, 'bark_key':'private-device-key'})
+        row=order(101,'1'); row['avgPrice']='100'; self.api.orders.insert(0,row)
+        with self.assertLogs('monitor',level='INFO') as logs:
+            self.monitor.poll(PID)
+            with patch('app.FuturesClient',FakeExchange): self.monitor.execute_copy()
+            with patch('app.send_notification'): self.monitor.deliver()
+        output='\n'.join(logs.output)
+        for stage in ('leader_detail','order_collect','poll_apply','copy_enqueued','copy_dequeued',
+                      'copy_preflight','copy_submit','copy_response','copy_finalize','copy_attempt','notification_send'):
+            self.assertIn('stage='+stage,output)
+        for stage in ('copy_enqueued','copy_preflight','copy_submit','copy_response','notification_send'):
+            self.assertTrue(any('stage='+stage+' ' in line and 'task=1 ' in line for line in logs.output),stage)
+        self.assertIn('source_to_enqueue_ms=',output)
+        self.assertIn('exchange_update_ms=unknown',output)
+        self.assertNotIn('private-device-key',output)
+        self.assertEqual([call[0] for call in FakeExchange.calls],['place'])
+
     def test_first_execution_skips_stale_open_without_placing_order(self):
         row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
         self.monitor.now_ms=lambda:180102

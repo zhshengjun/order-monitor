@@ -138,6 +138,31 @@ node --check static/app.js
 
 跟单排查可搜索 `copy switch`、`copy decision`、`copy task` 和 `copy result`。其中 `disabled` 表示关联的自动跟单开关未开启，`before_start` 表示成交时间早于启用时间，`queued` 表示已创建跟单任务；预检查或下单失败会记录原因。日志不记录 API 密钥。
 
+### 各环节耗时
+
+新实时订单的首次发现时间与发现延迟会持久化保存，带单员交易记录和账户跟单记录均显示“发现延迟”（秒，保留三位小数）。旧订单、历史回填和历史基线没有可验证的首次实时发现时间，统一显示 `-`，不会用后来的再次采集时间补算。重复采集和订单增量更新保留首次发现值。
+
+INFO 级别的 `timing stage=...` 日志用于定位延迟，单位为毫秒。用 `task=<ID>` 关联跟单任务、合约请求和结果通知，用 `target=<ID>` 关联带单员采集；分页另带 `kind`、`page`。每次请求独立记录成功或失败，不输出密钥、签名、请求参数、通知正文或原始异常。
+
+| stage | 含义 |
+|---|---|
+| `poll_schedule` | 已到采集时间后等待调度的时间；首次调度为 unknown |
+| `leader_detail` / `order_collect` / `poll_apply` | 详情查询、订单采集、获取处理锁并写入数据库 |
+| `history_lock_wait` / `history_rate_wait` | 历史接口锁等待、限速等待 |
+| `history_page` / `leader_request` | 单页总耗时、单次公开接口请求耗时（含读响应和解析） |
+| `order_discovered` | 首次发现新订单：`discovery_delay_ms = discovered_at_ms - source_order_time_ms`；发现时间取该页返回时，排除后续分页、处理与入队等待。`source_time_field=orderTime` 表示上游字段，不承诺是委托提交时间；历史记录标记 historical，统计实时延迟应排除它们。重复采集不会重复记录；同一订单后续增量不视为首次发现。通过 order_key 与 copy_enqueued 关联任务。 |
+| `copy_enqueued` | 任务 ID、源交易时间和 `source_to_enqueue_ms`；包含上游发布延迟与本地发现、处理时间，不能单独归因于轮询 |
+| `copy_pickup` / `copy_dequeued` | 工作线程获取锁和读取任务耗时；任务年龄 `task_age_ms`，以及重试到期后的 `ready_lag_ms` |
+| `copy_preflight` / `futures_request` | 预检查总耗时、各合约接口耗时；POST/GET 区分提交和查询订单 |
+| `copy_submit` / `copy_confirm` | 提交调用、后续确认查询耗时（即使超时也会记录） |
+| `copy_response` | 交易所状态、`exchange_update_ms`、源交易到响应和入队到响应的延迟 |
+| `copy_finalize` / `copy_attempt` | 保存终态并生成通知耗时、该次处理耗时 |
+| `notification_start` / `notification_send` | 通知事件年龄、发送耗时，附 event、task、channel、attempt |
+
+`duration_ms` 使用单调时钟；年龄与跨系统时间差使用墙上时钟，受时钟偏差影响。`task_age_ms` 在首次处理时反映排队时间，后续处理包含已执行时间和重试等待；结合 state、retries 和逐次日志判断。`exchange_update_ms` 是交易所返回的订单更新时间，不保证是精确成交时间；未返回时为 unknown。通知 `event_age_ms` 对交易操作从源交易时间算，对跟单结果从结果事件生成时间算，不能统一当作通知排队耗时。发送成功仅表示通知服务接受请求。
+
+嵌套阶段的耗时包含子阶段，不应直接相加。`outcome=ok` 表示该代码块正常返回；`copy_attempt` 可能正常处理了跳过或待重试，交易是否成功仍以 `copy result` / 数据库终态为准。部署新版本后才开始收集，旧记录无法补回。
+
 ## 自动跟单
 
 在“带单员与账户”页面保存合约 API 账号、关联带单员并点击“开启跟单”，无需等待首次历史同步；只处理本次开启后的新成交。重新开启会保留已有的跟单持仓和虚拟持仓。关闭跟单会取消未执行任务；已发送但结果未知的订单仍会查询状态。

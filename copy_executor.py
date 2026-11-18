@@ -9,6 +9,7 @@ import urllib.parse
 import urllib.request
 from decimal import Decimal
 from fractions import Fraction
+from timing import timed
 from copy_calculation import opening_quantity, closing_quantity, steps_quantity
 from market_guard import check_price, close_position
 
@@ -33,6 +34,10 @@ class FuturesClient:
         self.key, self.secret = key, secret
 
     def request(self, path, params=None, method='GET', signed=False):
+        with timed('futures_request', endpoint=path.split('?')[0], method=method):
+            return self._request(path, params, method, signed)
+
+    def _request(self, path, params=None, method='GET', signed=False):
         params = dict(params or {})
         if signed:
             params.update(timestamp=int(time.time()*1000), recvWindow=5000)

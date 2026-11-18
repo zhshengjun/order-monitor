@@ -36,6 +36,49 @@ class FakeAPI:
 
 
 class MonitorTests(unittest.TestCase):
+    def test_discovery_delay_uses_page_arrival_not_processing_time(self):
+        self.monitor.poll(PID)
+        self.api.orders.insert(0,order(200))
+        original=self.api.history
+        clock=[1.0]
+        def history(*args):
+            result=original(*args)
+            clock[0]=2.5
+            return result
+        original_event=self.store.event
+        def event(*args):
+            clock[0]=9.0
+            return original_event(*args)
+        with patch.object(self.api,'history',side_effect=history), patch.object(self.store,'event',side_effect=event):
+            with patch('app.time.time',side_effect=lambda:clock[0]), self.assertLogs('monitor',level='INFO') as logs:
+                self.monitor.poll(PID)
+                self.monitor.poll(PID)
+        discoveries=[line for line in logs.output if 'stage=order_discovered ' in line]
+        self.assertEqual(len(discoveries),1)
+        self.assertIn('source_order_time_ms=200 ',discoveries[0])
+        self.assertIn('discovered_at_ms=2500 ',discoveries[0])
+        self.assertIn('discovery_delay_ms=2300 ',discoveries[0])
+
+    def test_discovery_is_persisted_and_old_orders_remain_unknown(self):
+        self.monitor.poll(PID)  # Existing baseline must not get a fabricated delay.
+        self.api.orders.insert(0,order(200))
+        with patch('app.time.time',return_value=2.5): self.monitor.poll(PID)
+        self.api.orders[0]['executedQty']='2.5'
+        with patch('app.time.time',return_value=8.0): self.monitor.poll(PID)
+        reopened=Store(Path(self.temp.name)/'monitor.db')
+        rows=reopened.attach_discovery([
+            {'target':PID,'kind':'order','body':order(100)},
+            {'target':PID,'kind':'order','body':order(200)},
+            {'target_id':PID,'body':json.dumps(order(200))},
+        ])
+        self.assertIsNone(rows[0]['discovery_delay_ms'])
+        self.assertIsNone(rows[0]['discovered_at_ms'])
+        for row in rows[1:]:
+            self.assertEqual(row['discovery_delay_ms'],2300)
+            self.assertEqual(row['discovered_at_ms'],2500)
+        with reopened.db() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM order_discovery').fetchone()[0],1)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.store = Store(Path(self.temp.name) / 'monitor.db')

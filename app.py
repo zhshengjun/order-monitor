@@ -24,6 +24,7 @@ from virtual_position import decimal_string, transition
 from leader_replay import replay
 from copy_executor import FuturesClient, ExchangeError, plan
 from fractions import Fraction
+from timing import timed, timing_context, timing_event
 
 ROOT = Path(__file__).parent
 API_PATH = '/bapi/futures/v1/friendly/future/copy-trade/'
@@ -216,6 +217,10 @@ class Binance:
             raise ValueError('BINANCE_BASE_URL 必须为 HTTPS')
 
     def call(self, endpoint, body=None):
+        with timed('leader_request', endpoint=endpoint.split('?')[0]):
+            return self._call(endpoint, body)
+
+    def _call(self, endpoint, body=None):
         url = self.base + API_PATH + endpoint
         headers={'Content-Type':'application/json'}
         if endpoint.split('?')[0] != 'lead-portfolio/order-history':
@@ -274,12 +279,20 @@ class Binance:
             'hideFull': 'false', 'nickname': nickname, 'pageSize': 20})
 
     def history(self, pid, kind, page, page_size=20):
+        with timing_context(target=pid, kind=kind, page=page):
+            with timed('history_page'):
+                return self._history(pid, kind, page, page_size)
+
+    def _history(self, pid, kind, page, page_size=20):
         name = 'order-history' if kind == 'order' else 'transfer-history'
         body={'portfolioId': pid, 'pageSize': page_size, 'pageNumber': page}
         if kind == 'order':
+            wait_started=time.monotonic()
             with self.order_history_lock:
-                delay=self.order_history_next-time.monotonic()
-                if delay>0: time.sleep(delay)
+                timing_event('history_lock_wait', duration_ms=round((time.monotonic()-wait_started)*1000,3))
+                with timed('history_rate_wait'):
+                    delay=self.order_history_next-time.monotonic()
+                    if delay>0: time.sleep(delay)
                 try:
                     data=self.call('lead-portfolio/'+name,body)
                 finally:
@@ -341,6 +354,9 @@ class Store:
               target TEXT NOT NULL, kind TEXT NOT NULL, key TEXT NOT NULL, body TEXT NOT NULL,
               stamp INTEGER NOT NULL, PRIMARY KEY(target,kind,key));
             CREATE INDEX IF NOT EXISTS records_target_time ON records(target,kind,stamp DESC);
+            CREATE TABLE IF NOT EXISTS order_discovery (
+              target TEXT NOT NULL, key TEXT NOT NULL, discovered_at_ms INTEGER NOT NULL,
+              discovery_delay_ms INTEGER NOT NULL, PRIMARY KEY(target,key));
             CREATE TABLE IF NOT EXISTS leader_history (
               target TEXT NOT NULL, key TEXT NOT NULL, stamp INTEGER NOT NULL, body TEXT NOT NULL,
               PRIMARY KEY(target,key));
@@ -534,6 +550,18 @@ class Store:
             db.execute('DELETE FROM display_order WHERE kind=?', (kind,))
             db.executemany('INSERT INTO display_order(kind,item_id,position) VALUES(?,?,?)', ((kind, value, i) for i, value in enumerate(ids)))
 
+    def attach_discovery(self, rows):
+        with self.db() as db:
+            for row in rows:
+                row['discovery_delay_ms'] = None
+                row['discovered_at_ms'] = None
+                if row.get('kind', 'order') != 'order': continue
+                body = row['body'] if isinstance(row['body'], dict) else json.loads(row['body'])
+                saved = db.execute('SELECT discovered_at_ms,discovery_delay_ms FROM order_discovery WHERE target=? AND key=?',
+                                   (row.get('target',row.get('target_id')),identity('order',body))).fetchone()
+                if saved: row.update(dict(saved))
+        return rows
+
     def settings(self, db=None):
         if db is not None:
             return {**DEFAULTS, **json.loads(db.execute('SELECT value FROM settings WHERE id=1').fetchone()[0])}
@@ -619,7 +647,7 @@ class Monitor:
                 db.execute('UPDATE virtual_sessions SET active=0 WHERE target_id=?',(pid,))
         LOG.info('monitor switch saved target=%s enabled=%s next_check=%s',pid,enabled,'immediate' if enabled else 'disabled')
 
-    def collect(self, pid, kind, initialized):
+    def collect(self, pid, kind, initialized, observations=None):
         with self.store.db() as db:
             stamps = db.execute('SELECT MAX(stamp) FROM records WHERE target=? AND kind=?', (pid, kind)).fetchone()
             watermark = stamps[0]
@@ -632,6 +660,10 @@ class Monitor:
             rows=[]
             for page in range(1,51):
                 batch=self.api.history(pid,kind,page,page_size)['list']
+                received_ms=int(time.time()*1000)
+                if observations is not None:
+                    for item in batch:
+                        observations.setdefault(identity('order',clean_history(item)), (received_ms,page))
                 rows.extend(batch)
                 if not batch or len(batch)<page_size or (not initialized and watermark is None): return rows
                 if initialized:
@@ -704,6 +736,8 @@ class Monitor:
             created = db.execute('INSERT OR IGNORE INTO copy_tasks(account_id,target_id,order_key,body,action,before_qty,lead_balance,client_id,created) VALUES(?,?,?,?,?,?,?,?,?)',
                        (aid,pid,key,dumps(row),change['action'],change['before'],'' if lead_balance is None else str(lead_balance),client_id,int(time.time()*1000)))
             LOG.info('copy decision target=%s account=%s symbol=%s order_time=%s action=%s result=%s',pid,aid,symbol,row['orderTime'],change['action'],'queued' if created.rowcount else 'existing_task')
+            if created.rowcount:
+                timing_event('copy_enqueued', task=created.lastrowid, order_key=identity('order',row), target=pid, account=aid, order_time_ms=row['orderTime'], source_to_enqueue_ms=int(time.time()*1000)-int(row['orderTime']))
             if change['action'] != 'unmatched_close':
                 db.execute('INSERT OR REPLACE INTO virtual_positions VALUES(?,?,?,?,?)', (aid,pid,symbol,side,change['after']))
 
@@ -732,23 +766,31 @@ class Monitor:
         self.virtual_apply(db, pid, key + ':' + decimal_string(new_qty), delta, lead_balance)
 
     def poll(self, pid):
+        with timing_context(target=pid):
+            return self._poll(pid)
+
+    def _poll(self, pid):
         with self.store.db() as db:
             target = db.execute('SELECT * FROM targets WHERE id=?', (pid,)).fetchone()
         if not target or not target['enabled']:
             return
         LOG.info('poll start target=%s initialized=%s',pid,target['initialized'])
+        timing_event('poll_schedule', overdue_ms=round((time.time()-target['next_check'])*1000,3) if target['next_check'] else 'unknown')
         started_at=time.monotonic()
         inserted=updated=historical_count=0
         try:
             detail_error = ''
             try:
-                detail = self.api.detail(pid)
+                with timed('leader_detail'):
+                    detail = self.api.detail(pid)
             except (UpstreamError, ValueError, InvalidOperation, KeyError) as exc:
                 detail_error = str(exc)[:300]
                 LOG.warning('portfolio %s detail failed; continuing order polling: %s',pid,detail_error)
                 detail = {'nickname':target['name'], 'marginBalance':None}
-            histories = {'order': self.collect(pid,'order',target['initialized'])}
-            with self.lock, self.store.db() as db:
+            observations = {}
+            with timed('order_collect'):
+                histories = {'order': self.collect(pid,'order',target['initialized'],observations)}
+            with timed('poll_apply'), self.lock, self.store.db() as db:
                 current = db.execute('SELECT initialized,enabled FROM targets WHERE id=?', (pid,)).fetchone()
                 if not current or not current['enabled'] or current['initialized'] != target['initialized']:
                     return
@@ -813,6 +855,11 @@ class Monitor:
                         if kind == 'order' and self.now_ms()-stamp > MAX_ORDER_AGE_MS:
                             historical = True
                             LOG.info('poll order target=%s symbol=%s order_time=%s result=stale_saved',pid,row['symbol'],stamp)
+                        if kind == 'order':
+                            discovered_ms, page = observations[identity('order',row)]
+                            if not historical:
+                                db.execute('INSERT OR IGNORE INTO order_discovery VALUES(?,?,?,?)',(pid,identity('order',row),discovered_ms,discovered_ms-stamp))
+                            timing_event('order_discovered', order_key=identity('order',row), symbol=row['symbol'], source_time_field='orderTime', source_order_time_ms=stamp, discovered_at_ms=discovered_ms, discovery_delay_ms=discovered_ms-stamp, page=page, historical=historical)
                         inserted += 1
                         historical_count += int(historical)
                         self.store.event(db, pid, detail['nickname'], kind, body, stamp, historical, settings)
@@ -922,7 +969,10 @@ class Monitor:
                 continue
             title, message = self.message(task)
             try:
-                send_notification(channel, settings, title, message)
+                with timing_context(event=task['id'], task=json.loads(task['body']).get('copy_task_id','unknown'), channel=channel, attempt=task['attempts']+1):
+                    timing_event('notification_start', event_age_ms=int(time.time()*1000)-task['stamp'])
+                    with timed('notification_send'):
+                        send_notification(channel, settings, title, message)
                 with self.store.db() as db:
                     db.execute("UPDATE outbox SET status='sent',error='' WHERE id=?", (task['task_id'],))
             except Exception as exc:
@@ -935,179 +985,189 @@ class Monitor:
 
     def copy_notice(self, db, task, message):
         name = db.execute('SELECT name FROM targets WHERE id=?', (task['target_id'],)).fetchone()
-        self.store.event(db, task['target_id'], name['name'] if name else task['target_id'], 'copy', {'message':message}, int(time.time()*1000), False, self.store.settings(db))
+        self.store.event(db, task['target_id'], name['name'] if name else task['target_id'], 'copy', {'message':message, 'copy_task_id':task['id'] if 'id' in task.keys() else None}, int(time.time()*1000), False, self.store.settings(db))
 
     def execute_copy(self):
+        pickup_started=time.monotonic()
         # Serial worker: a submitted order with unknown outcome is reconciled, never re-sent.
         with self.lock:
             with self.store.db() as db:
                 task=db.execute("SELECT c.*,a.api_key,a.api_secret FROM copy_tasks c JOIN futures_accounts a ON a.id=c.account_id JOIN virtual_sessions s ON s.account_id=c.account_id AND s.target_id=c.target_id JOIN targets t ON t.id=c.target_id WHERE (c.state='submitted' AND c.next_check<=strftime('%s','now')) OR (c.state='pending' AND c.next_check<=strftime('%s','now') AND s.active=1 AND t.enabled=1 AND NOT EXISTS (SELECT 1 FROM copy_tasks u WHERE u.account_id=c.account_id AND (u.state='submitted' OR (u.state='pending' AND u.id<c.id)))) ORDER BY CASE WHEN c.state='submitted' THEN 0 ELSE 1 END,c.id LIMIT 1").fetchone()
             if not task: return
-            client=FuturesClient(task['api_key'],task['api_secret']); row=json.loads(task['body'])
-            LOG.info('copy task id=%s account=%s target=%s symbol=%s action=%s state=%s retries=%s',task['id'],task['account_id'],task['target_id'],row.get('symbol'),task['action'],task['state'],task['retry_count'])
-            if task['state']=='pending':
-                if self.now_ms()-int(row['orderTime']) > MAX_ORDER_AGE_MS:
-                    reason='带单员交易操作超过 3 分钟，取消跟单'
-                    with self.store.db() as db:
-                        db.execute("UPDATE copy_tasks SET state='skipped',error=? WHERE id=? AND state='pending'",(reason,task['id']))
-                        self.copy_notice(db,task,'%s 跟单跳过：%s' % (row['symbol'],reason))
-                    LOG.warning('copy task id=%s symbol=%s action=%s result=stale_order',task['id'],row['symbol'],task['action'])
-                    return
-                if task['action']=='open' and task['retry_count']:
-                    with self.store.db() as db:
-                        if int(time.time()*1000) - int(row['orderTime']) > 180000:
-                            reason='带单员开仓操作超过 3 分钟，取消重试'
+            with timing_context(task=task['id'], account=task['account_id'], target=task['target_id'], state=task['state'], retries=task['retry_count']), timed('copy_attempt'):
+                timing_event('copy_pickup', duration_ms=round((time.monotonic()-pickup_started)*1000,3))
+                timing_event('copy_dequeued', task_age_ms=int(time.time()*1000)-task['created'], ready_lag_ms=round((time.time()-task['next_check'])*1000,3) if task['next_check'] else 'unknown')
+                client=FuturesClient(task['api_key'],task['api_secret']); row=json.loads(task['body'])
+                LOG.info('copy task id=%s account=%s target=%s symbol=%s action=%s state=%s retries=%s',task['id'],task['account_id'],task['target_id'],row.get('symbol'),task['action'],task['state'],task['retry_count'])
+                if task['state']=='pending':
+                    if self.now_ms()-int(row['orderTime']) > MAX_ORDER_AGE_MS:
+                        reason='带单员交易操作超过 3 分钟，取消跟单'
+                        with self.store.db() as db:
                             db.execute("UPDATE copy_tasks SET state='skipped',error=? WHERE id=? AND state='pending'",(reason,task['id']))
                             self.copy_notice(db,task,'%s 跟单跳过：%s' % (row['symbol'],reason))
-                            return
-                        closed = db.execute("SELECT 1 FROM virtual_events WHERE account_id=? AND target_id=? AND symbol=? AND position_side=? AND stamp>=? AND action IN ('close','unmatched_close') AND order_key!=? LIMIT 1", (task['account_id'],task['target_id'],row['symbol'],row['positionSide'],int(row['orderTime']),task['order_key'])).fetchone()
-                        if closed:
-                            reason='带单员后续已平仓或减仓，取消重试开仓'
-                            db.execute("UPDATE copy_tasks SET state='skipped',error=? WHERE id=? AND state='pending'",(reason,task['id']))
-                            self.copy_notice(db,task,'%s 跟单跳过：%s' % (row['symbol'],reason))
-                            return
-                try:
-                    lead_balance=task['lead_balance']
-                    if not lead_balance:
-                        recovered=self.api.detail(task['target_id'])
-                        lead_balance=decimal_text(recovered['marginBalance'])
-                        if number(lead_balance)<=0: raise ValueError('带单员余额无效')
-                        with self.store.db() as db:
-                            db.execute('UPDATE copy_tasks SET lead_balance=? WHERE id=? AND state=\'pending\'',(lead_balance,task['id']))
-                    with self.store.db() as db:
-                        old=db.execute('SELECT quantity FROM copied_positions WHERE account_id=? AND target_id=? AND symbol=? AND position_side=?',(task['account_id'],task['target_id'],row['symbol'],row['positionSide'])).fetchone()
-                    positions = None
-                    if task['action'] in ('close','unmatched_close'):
-                        from market_guard import close_position
-                        positions = client.positions()
-                        if not isinstance(positions, list): raise ValueError('账户持仓响应格式错误')
-                        if close_position(positions,row['symbol'],row['positionSide']) <= 0:
-                            raise ValueError('没有对应方向持仓，跳过平仓')
-                    balances=client.balance()
-                    balance_time=int(time.time()*1000)
-                    if not isinstance(balances,list): raise ValueError('账户余额响应格式错误')
-                    usdt=next((asset for asset in balances if asset.get('asset')=='USDT'),None)
-                    mark_price = leverage = None
-                    if task['action'] == 'open':
-                        mark = client.mark_price(row['symbol'])
-                        configs = client.symbol_config(row['symbol'])
-                        if not isinstance(mark, dict) or mark.get('symbol') != row['symbol'] or not isinstance(configs, list):
-                            raise ValueError('标记价格或杠杆配置响应无效')
-                        config = next((c for c in configs if isinstance(c,dict) and c.get('symbol') == row['symbol']), None)
-                        if not config: raise ValueError('未获取到交易对杠杆配置')
-                        mark_price, leverage = mark.get('markPrice'), config.get('leverage')
-                    if positions is None: positions = client.positions()
-                    mode, rules = client.mode(), client.rules()
-                    if task['action'] == 'close':
-                        from market_guard import close_position
-                        with self.store.db() as db:
-                            amounts = db.execute('SELECT quantity FROM copied_positions WHERE account_id=? AND symbol=? AND position_side=?', (task['account_id'],row['symbol'],row['positionSide'])).fetchall()
-                        total = sum((Fraction(number(x['quantity'])) for x in amounts), Fraction(0))
-                        if total > Fraction(close_position(positions,row['symbol'],row['positionSide'])):
-                            raise ValueError('跟单持仓记录超过账户实际持仓，请先核对')
-                    quote=client.quote(row['symbol'])
-                    plan_action, before_qty, owned_qty = task['action'], task['before_qty'], old['quantity'] if old else '0'
-                    if plan_action in ('close','unmatched_close') and not row.get('incremental'):
-                        # Incremental tasks carry the tracked pre-fill quantity, so replaying
-                        # the leader's earlier history would size the close against the whole
-                        # order instead of the part reported in this poll.
-                        with self.store.db() as db:
-                            sync = db.execute('SELECT complete FROM leader_history_sync WHERE target=?',(task['target_id'],)).fetchone()
-                            earlier = [json.loads(x['body']) for x in db.execute('SELECT body FROM leader_history WHERE target=? AND stamp<? ORDER BY stamp,key',(task['target_id'],int(row['orderTime'])))] if sync and sync['complete'] else []
-                            simultaneous = [json.loads(x['body']) for x in db.execute('SELECT body FROM leader_history WHERE target=? AND stamp=?',(task['target_id'],int(row['orderTime'])))]
-                            ambiguous = any(x['symbol']==row['symbol'] and x['positionSide']==row['positionSide'] and x['side']!=row['side'] for x in simultaneous)
-                        prior = next((p for p in replay(earlier) if p['symbol']==row['symbol'] and p['side']==row['positionSide']),None) if earlier and not ambiguous else None
-                        if prior and not prior['uncertain'] and number(prior['quantity'])>=number(row['executedQty']):
-                            from market_guard import close_position
-                            unmatched = plan_action == 'unmatched_close'
-                            plan_action, before_qty = 'close', prior['quantity']
-                            if unmatched:
-                                owned_qty = str(close_position(positions,row['symbol'],row['positionSide']))
-                    cumulative_row=None
-                    already_filled='0'
-                    if plan_action=='open' and row.get('incremental'):
-                        base_key=task['order_key'].split(':',1)[0]
-                        with self.store.db() as db:
-                            original=db.execute("SELECT body FROM records WHERE target=? AND kind='order' AND key=?",(task['target_id'],base_key)).fetchone()
-                            prior=db.execute("SELECT result FROM copy_tasks WHERE account_id=? AND target_id=? AND id<? AND (order_key=? OR order_key LIKE ?) AND state IN ('filled','finished')",(task['account_id'],task['target_id'],task['id'],base_key,base_key+':%')).fetchall()
-                        if not original: raise ValueError('缺少累计成交记录，无法计算增量')
-                        cumulative_row=json.loads(original['body'])
-                        if identity('order',cumulative_row)!=identity('order',row): raise ValueError('累计成交记录不匹配')
-                        filled=sum((Fraction(number(json.loads(item['result'])['executedQty'])) for item in prior),Fraction(0))
-                        already_filled=decimal_string(filled)
-                    params=plan(row,plan_action,before_qty,owned_qty,lead_balance,balances,positions,mode,quote,rules,mark_price=mark_price,leverage=leverage,cumulative_row=cumulative_row,already_filled=already_filled)
-                    price=quote['askPrice'] if row['side']=='BUY' else quote['bidPrice']
-                except (ValueError,ExchangeError,UpstreamError,KeyError,InvalidOperation) as exc:
-                    LOG.warning('跟单预检查失败 account=%s symbol=%s: %s', task['account_id'], row.get('symbol',''), str(exc)[:200])
-                    with self.store.db() as db:
-                        transient = isinstance(exc, UpstreamError) or (isinstance(exc, ExchangeError) and (exc.status is None or exc.status in (408, 418, 429, 451) or 500 <= exc.status <= 599))
-                        retries = task['retry_count']
-                        if transient and retries < 3:
-                            retries += 1
-                            reason = '预检查网络错误，等待第 %s/3 次重试：%s' % (retries,str(exc)[:180])
-                            db.execute("UPDATE copy_tasks SET retry_count=?,next_check=?,error=? WHERE id=? AND state='pending'",(retries,time.time()+5*2**(retries-1),reason,task['id']))
-                        else:
-                            reason = ('预检查重试 3 次后失败：' if transient else '') + str(exc)[:200]
-                            db.execute("UPDATE copy_tasks SET state='skipped',error=? WHERE id=? AND state='pending'",(reason,task['id']))
-                            self.copy_notice(db,task,'%s 跟单跳过：%s' % (row['symbol'],reason))
-                    return
-                params['newClientOrderId']=task['client_id']
-                LOG.info('copy preflight passed task=%s account=%s target=%s symbol=%s action=%s quantity=%s',task['id'],task['account_id'],task['target_id'],row['symbol'],task['action'],params['quantity'])
-                # Persist intent before touching the exchange, so process crashes cannot duplicate a POST.
-                with self.store.db() as db:
-                    db.execute('INSERT OR REPLACE INTO copy_task_audit(task_id,balance_time,asset,wallet_balance,available_balance,lead_balance,reference_price,planned_quantity) VALUES(?,?,?,?,?,?,?,?)', (task['id'],balance_time,'USDT',str(usdt['balance']) if usdt and 'balance' in usdt else None,str(usdt['availableBalance']) if usdt and 'availableBalance' in usdt else None,lead_balance,str(price),params['quantity']))
-                    changed = db.execute("UPDATE copy_tasks SET state='submitted',quantity=? WHERE id=? AND state='pending' AND EXISTS (SELECT 1 FROM copy_live l JOIN copy_bindings b ON b.account_id=l.account_id AND b.target_id=l.target_id JOIN targets t ON t.id=l.target_id WHERE l.account_id=copy_tasks.account_id AND l.target_id=copy_tasks.target_id AND l.enabled=1 AND t.enabled=1)",(params['quantity'],task['id'])).rowcount
-                    if not changed:
-                        still_pending = db.execute("SELECT 1 FROM copy_tasks WHERE id=? AND state='pending'",(task['id'],)).fetchone()
-                        if still_pending:
-                            reason='跟单关联或开关状态不一致，未提交订单'
-                            db.execute("UPDATE copy_tasks SET state='skipped',error=? WHERE id=? AND state='pending'",(reason,task['id']))
-                            self.copy_notice(db,task,'%s 跟单跳过：%s' % (row['symbol'],reason))
-                            LOG.warning('copy task id=%s account=%s target=%s symbol=%s result=invalid_binding',task['id'],task['account_id'],task['target_id'],row['symbol'])
+                        LOG.warning('copy task id=%s symbol=%s action=%s result=stale_order',task['id'],row['symbol'],task['action'])
                         return
-                try: result=client.place(params)
-                except ExchangeError as exc:
-                    reason=str(exc)[:200]
-                    if exc.definitively_rejected:
+                    if task['action']=='open' and task['retry_count']:
                         with self.store.db() as db:
-                            db.execute("UPDATE copy_tasks SET state='skipped',error=? WHERE id=? AND state='submitted'", (reason,task['id']))
-                            self.copy_notice(db,task,'%s 跟单被交易所拒绝：%s' % (row['symbol'],reason))
+                            if int(time.time()*1000) - int(row['orderTime']) > 180000:
+                                reason='带单员开仓操作超过 3 分钟，取消重试'
+                                db.execute("UPDATE copy_tasks SET state='skipped',error=? WHERE id=? AND state='pending'",(reason,task['id']))
+                                self.copy_notice(db,task,'%s 跟单跳过：%s' % (row['symbol'],reason))
+                                return
+                            closed = db.execute("SELECT 1 FROM virtual_events WHERE account_id=? AND target_id=? AND symbol=? AND position_side=? AND stamp>=? AND action IN ('close','unmatched_close') AND order_key!=? LIMIT 1", (task['account_id'],task['target_id'],row['symbol'],row['positionSide'],int(row['orderTime']),task['order_key'])).fetchone()
+                            if closed:
+                                reason='带单员后续已平仓或减仓，取消重试开仓'
+                                db.execute("UPDATE copy_tasks SET state='skipped',error=? WHERE id=? AND state='pending'",(reason,task['id']))
+                                self.copy_notice(db,task,'%s 跟单跳过：%s' % (row['symbol'],reason))
+                                return
+                    try:
+                        with timed('copy_preflight'):
+                            lead_balance=task['lead_balance']
+                            if not lead_balance:
+                                recovered=self.api.detail(task['target_id'])
+                                lead_balance=decimal_text(recovered['marginBalance'])
+                                if number(lead_balance)<=0: raise ValueError('带单员余额无效')
+                                with self.store.db() as db:
+                                    db.execute('UPDATE copy_tasks SET lead_balance=? WHERE id=? AND state=\'pending\'',(lead_balance,task['id']))
+                            with self.store.db() as db:
+                                old=db.execute('SELECT quantity FROM copied_positions WHERE account_id=? AND target_id=? AND symbol=? AND position_side=?',(task['account_id'],task['target_id'],row['symbol'],row['positionSide'])).fetchone()
+                            positions = None
+                            if task['action'] in ('close','unmatched_close'):
+                                from market_guard import close_position
+                                positions = client.positions()
+                                if not isinstance(positions, list): raise ValueError('账户持仓响应格式错误')
+                                if close_position(positions,row['symbol'],row['positionSide']) <= 0:
+                                    raise ValueError('没有对应方向持仓，跳过平仓')
+                            balances=client.balance()
+                            balance_time=int(time.time()*1000)
+                            if not isinstance(balances,list): raise ValueError('账户余额响应格式错误')
+                            usdt=next((asset for asset in balances if asset.get('asset')=='USDT'),None)
+                            mark_price = leverage = None
+                            if task['action'] == 'open':
+                                mark = client.mark_price(row['symbol'])
+                                configs = client.symbol_config(row['symbol'])
+                                if not isinstance(mark, dict) or mark.get('symbol') != row['symbol'] or not isinstance(configs, list):
+                                    raise ValueError('标记价格或杠杆配置响应无效')
+                                config = next((c for c in configs if isinstance(c,dict) and c.get('symbol') == row['symbol']), None)
+                                if not config: raise ValueError('未获取到交易对杠杆配置')
+                                mark_price, leverage = mark.get('markPrice'), config.get('leverage')
+                            if positions is None: positions = client.positions()
+                            mode, rules = client.mode(), client.rules()
+                            if task['action'] == 'close':
+                                from market_guard import close_position
+                                with self.store.db() as db:
+                                    amounts = db.execute('SELECT quantity FROM copied_positions WHERE account_id=? AND symbol=? AND position_side=?', (task['account_id'],row['symbol'],row['positionSide'])).fetchall()
+                                total = sum((Fraction(number(x['quantity'])) for x in amounts), Fraction(0))
+                                if total > Fraction(close_position(positions,row['symbol'],row['positionSide'])):
+                                    raise ValueError('跟单持仓记录超过账户实际持仓，请先核对')
+                            quote=client.quote(row['symbol'])
+                            plan_action, before_qty, owned_qty = task['action'], task['before_qty'], old['quantity'] if old else '0'
+                            if plan_action in ('close','unmatched_close') and not row.get('incremental'):
+                                # Incremental tasks carry the tracked pre-fill quantity, so replaying
+                                # the leader's earlier history would size the close against the whole
+                                # order instead of the part reported in this poll.
+                                with self.store.db() as db:
+                                    sync = db.execute('SELECT complete FROM leader_history_sync WHERE target=?',(task['target_id'],)).fetchone()
+                                    earlier = [json.loads(x['body']) for x in db.execute('SELECT body FROM leader_history WHERE target=? AND stamp<? ORDER BY stamp,key',(task['target_id'],int(row['orderTime'])))] if sync and sync['complete'] else []
+                                    simultaneous = [json.loads(x['body']) for x in db.execute('SELECT body FROM leader_history WHERE target=? AND stamp=?',(task['target_id'],int(row['orderTime'])))]
+                                    ambiguous = any(x['symbol']==row['symbol'] and x['positionSide']==row['positionSide'] and x['side']!=row['side'] for x in simultaneous)
+                                prior = next((p for p in replay(earlier) if p['symbol']==row['symbol'] and p['side']==row['positionSide']),None) if earlier and not ambiguous else None
+                                if prior and not prior['uncertain'] and number(prior['quantity'])>=number(row['executedQty']):
+                                    from market_guard import close_position
+                                    unmatched = plan_action == 'unmatched_close'
+                                    plan_action, before_qty = 'close', prior['quantity']
+                                    if unmatched:
+                                        owned_qty = str(close_position(positions,row['symbol'],row['positionSide']))
+                            cumulative_row=None
+                            already_filled='0'
+                            if plan_action=='open' and row.get('incremental'):
+                                base_key=task['order_key'].split(':',1)[0]
+                                with self.store.db() as db:
+                                    original=db.execute("SELECT body FROM records WHERE target=? AND kind='order' AND key=?",(task['target_id'],base_key)).fetchone()
+                                    prior=db.execute("SELECT result FROM copy_tasks WHERE account_id=? AND target_id=? AND id<? AND (order_key=? OR order_key LIKE ?) AND state IN ('filled','finished')",(task['account_id'],task['target_id'],task['id'],base_key,base_key+':%')).fetchall()
+                                if not original: raise ValueError('缺少累计成交记录，无法计算增量')
+                                cumulative_row=json.loads(original['body'])
+                                if identity('order',cumulative_row)!=identity('order',row): raise ValueError('累计成交记录不匹配')
+                                filled=sum((Fraction(number(json.loads(item['result'])['executedQty'])) for item in prior),Fraction(0))
+                                already_filled=decimal_string(filled)
+                            params=plan(row,plan_action,before_qty,owned_qty,lead_balance,balances,positions,mode,quote,rules,mark_price=mark_price,leverage=leverage,cumulative_row=cumulative_row,already_filled=already_filled)
+                            price=quote['askPrice'] if row['side']=='BUY' else quote['bidPrice']
+                    except (ValueError,ExchangeError,UpstreamError,KeyError,InvalidOperation) as exc:
+                        LOG.warning('跟单预检查失败 account=%s symbol=%s: %s', task['account_id'], row.get('symbol',''), str(exc)[:200])
+                        with self.store.db() as db:
+                            transient = isinstance(exc, UpstreamError) or (isinstance(exc, ExchangeError) and (exc.status is None or exc.status in (408, 418, 429, 451) or 500 <= exc.status <= 599))
+                            retries = task['retry_count']
+                            if transient and retries < 3:
+                                retries += 1
+                                reason = '预检查网络错误，等待第 %s/3 次重试：%s' % (retries,str(exc)[:180])
+                                db.execute("UPDATE copy_tasks SET retry_count=?,next_check=?,error=? WHERE id=? AND state='pending'",(retries,time.time()+5*2**(retries-1),reason,task['id']))
+                            else:
+                                reason = ('预检查重试 3 次后失败：' if transient else '') + str(exc)[:200]
+                                db.execute("UPDATE copy_tasks SET state='skipped',error=? WHERE id=? AND state='pending'",(reason,task['id']))
+                                self.copy_notice(db,task,'%s 跟单跳过：%s' % (row['symbol'],reason))
                         return
-                    LOG.warning('跟单提交结果未知 account=%s symbol=%s: %s', task['account_id'], row['symbol'], reason)
+                    params['newClientOrderId']=task['client_id']
+                    LOG.info('copy preflight passed task=%s account=%s target=%s symbol=%s action=%s quantity=%s',task['id'],task['account_id'],task['target_id'],row['symbol'],task['action'],params['quantity'])
+                    # Persist intent before touching the exchange, so process crashes cannot duplicate a POST.
                     with self.store.db() as db:
-                        db.execute("UPDATE copy_tasks SET error=?,next_check=strftime('%s','now')+15 WHERE id=?",('下单结果未知，等待查询确认：'+reason,task['id']))
-                        self.copy_notice(db,task,'%s 下单结果未知，正在查询订单状态：%s' % (row['symbol'],reason))
+                        db.execute('INSERT OR REPLACE INTO copy_task_audit(task_id,balance_time,asset,wallet_balance,available_balance,lead_balance,reference_price,planned_quantity) VALUES(?,?,?,?,?,?,?,?)', (task['id'],balance_time,'USDT',str(usdt['balance']) if usdt and 'balance' in usdt else None,str(usdt['availableBalance']) if usdt and 'availableBalance' in usdt else None,lead_balance,str(price),params['quantity']))
+                        changed = db.execute("UPDATE copy_tasks SET state='submitted',quantity=? WHERE id=? AND state='pending' AND EXISTS (SELECT 1 FROM copy_live l JOIN copy_bindings b ON b.account_id=l.account_id AND b.target_id=l.target_id JOIN targets t ON t.id=l.target_id WHERE l.account_id=copy_tasks.account_id AND l.target_id=copy_tasks.target_id AND l.enabled=1 AND t.enabled=1)",(params['quantity'],task['id'])).rowcount
+                        if not changed:
+                            still_pending = db.execute("SELECT 1 FROM copy_tasks WHERE id=? AND state='pending'",(task['id'],)).fetchone()
+                            if still_pending:
+                                reason='跟单关联或开关状态不一致，未提交订单'
+                                db.execute("UPDATE copy_tasks SET state='skipped',error=? WHERE id=? AND state='pending'",(reason,task['id']))
+                                self.copy_notice(db,task,'%s 跟单跳过：%s' % (row['symbol'],reason))
+                                LOG.warning('copy task id=%s account=%s target=%s symbol=%s result=invalid_binding',task['id'],task['account_id'],task['target_id'],row['symbol'])
+                            return
+                    try:
+                        with timed('copy_submit'):
+                            result=client.place(params)
+                    except ExchangeError as exc:
+                        reason=str(exc)[:200]
+                        if exc.definitively_rejected:
+                            with self.store.db() as db:
+                                db.execute("UPDATE copy_tasks SET state='skipped',error=? WHERE id=? AND state='submitted'", (reason,task['id']))
+                                self.copy_notice(db,task,'%s 跟单被交易所拒绝：%s' % (row['symbol'],reason))
+                            return
+                        LOG.warning('跟单提交结果未知 account=%s symbol=%s: %s', task['account_id'], row['symbol'], reason)
+                        with self.store.db() as db:
+                            db.execute("UPDATE copy_tasks SET error=?,next_check=strftime('%s','now')+15 WHERE id=?",('下单结果未知，等待查询确认：'+reason,task['id']))
+                            self.copy_notice(db,task,'%s 下单结果未知，正在查询订单状态：%s' % (row['symbol'],reason))
+                        return
+                else:
+                    try:
+                        with timed('copy_confirm'):
+                            result=client.order(row['symbol'],task['client_id'])
+                    except ExchangeError as exc:
+                        reason=str(exc)[:200]
+                        LOG.warning('跟单订单查询失败 account=%s symbol=%s: %s', task['account_id'], row['symbol'], reason)
+                        with self.store.db() as db: db.execute("UPDATE copy_tasks SET error=?,next_check=strftime('%s','now')+15 WHERE id=?",('订单结果未知，等待查询确认：'+reason,task['id']))
+                        return
+                timing_event('copy_response', status=result.get('status'), exchange_update_ms=result.get('updateTime','unknown'), task_age_ms=int(time.time()*1000)-task['created'], source_age_ms=int(time.time()*1000)-int(row['orderTime']))
+                status=result.get('status')
+                if status not in ('FILLED','CANCELED','EXPIRED','REJECTED','EXPIRED_IN_MATCH'):
+                    LOG.info('copy awaiting confirmation task=%s account=%s symbol=%s status=%s',task['id'],task['account_id'],row['symbol'],status)
+                    with self.store.db() as db: db.execute("UPDATE copy_tasks SET next_check=strftime('%s','now')+15 WHERE id=?", (task['id'],))
                     return
-            else:
-                try: result=client.order(row['symbol'],task['client_id'])
-                except ExchangeError as exc:
-                    reason=str(exc)[:200]
-                    LOG.warning('跟单订单查询失败 account=%s symbol=%s: %s', task['account_id'], row['symbol'], reason)
-                    with self.store.db() as db: db.execute("UPDATE copy_tasks SET error=?,next_check=strftime('%s','now')+15 WHERE id=?",('订单结果未知，等待查询确认：'+reason,task['id']))
-                    return
-            status=result.get('status')
-            if status not in ('FILLED','CANCELED','EXPIRED','REJECTED','EXPIRED_IN_MATCH'):
-                LOG.info('copy awaiting confirmation task=%s account=%s symbol=%s status=%s',task['id'],task['account_id'],row['symbol'],status)
-                with self.store.db() as db: db.execute("UPDATE copy_tasks SET next_check=strftime('%s','now')+15 WHERE id=?", (task['id'],))
-                return
-            executed=number(result.get('executedQty','0'))
-            with self.store.db() as db:
-                saved=db.execute('SELECT quantity FROM copy_tasks WHERE id=?', (task['id'],)).fetchone()
-            if not saved or not saved['quantity'] or executed<0 or executed>number(saved['quantity']) or (result.get('symbol') and result['symbol']!=row['symbol']) or (result.get('clientOrderId') and result['clientOrderId']!=task['client_id']):
+                executed=number(result.get('executedQty','0'))
                 with self.store.db() as db:
-                    db.execute("UPDATE copy_tasks SET error='订单响应与提交信息不一致，等待人工核对',next_check=strftime('%s','now')+15 WHERE id=?",(task['id'],))
-                return
-            with self.store.db() as db:
-                current=db.execute('SELECT state FROM copy_tasks WHERE id=?',(task['id'],)).fetchone()
-                if not current or current['state']!='submitted': return
-                pos=db.execute('SELECT quantity FROM copied_positions WHERE account_id=? AND target_id=? AND symbol=? AND position_side=?',(task['account_id'],task['target_id'],row['symbol'],row['positionSide'])).fetchone()
-                before=Fraction(number(pos['quantity'] if pos else '0')); filled=Fraction(executed)
-                after=before+filled if task['action']=='open' else max(Fraction(0),before-filled)
-                db.execute('INSERT OR REPLACE INTO copied_positions VALUES(?,?,?,?,?)',(task['account_id'],task['target_id'],row['symbol'],row['positionSide'],decimal_string(after)))
-                actual_notional = actual_copy_notional(result, executed)
-                db.execute("UPDATE copy_tasks SET state=?,result=?,error='' WHERE id=?",('filled' if status=='FILLED' else 'finished',dumps({'status':status,'executedQty':str(executed),'orderId':result.get('orderId'), 'cumQuote':actual_notional}),task['id']))
-                LOG.info('copy result task=%s account=%s symbol=%s status=%s executed_qty=%s',task['id'],task['account_id'],row['symbol'],status,executed)
-                self.copy_notice(db,task,'%s %s，状态 %s\n实际成交数量：%s %s\n跟单金额：%s %s' % (row['symbol'],direction(row),status,notification_number(executed),row.get('baseAsset',''),notification_number(actual_notional),row.get('quoteAsset','USDT')))
+                    saved=db.execute('SELECT quantity FROM copy_tasks WHERE id=?', (task['id'],)).fetchone()
+                if not saved or not saved['quantity'] or executed<0 or executed>number(saved['quantity']) or (result.get('symbol') and result['symbol']!=row['symbol']) or (result.get('clientOrderId') and result['clientOrderId']!=task['client_id']):
+                    with self.store.db() as db:
+                        db.execute("UPDATE copy_tasks SET error='订单响应与提交信息不一致，等待人工核对',next_check=strftime('%s','now')+15 WHERE id=?",(task['id'],))
+                    return
+                with timed('copy_finalize'), self.store.db() as db:
+                    current=db.execute('SELECT state FROM copy_tasks WHERE id=?',(task['id'],)).fetchone()
+                    if not current or current['state']!='submitted': return
+                    pos=db.execute('SELECT quantity FROM copied_positions WHERE account_id=? AND target_id=? AND symbol=? AND position_side=?',(task['account_id'],task['target_id'],row['symbol'],row['positionSide'])).fetchone()
+                    before=Fraction(number(pos['quantity'] if pos else '0')); filled=Fraction(executed)
+                    after=before+filled if task['action']=='open' else max(Fraction(0),before-filled)
+                    db.execute('INSERT OR REPLACE INTO copied_positions VALUES(?,?,?,?,?)',(task['account_id'],task['target_id'],row['symbol'],row['positionSide'],decimal_string(after)))
+                    actual_notional = actual_copy_notional(result, executed)
+                    db.execute("UPDATE copy_tasks SET state=?,result=?,error='' WHERE id=?",('filled' if status=='FILLED' else 'finished',dumps({'status':status,'executedQty':str(executed),'orderId':result.get('orderId'), 'cumQuote':actual_notional}),task['id']))
+                    LOG.info('copy result task=%s account=%s symbol=%s status=%s executed_qty=%s',task['id'],task['account_id'],row['symbol'],status,executed)
+                    self.copy_notice(db,task,'%s %s，状态 %s\n实际成交数量：%s %s\n跟单金额：%s %s' % (row['symbol'],direction(row),status,notification_number(executed),row.get('baseAsset',''),notification_number(actual_notional),row.get('quoteAsset','USDT')))
 
     def check_margin(self, account):
         client = FuturesAccount(account['api_key'], account['api_secret'])
@@ -1450,7 +1510,7 @@ def handler_factory(store, monitor, token):
                         row['result']=json.loads(row['result']) if row['result'] else None
                         if row['result'] and row['result'].get('orderId') is not None:
                             row['result']['orderId']=str(row['result']['orderId'])
-                    return self.reply({'list':rows,'total':total,'page':page})
+                    return self.reply({'list':store.attach_discovery(rows),'total':total,'page':page})
                 if parsed.path == '/api/events':
                     page = max(1, min(100000, int(query.get('page', ['1'])[0])))
                     limit = max(1, min(50, int(query.get('limit', ['50'])[0])))
@@ -1470,7 +1530,7 @@ def handler_factory(store, monitor, token):
                                     for row in db.execute("SELECT target,name,kind,body,stamp,historical FROM events WHERE target=? AND kind='transfer'",(target,)):
                                         entry=dict(row);entry['body']=json.loads(entry['body']);rows.append(entry)
                                 rows.sort(key=lambda r:(r['stamp'],r['kind'],str(r['body'].get('symbol',''))),reverse=True)
-                                return self.reply({'list':rows[(page-1)*limit:page*limit],'total':len(rows),'page':page})
+                                return self.reply({'list':store.attach_discovery(rows[(page-1)*limit:page*limit]),'total':len(rows),'page':page})
                     where, args = ("kind IN ('order','transfer')" if kind == 'leader' else "kind IN ('order','transfer','copy')"), []
                     if kind == 'leader': kind = ''
                     for column, value in [('target', target), ('kind', kind)]:
@@ -1484,7 +1544,7 @@ def handler_factory(store, monitor, token):
                         row['body'] = json.loads(row['body'])
                         if row['kind'] == 'order':
                             row['body']['direction'] = direction(row['body'])
-                    return self.reply({'list': rows, 'total': total, 'page': page})
+                    return self.reply({'list': store.attach_discovery(rows), 'total': total, 'page': page})
                 if parsed.path == '/api/search':
                     nickname = query.get('q', [''])[0].strip()
                     if not nickname or len(nickname) > 80:
@@ -1553,7 +1613,7 @@ def handler_factory(store, monitor, token):
                             db.execute('DELETE FROM '+name+' WHERE '+column+'=?',(item,))
                         if is_target:
                             db.execute('DELETE FROM outbox WHERE event IN (SELECT id FROM events WHERE target=?)',(item,))
-                            for name in ('records','events','leader_history','leader_history_stage','leader_history_sync','baseline_watermarks','monitor_start'):
+                            for name in ('records','events','order_discovery','leader_history','leader_history_stage','leader_history_sync','baseline_watermarks','monitor_start'):
                                 db.execute('DELETE FROM '+name+' WHERE target=?',(item,))
                             monitor.history_active.discard(item)
                         else:
