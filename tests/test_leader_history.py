@@ -17,13 +17,17 @@ class LeaderHistoryTests(unittest.TestCase):
         self.assertEqual(result[0]['avg_price'],'110')
         self.assertFalse(result[0]['uncertain'])
 
-    def test_missing_open_and_same_timestamp_are_unknown(self):
+    def test_excess_close_resets_position_and_later_open_restarts(self):
         close=order(1,'2'); close['side']='SELL'
         later=order(2,'1')
         result=replay([later,close])
-        self.assertTrue(result[0]['uncertain'])
-        self.assertIsNone(result[0]['quantity'])
-        a=order(3,'1'); b=order(3,'2'); b['side']='SELL'
+        self.assertFalse(result[0]['uncertain'])
+        self.assertEqual(result[0]['quantity'],'1')
+        self.assertEqual(result[0]['avg_price'],'0.1')
+        self.assertEqual(replay([close]),[])
+
+    def test_same_timestamp_is_unknown(self):
+        a=order(3,'1'); b=order(3,'2')
         self.assertTrue(replay([a,b])[0]['uncertain'])
 
     def test_background_backfill_persists_without_notifications_or_copy_tasks(self):
@@ -31,7 +35,7 @@ class LeaderHistoryTests(unittest.TestCase):
             store=Store(Path(tmp)/'db'); api=FakeAPI(); monitor=Monitor(store,api)
             api.orders=[order(x) for x in range(50,0,-1)]
             monitor.add(PID)
-            for _ in range(3):
+            for _ in range(4):
                 with store.db() as db: db.execute('UPDATE leader_history_sync SET next_check=0')
                 monitor.sync_history(PID)
             with store.db() as db:
@@ -41,4 +45,20 @@ class LeaderHistoryTests(unittest.TestCase):
                 self.assertEqual(db.execute('SELECT COUNT(*) FROM copy_tasks').fetchone()[0],0)
             monitor.sync_history(PID)
             with store.db() as db: self.assertEqual(db.execute('SELECT COUNT(*) FROM leader_history').fetchone()[0],50)
+
+    def test_sync_continues_until_empty_even_if_total_is_inaccurate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store=Store(Path(tmp)/'db'); api=FakeAPI(); monitor=Monitor(store,api)
+            api.orders=[order(x) for x in range(25,0,-1)]
+            original=api.history
+            def understated(pid,kind,page,page_size=20):
+                data=original(pid,kind,page,page_size);data['total']=1;return data
+            api.history=understated;monitor.add(PID)
+            for _ in range(3):
+                with store.db() as db: db.execute('UPDATE leader_history_sync SET next_check=0')
+                monitor.sync_history(PID)
+            with store.db() as db:
+                self.assertEqual(db.execute('SELECT COUNT(*) FROM leader_history').fetchone()[0],25)
+                self.assertEqual(db.execute('SELECT complete FROM leader_history_sync').fetchone()[0],1)
+            self.assertEqual([x[1] for x in api.calls], [1,2,3])
 

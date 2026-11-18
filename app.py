@@ -780,7 +780,7 @@ class Monitor:
             with self.store.db() as db:
                 for row in rows:
                     db.execute('INSERT OR REPLACE INTO leader_history VALUES(?,?,?,?)', (pid,identity('order',row),int(row['orderTime']),dumps(row)))
-                complete = not rows or page*20 >= total
+                complete = not rows
                 db.execute('UPDATE leader_history_sync SET page=?,complete=?,total=?,next_check=?,error=?,updated=? WHERE target=?',
                            (1 if complete else page+1,int(complete),total,time.time()+(3600 if complete else 1),'',time.time(),pid))
         except Exception as exc:

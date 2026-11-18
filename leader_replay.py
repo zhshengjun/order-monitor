@@ -19,7 +19,8 @@ def replay(rows):
         key = (symbol, position_side)
         position = positions.setdefault(key, {'qty': Fraction(0), 'cost': Fraction(0), 'uncertain': False})
         stamp_key = (symbol, position_side, int(row['orderTime']))
-        if stamp_key in stamps:
+        simultaneous = stamp_key in stamps
+        if simultaneous:
             position['uncertain'] = True  # No stable ordering within the same millisecond.
         stamps.add(stamp_key)
         qty, cost, amount = position['qty'], position['cost'], Fraction(quantity)
@@ -27,7 +28,7 @@ def replay(rows):
             position['qty'] = qty + amount
             position['cost'] = cost + amount * Fraction(price)
         elif amount > qty:
-            position.update(qty=Fraction(0), cost=Fraction(0), uncertain=True)
+            position.update(qty=Fraction(0), cost=Fraction(0), uncertain=simultaneous)
         else:
             position['qty'] = qty - amount
             position['cost'] = cost * (qty - amount) / qty
