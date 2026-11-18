@@ -193,6 +193,16 @@ class CopyExecutionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'可用余额'):
             plan(row,'open','0','0','100',balances,[],{'dualSidePosition':False},QUOTE,RULES,mark_price='100',leverage='10')
 
+    def test_margin_check_uses_ten_or_actual_lower_leverage(self):
+        row=order(101,'1');row['avgPrice']='100'
+        balances=[{'asset':'USDT','balance':'100','availableBalance':'7'}]
+        with self.assertRaisesRegex(ValueError,'可用余额'):
+            plan(row,'open','0','0','100',balances,[],{'dualSidePosition':False},QUOTE,RULES,mark_price='100',leverage='20')
+        balances[0]['availableBalance']='12'
+        self.assertEqual(plan(row,'open','0','0','100',balances,[],{'dualSidePosition':False},QUOTE,RULES,mark_price='100',leverage='20')['quantity'],'0.999')
+        with self.assertRaisesRegex(ValueError,'可用余额'):
+            plan(row,'open','0','0','100',balances,[],{'dualSidePosition':False},QUOTE,RULES,mark_price='100',leverage='5')
+
     def test_open_fails_when_wallet_balance_missing_or_invalid(self):
         row=order(101,'1');row['avgPrice']='100'
         for balances in ([{'asset':'USDT','availableBalance':'20'}],[{'asset':'USDT','balance':'NaN','availableBalance':'20'}]):
