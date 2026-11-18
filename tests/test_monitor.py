@@ -74,12 +74,12 @@ class MonitorTests(unittest.TestCase):
             for thread in threads: thread.join()
         self.assertEqual(peak,1)
 
-    def test_upgrade_sets_poll_page_size_to_twenty(self):
+    def test_upgrade_sets_poll_page_size_to_five(self):
         with self.store.db() as db:
             settings=self.store.settings(db);settings['page_size']=100
             db.execute('UPDATE settings SET value=? WHERE id=1',(json.dumps(settings),))
-            db.execute("DELETE FROM app_migrations WHERE name='poll_page_size_20'")
-        self.assertEqual(Store(self.store.path).settings()['page_size'],20)
+            db.execute("DELETE FROM app_migrations WHERE name='poll_page_size_5'")
+        self.assertEqual(Store(self.store.path).settings()['page_size'],5)
 
     def test_baseline_silent_and_decimal_exact(self):
         self.baseline()
@@ -91,7 +91,7 @@ class MonitorTests(unittest.TestCase):
     def test_first_boot_only_fetches_recent_page(self):
         self.api.orders = [order(x) for x in range(3000, 0, -1)]
         self.baseline()
-        self.assertEqual(len(self.rows('records')), 20)
+        self.assertEqual(len(self.rows('records')), 5)
         self.assertEqual(self.api.calls, [('order', 1), ('transfer', 1)])
         self.assertEqual(self.rows('outbox'), [])
         self.api.calls.clear()

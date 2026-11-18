@@ -27,7 +27,7 @@ from fractions import Fraction
 
 ROOT = Path(__file__).parent
 API_PATH = '/bapi/futures/v1/friendly/future/copy-trade/'
-DEFAULTS = {'interval': 60, 'page_size': 20, 'balance_threshold': '0', 'telegram_enabled': False,
+DEFAULTS = {'interval': 60, 'page_size': 5, 'balance_threshold': '0', 'telegram_enabled': False,
             'telegram_token': '', 'telegram_chat': '', 'bark_enabled': False,
             'bark_url': 'https://api.day.app', 'bark_key': ''}
 SECRETS = ('telegram_token', 'bark_key')
@@ -460,6 +460,11 @@ class Store:
                 current['page_size'] = 20
                 db.execute('UPDATE settings SET value=? WHERE id=1',(dumps(current),))
                 db.execute("INSERT INTO app_migrations VALUES('poll_page_size_20')")
+            if not db.execute("SELECT 1 FROM app_migrations WHERE name='poll_page_size_5'").fetchone():
+                current = json.loads(db.execute('SELECT value FROM settings WHERE id=1').fetchone()[0])
+                current['page_size'] = 5
+                db.execute('UPDATE settings SET value=? WHERE id=1',(dumps(current),))
+                db.execute("INSERT INTO app_migrations VALUES('poll_page_size_5')")
             if not db.execute("SELECT 1 FROM app_migrations WHERE name='history_identity_v5'").fetchone():
                 db.execute('CREATE TABLE IF NOT EXISTS leader_history_before_v5 AS SELECT * FROM leader_history')
                 saved=db.execute('SELECT target,body FROM leader_history').fetchall()
@@ -620,7 +625,7 @@ class Monitor:
             watermark = stamps[0]
             if kind == 'transfer':
                 initialized = bool(db.execute("SELECT 1 FROM baseline_watermarks WHERE target=? AND kind='transfer'",(pid,)).fetchone())
-            page_size = self.store.settings(db)['page_size'] if initialized else 20
+            page_size = self.store.settings(db)['page_size']
             if not initialized and kind == 'order':
                 watermark = db.execute('SELECT MIN(started_at) FROM copy_live WHERE target_id=? AND enabled=1',(pid,)).fetchone()[0]
         if kind == 'order':
