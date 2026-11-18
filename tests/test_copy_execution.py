@@ -1,4 +1,5 @@
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -138,7 +139,7 @@ class CopyExecutionTests(unittest.TestCase):
         self.assertEqual(FakeExchange.calls,[])
 
     def test_precheck_retries_three_times_then_stops(self):
-        row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
+        row=order(int(time.time()*1000),'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
         with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'balance',side_effect=ExchangeError('HTTP 451',451,0)) as balance:
             for _ in range(4):
                 with self.store.db() as db: db.execute('UPDATE copy_tasks SET next_check=0')
@@ -150,13 +151,36 @@ class CopyExecutionTests(unittest.TestCase):
         self.assertEqual(FakeExchange.calls,[])
 
     def test_precheck_network_recovery_retries_original_task(self):
-        row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
+        row=order(int(time.time()*1000),'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
         with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'balance',side_effect=[ExchangeError('timeout'),BALANCES]):
             self.monitor.execute_copy()
             with self.store.db() as db: db.execute('UPDATE copy_tasks SET next_check=0')
             self.monitor.execute_copy()
         self.assertEqual(self.rows('SELECT state,retry_count FROM copy_tasks')[0]['state'],'filled')
         self.assertEqual([x[0] for x in FakeExchange.calls],['place'])
+
+    def test_retry_open_skips_if_leader_subsequently_closes(self):
+        stamp=int(time.time()*1000);row=order(stamp,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
+        with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'balance',side_effect=ExchangeError('HTTP 451',451,0)):
+            self.monitor.execute_copy()
+        close=order(stamp+1,'0.5');close['avgPrice']='100';close['side']='SELL';self.api.orders.insert(0,close);self.monitor.poll(PID)
+        with self.store.db() as db: db.execute('UPDATE copy_tasks SET next_check=0')
+        with patch('app.FuturesClient',FakeExchange): self.monitor.execute_copy()
+        first=self.rows('SELECT state,error FROM copy_tasks ORDER BY id')[0]
+        self.assertEqual(first['state'],'skipped')
+        self.assertIn('平仓或减仓',first['error'])
+        self.assertEqual(FakeExchange.calls,[])
+
+    def test_retry_open_skips_when_source_order_older_than_three_minutes(self):
+        row=order(int(time.time()*1000)-181000,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
+        with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'balance',side_effect=ExchangeError('HTTP 451',451,0)):
+            self.monitor.execute_copy()
+        with self.store.db() as db: db.execute('UPDATE copy_tasks SET next_check=0')
+        with patch('app.FuturesClient',FakeExchange): self.monitor.execute_copy()
+        task=self.rows('SELECT state,error FROM copy_tasks')[0]
+        self.assertEqual(task['state'],'skipped')
+        self.assertIn('超过 3 分钟',task['error'])
+        self.assertEqual(FakeExchange.calls,[])
 
     def test_precheck_retry_waits_and_blocks_later_same_account(self):
         row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)

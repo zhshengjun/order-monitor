@@ -556,6 +556,19 @@ class Monitor:
             if not task: return
             client=FuturesClient(task['api_key'],task['api_secret']); row=json.loads(task['body'])
             if task['state']=='pending':
+                if task['action']=='open' and task['retry_count']:
+                    with self.store.db() as db:
+                        if int(time.time()*1000) - int(row['orderTime']) > 180000:
+                            reason='带单员开仓操作超过 3 分钟，取消重试'
+                            db.execute("UPDATE copy_tasks SET state='skipped',error=? WHERE id=? AND state='pending'",(reason,task['id']))
+                            self.copy_notice(db,task,'%s 跟单跳过：%s' % (row['symbol'],reason))
+                            return
+                        closed = db.execute("SELECT 1 FROM virtual_events WHERE account_id=? AND target_id=? AND symbol=? AND position_side=? AND stamp>=? AND action IN ('close','unmatched_close') AND order_key!=? LIMIT 1", (task['account_id'],task['target_id'],row['symbol'],row['positionSide'],int(row['orderTime']),task['order_key'])).fetchone()
+                        if closed:
+                            reason='带单员后续已平仓或减仓，取消重试开仓'
+                            db.execute("UPDATE copy_tasks SET state='skipped',error=? WHERE id=? AND state='pending'",(reason,task['id']))
+                            self.copy_notice(db,task,'%s 跟单跳过：%s' % (row['symbol'],reason))
+                            return
                 try:
                     with self.store.db() as db:
                         old=db.execute('SELECT quantity FROM copied_positions WHERE account_id=? AND target_id=? AND symbol=? AND position_side=?',(task['account_id'],task['target_id'],row['symbol'],row['positionSide'])).fetchone()
