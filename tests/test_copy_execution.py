@@ -410,13 +410,79 @@ class CopyExecutionTests(unittest.TestCase):
         self.assertEqual(FakeExchange.calls,[])
         self.assertIn('杠杆配置',self.rows('SELECT state,error FROM copy_tasks')[0]['error'])
 
-    def test_conflicting_signal_stops_copy_before_dispatch(self):
-        row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
-        self.api.orders[0]['executedQty']='2';self.monitor.poll(PID)
+    def test_split_fills_across_polls_follow_increment(self):
+        import json
+        row=order(101,'0.4');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
+        self.assertEqual(self.rows('SELECT enabled FROM copy_live')[0]['enabled'],1)
+        self.assertEqual(self.rows('SELECT quantity FROM virtual_positions')[0]['quantity'],'0.4')
+        self.api.orders[0]['executedQty']='1';self.monitor.poll(PID)
+        self.assertEqual(self.rows('SELECT enabled FROM copy_live')[0]['enabled'],1)
+        tasks=self.rows('SELECT * FROM copy_tasks ORDER BY id')
+        self.assertEqual([json.loads(t['body'])['executedQty'] for t in tasks],['0.4','0.6'])
+        self.assertEqual([json.loads(t['body'])['avgPrice'] for t in tasks],['100','100'])
+        self.assertEqual(self.rows('SELECT quantity FROM virtual_positions')[0]['quantity'],'1')
+        self.assertEqual(self.rows("SELECT COUNT(*) AS n FROM copy_tasks WHERE state!='pending'")[0]['n'],0)
+        self.assertEqual(self.rows("SELECT COUNT(*) AS n FROM events WHERE kind='copy'")[0]['n'],0)
+        self.monitor.poll(PID)
+        self.assertEqual(len(self.rows('SELECT * FROM copy_tasks')),2)
+
+    def test_split_close_across_polls_keeps_tracked_quantity(self):
+        import json
+        open_row=order(101,'1');open_row['avgPrice']='100';self.api.orders.insert(0,open_row);self.monitor.poll(PID)
+        close_row=order(102,'0.4');close_row.update(side='SELL',avgPrice='100');self.api.orders.insert(0,close_row);self.monitor.poll(PID)
+        close_row['executedQty']='1';self.monitor.poll(PID)
+        tasks=self.rows('SELECT * FROM copy_tasks ORDER BY id')
+        self.assertEqual([t['action'] for t in tasks],['open','close','close'])
+        self.assertEqual([t['before_qty'] for t in tasks],['0','1','0.6'])
+        self.assertEqual([json.loads(t['body'])['executedQty'] for t in tasks],['1','0.4','0.6'])
+        self.assertEqual(self.rows('SELECT quantity FROM virtual_positions')[0]['quantity'],'0')
+        self.assertEqual(self.rows('SELECT enabled FROM copy_live')[0]['enabled'],1)
+
+    def test_incremental_close_skips_whole_order_replay(self):
+        import json
+        open_row=order(101,'1');open_row['avgPrice']='100';self.api.orders.insert(0,open_row);self.monitor.poll(PID)
+        close_row=order(102,'0.4');close_row.update(side='SELL',avgPrice='100');self.api.orders.insert(0,close_row);self.monitor.poll(PID)
+        close_row['executedQty']='1';self.monitor.poll(PID)
+        with self.store.db() as db:
+            db.execute("INSERT OR REPLACE INTO leader_history_sync(target,complete) VALUES(?,1)",(PID,))
+            db.execute('INSERT OR REPLACE INTO leader_history VALUES(?,?,?,?)',(PID,'h1',101,json.dumps(open_row)))
+            db.execute('INSERT OR REPLACE INTO leader_history VALUES(?,?,?,?)',(PID,'h2',102,json.dumps(close_row)))
+            db.execute("UPDATE copy_tasks SET state='filled' WHERE action='open' OR before_qty='1'")
+            db.execute('INSERT OR REPLACE INTO copied_positions VALUES(?,?,?,?,?)',(1,PID,'BTCUSDT','LONG','0.6'))
+        task=self.rows("SELECT * FROM copy_tasks WHERE state='pending'")[0]
+        self.assertTrue(json.loads(task['body'])['incremental'])
+        self.assertEqual(task['before_qty'],'0.6')
+        FakeExchange.result={'status':'FILLED','executedQty':'0.6','orderId':1}
+        try:
+            with patch('app.FuturesClient',FakeExchange): self.monitor.execute_copy()
+        finally:
+            FakeExchange.result={'status':'FILLED','executedQty':'0.999','orderId':1}
+        places=[c[1] for c in FakeExchange.calls if c[0]=='place']
+        self.assertEqual(len(places),1)
+        self.assertEqual(places[0]['quantity'],'0.600')
+        self.assertEqual(self.rows("SELECT state FROM copy_tasks WHERE id=%d" % task['id'])[0]['state'],'filled')
+
+    def test_quantity_regression_stops_copy_before_dispatch(self):
+        row=order(101,'2');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
+        self.api.orders[0]['executedQty']='1';self.monitor.poll(PID)
         self.assertEqual(self.rows('SELECT enabled FROM copy_live')[0]['enabled'],0)
         self.assertEqual(self.rows('SELECT state FROM copy_tasks')[0]['state'],'cancelled')
         with patch('app.FuturesClient',FakeExchange): self.monitor.execute_copy()
         self.assertEqual(FakeExchange.calls,[])
+
+    def test_price_revision_without_quantity_change_keeps_copy(self):
+        row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
+        self.api.orders[0]['avgPrice']='101';self.monitor.poll(PID)
+        self.assertEqual(self.rows('SELECT enabled FROM copy_live')[0]['enabled'],1)
+        self.assertEqual(len(self.rows('SELECT * FROM copy_tasks')),1)
+        import json
+        self.assertEqual(json.loads(self.rows('SELECT body FROM records ORDER BY stamp DESC LIMIT 1')[0]['body'])['avgPrice'],'101')
+
+    def test_decimal_formatting_change_is_not_a_regression(self):
+        row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
+        self.api.orders[0]['executedQty']='1.00000000';self.monitor.poll(PID)
+        self.assertEqual(self.rows('SELECT enabled FROM copy_live')[0]['enabled'],1)
+        self.assertEqual(len(self.rows('SELECT * FROM copy_tasks')),1)
 
 class FuturesTransportTests(unittest.TestCase):
     def test_exchange_rules_cache_expires(self):

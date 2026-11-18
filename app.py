@@ -18,7 +18,7 @@ from decimal import Decimal, InvalidOperation, localcontext
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from virtual_position import transition
+from virtual_position import decimal_string, transition
 from leader_replay import replay
 from copy_executor import FuturesClient, ExchangeError, plan
 from fractions import Fraction
@@ -136,6 +136,27 @@ def merge_order_fills(rows):
             avg = format(Decimal(average.numerator)/Decimal(average.denominator),'f')
         merged.append({**fills[0], 'executedQty':decimal_string(qty), 'avgPrice':avg, 'totalPnl':decimal_string(pnl)})
     return sorted(merged,key=lambda r:(r['orderTime'],r['symbol'],r['side'],r['positionSide']))
+
+
+def incremental_fill(previous, current):
+    """Describe the part of an order that filled after the previous poll.
+
+    The history interface reports cumulative fills per order, so the same order
+    can reappear later with a larger quantity. The incremental price is derived
+    from the difference of cumulative cost, not from the new weighted average.
+    """
+    old_qty, new_qty = Fraction(number(previous['executedQty'])), Fraction(number(current['executedQty']))
+    delta = new_qty - old_qty
+    cost = new_qty * Fraction(number(current['avgPrice'])) - old_qty * Fraction(number(previous['avgPrice']))
+    if delta <= 0 or cost <= 0:
+        raise ValueError('累计成交数量或成本不一致')
+    pnl = Fraction(number(current.get('totalPnl') or '0')) - Fraction(number(previous.get('totalPnl') or '0'))
+    price = cost / delta
+    with localcontext() as ctx:
+        ctx.prec = 40
+        average = format(Decimal(price.numerator) / Decimal(price.denominator), 'f')
+    return {**current, 'executedQty': decimal_string(delta), 'avgPrice': average,
+            'totalPnl': decimal_string(pnl), 'incremental': True}
 
 
 class UpstreamError(Exception):
@@ -570,6 +591,30 @@ class Monitor:
             if change['action'] != 'unmatched_close':
                 db.execute('INSERT OR REPLACE INTO virtual_positions VALUES(?,?,?,?,?)', (aid,pid,symbol,side,change['after']))
 
+    def stop_copy(self, db, pid, message):
+        """Stop following a leader after an unrecoverable record inconsistency."""
+        sessions = db.execute('SELECT account_id FROM copy_live WHERE target_id=? AND enabled=1', (pid,)).fetchall()
+        for session in sessions:
+            db.execute('UPDATE copy_live SET enabled=0 WHERE account_id=? AND target_id=?', (session['account_id'],pid))
+            db.execute('UPDATE virtual_sessions SET active=0 WHERE account_id=? AND target_id=?', (session['account_id'],pid))
+            db.execute("UPDATE copy_tasks SET state='cancelled',error='订单成交数据异常' WHERE account_id=? AND target_id=? AND state='pending'", (session['account_id'],pid))
+        self.copy_notice(db, {'target_id':pid}, message)
+        LOG.warning('copy stopped target=%s reason=%s',pid,message)
+
+    def apply_increment(self, db, pid, key, old, row, lead_balance, new_qty):
+        """Copy only the part of an order reported after the previous poll."""
+        if not db.execute('SELECT 1 FROM virtual_events WHERE target_id=? AND order_key=?', (pid,key)).fetchone():
+            LOG.info('copy fill update target=%s symbol=%s order_time=%s cumulative=%s result=not_followed',pid,row['symbol'],row['orderTime'],decimal_text(new_qty))
+            return
+        try:
+            delta = incremental_fill(old, row)
+        except ValueError as exc:
+            self.stop_copy(db, pid, '%s 订单 %s 的成交明细无法合并：%s；已关闭跟单，请核对记录' % (row['symbol'],row['orderTime'],exc))
+            return
+        LOG.info('copy fill update target=%s symbol=%s order_time=%s cumulative=%s delta=%s result=applied',
+                 pid,row['symbol'],row['orderTime'],decimal_text(new_qty),delta['executedQty'])
+        self.virtual_apply(db, pid, key + ':' + decimal_string(new_qty), delta, lead_balance)
+
     def poll(self, pid):
         with self.store.db() as db:
             target = db.execute('SELECT * FROM targets WHERE id=?', (pid,)).fetchone()
@@ -607,16 +652,20 @@ class Monitor:
                         if kind == 'order':
                             body.update(direction=direction(row), notional=decimal_text(number(row['executedQty']) * number(row['avgPrice'])), updated=bool(previous))
                         if previous:
-                            # A reused identity with different immutable execution fields is ambiguous.
-                            # Stop copying and cancel pending tasks rather than treating it as an update.
+                            # The interface has no unique execution id: an order keeps the same
+                            # identity while its cumulative fills grow. Follow the difference
+                            # instead of treating a later detailed fill as a conflicting order.
                             old = json.loads(previous['body'])
-                            if kind == 'order' and any(str(old.get(field)) != str(row.get(field)) for field in ('executedQty','avgPrice')):
-                                sessions = db.execute('SELECT account_id,target_id FROM copy_live WHERE target_id=? AND enabled=1', (pid,)).fetchall()
-                                for session in sessions:
-                                    db.execute('UPDATE copy_live SET enabled=0 WHERE account_id=? AND target_id=?', (session['account_id'],pid))
-                                    db.execute('UPDATE virtual_sessions SET active=0 WHERE account_id=? AND target_id=?', (session['account_id'],pid))
-                                    db.execute("UPDATE copy_tasks SET state='cancelled',error='订单标识冲突' WHERE account_id=? AND target_id=? AND state='pending'", (session['account_id'],pid))
-                                    self.copy_notice(db, {'target_id':pid}, '%s 订单标识冲突，已关闭跟单，请核对记录' % row['symbol'])
+                            if kind == 'order' and str(old.get('executedQty')) != str(row.get('executedQty')):
+                                old_qty, new_qty = Fraction(number(old['executedQty'])), Fraction(number(row['executedQty']))
+                                if new_qty > old_qty:
+                                    self.apply_increment(db, pid, key, old, row, detail['marginBalance'], new_qty)
+                                elif new_qty < old_qty:
+                                    self.stop_copy(db, pid, '%s 订单 %s 的成交数量由 %s 回退到 %s，已关闭跟单，请核对记录' % (
+                                        row['symbol'], row['orderTime'], decimal_text(old['executedQty']), decimal_text(row['executedQty'])))
+                                # Equal values with different text are the same cumulative fill.
+                            elif kind == 'order' and str(old.get('avgPrice')) != str(row.get('avgPrice')):
+                                LOG.info('copy fill revision target=%s symbol=%s order_time=%s result=price_only',pid,row['symbol'],row['orderTime'])
                             # Refresh the original display row; never enqueue an update as a new order.
                             candidates = db.execute('SELECT id,body FROM events WHERE target=? AND kind=? AND stamp=?', (pid, kind, stamp)).fetchall()
                             for event in candidates:
@@ -745,7 +794,10 @@ class Monitor:
                             raise ValueError('跟单持仓记录超过账户实际持仓，请先核对')
                     quote=client.quote(row['symbol'])
                     plan_action, before_qty, owned_qty = task['action'], task['before_qty'], old['quantity'] if old else '0'
-                    if plan_action in ('close','unmatched_close'):
+                    if plan_action in ('close','unmatched_close') and not row.get('incremental'):
+                        # Incremental tasks carry the tracked pre-fill quantity, so replaying
+                        # the leader's earlier history would size the close against the whole
+                        # order instead of the part reported in this poll.
                         with self.store.db() as db:
                             sync = db.execute('SELECT complete FROM leader_history_sync WHERE target=?',(task['target_id'],)).fetchone()
                             earlier = [json.loads(x['body']) for x in db.execute('SELECT body FROM leader_history WHERE target=? AND stamp<? ORDER BY stamp,key',(task['target_id'],int(row['orderTime'])))] if sync and sync['complete'] else []
