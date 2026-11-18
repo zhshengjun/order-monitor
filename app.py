@@ -95,10 +95,11 @@ def history_identity(row):
     def decimal_key(value):
         text = format(number(value), 'f')
         return text.rstrip('0').rstrip('.') if '.' in text else text
+    amount = decimal_string(Fraction(number(row['executedQty'])) * Fraction(number(row['avgPrice'])))
     return hashlib.sha256(dumps([str(row.get('symbol','')).strip().upper(),
                                   str(row.get('side','')).strip().upper(),
                                   str(row.get('positionSide','')).strip().upper(),
-                                  int(row['orderTime']),decimal_key(row['executedQty'])]).encode()).hexdigest()
+                                  int(row['orderTime']),decimal_key(row['executedQty']),amount]).encode()).hexdigest()
 
 
 def clean_history(row):
@@ -134,7 +135,7 @@ def merge_order_fills(rows):
             ctx.prec = 40
             average = cost/qty
             avg = format(Decimal(average.numerator)/Decimal(average.denominator),'f')
-        merged.append({**fills[0], 'executedQty':decimal_string(qty), 'avgPrice':avg, 'totalPnl':decimal_string(pnl)})
+        merged.append({**fills[0], 'executedQty':decimal_string(qty), 'avgPrice':avg, 'notional':decimal_string(cost), 'totalPnl':decimal_string(pnl)})
     return sorted(merged,key=lambda r:(r['orderTime'],r['symbol'],r['side'],r['positionSide']))
 
 
@@ -147,7 +148,8 @@ def incremental_fill(previous, current):
     """
     old_qty, new_qty = Fraction(number(previous['executedQty'])), Fraction(number(current['executedQty']))
     delta = new_qty - old_qty
-    cost = new_qty * Fraction(number(current['avgPrice'])) - old_qty * Fraction(number(previous['avgPrice']))
+    cost = Fraction(number(current['notional'])) if 'notional' in current else new_qty * Fraction(number(current['avgPrice']))
+    cost -= Fraction(number(previous['notional'])) if 'notional' in previous else old_qty * Fraction(number(previous['avgPrice']))
     if delta <= 0 or cost <= 0:
         raise ValueError('累计成交数量或成本不一致')
     pnl = Fraction(number(current.get('totalPnl') or '0')) - Fraction(number(previous.get('totalPnl') or '0'))
@@ -155,7 +157,7 @@ def incremental_fill(previous, current):
     with localcontext() as ctx:
         ctx.prec = 40
         average = format(Decimal(price.numerator) / Decimal(price.denominator), 'f')
-    return {**current, 'executedQty': decimal_string(delta), 'avgPrice': average,
+    return {**current, 'executedQty': decimal_string(delta), 'avgPrice': average, 'notional': decimal_string(cost),
             'totalPnl': decimal_string(pnl), 'incremental': True}
 
 
@@ -412,6 +414,16 @@ class Store:
                 db.execute('DELETE FROM leader_history_stage')
                 db.execute("UPDATE leader_history_sync SET page=1,complete=0,next_check=0,last_batch='',error=''")
                 db.execute("INSERT INTO app_migrations VALUES('history_identity_v5')")
+            if not db.execute("SELECT 1 FROM app_migrations WHERE name='history_identity_v6'").fetchone():
+                db.execute('CREATE TABLE IF NOT EXISTS leader_history_before_v6 AS SELECT * FROM leader_history')
+                saved=db.execute('SELECT target,body FROM leader_history').fetchall()
+                db.execute('DELETE FROM leader_history')
+                for row in saved:
+                    cleaned=clean_history(json.loads(row['body']))
+                    db.execute('INSERT OR REPLACE INTO leader_history VALUES(?,?,?,?)',(row['target'],history_identity(cleaned),cleaned['orderTime'],dumps(cleaned)))
+                db.execute('DELETE FROM leader_history_stage')
+                db.execute("UPDATE leader_history_sync SET page=1,complete=0,next_check=0,last_batch='',error='',started_at=0,failures=0")
+                db.execute("INSERT INTO app_migrations VALUES('history_identity_v6')")
             db.execute('INSERT OR IGNORE INTO monitor_start SELECT id,? FROM targets',(int(time.time()*1000),))
             db.execute('INSERT OR IGNORE INTO baseline_watermarks SELECT r.target,r.kind,MAX(r.stamp) FROM records r JOIN targets t ON t.id=r.target WHERE t.initialized=1 GROUP BY r.target,r.kind')
             if not db.execute("SELECT 1 FROM app_migrations WHERE name='transfer_baseline_initialized'").fetchone():
@@ -688,7 +700,7 @@ class Monitor:
                         db.execute('INSERT OR REPLACE INTO records VALUES(?,?,?,?,?)', (pid, kind, key, dumps(row), stamp))
                         body = dict(row)
                         if kind == 'order':
-                            body.update(direction=direction(row), notional=decimal_text(number(row['executedQty']) * number(row['avgPrice'])), updated=bool(previous))
+                            body.update(direction=direction(row), notional=row.get('notional',decimal_text(number(row['executedQty']) * number(row['avgPrice']))), updated=bool(previous))
                         if previous:
                             # The interface has no unique execution id: an order keeps the same
                             # identity while its cumulative fills grow. Follow the difference
@@ -1332,7 +1344,7 @@ def handler_factory(store, monitor, token):
                                     raw = [json.loads(r['body']) for r in db.execute('SELECT body FROM leader_history WHERE target=? ORDER BY stamp,key',(target,))]
                                     for body in merge_order_fills(raw):
                                         body['direction']=direction(body)
-                                        body['notional']=decimal_text(number(body['executedQty'])*number(body['avgPrice']))
+                                        body['notional']=body.get('notional',decimal_text(number(body['executedQty'])*number(body['avgPrice'])))
                                         rows.append({'target':target,'name':exists['name'],'kind':'order','body':body,'stamp':int(body['orderTime']),'historical':0})
                                 if kind in ('leader','transfer'):
                                     for row in db.execute("SELECT target,name,kind,body,stamp,historical FROM events WHERE target=? AND kind='transfer'",(target,)):

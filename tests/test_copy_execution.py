@@ -83,6 +83,14 @@ class CopyExecutionTests(unittest.TestCase):
         tasks=[json.loads(x['body']) for x in self.rows('SELECT body FROM copy_tasks ORDER BY id')]
         self.assertEqual([x['executedQty'] for x in tasks],['1','2'])
 
+    def test_equal_quantity_different_amount_is_followed_as_increment(self):
+        import json
+        first=order(101,'1');first['avgPrice']='100';self.api.orders.insert(0,first);self.monitor.poll(PID)
+        second=order(101,'1');second['avgPrice']='101';self.api.orders.insert(0,second);self.monitor.poll(PID)
+        tasks=[json.loads(x['body']) for x in self.rows('SELECT body FROM copy_tasks ORDER BY id')]
+        self.assertEqual([x['executedQty'] for x in tasks],['1','1'])
+        self.assertEqual(tasks[1]['notional'],'101')
+
     def test_existing_legacy_order_key_is_reused(self):
         import hashlib, json
         row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)

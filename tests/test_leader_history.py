@@ -2,12 +2,20 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app import Monitor, Store, history_identity, identity
+from app import Monitor, Store, history_identity, identity, merge_order_fills
 from leader_replay import replay
 from test_monitor import FakeAPI, PID, order
 
 
 class LeaderHistoryTests(unittest.TestCase):
+    def test_merge_distinct_fills_and_ignore_duplicate(self):
+        a=order(1,'1');a['avgPrice']='100'
+        b=order(1,'1');b['avgPrice']='130'
+        merged=merge_order_fills([a,b,dict(a)])
+        self.assertEqual(len(merged),1)
+        self.assertEqual((merged[0]['executedQty'],merged[0]['notional'],merged[0]['avgPrice']),('2','230','115'))
+        self.assertEqual(replay(merged)[0]['quantity'],'2')
+
     def test_replay_weighted_average_and_partial_close(self):
         a=order(1,'2'); a['avgPrice']='100'
         b=order(2,'1'); b['avgPrice']='130'
@@ -86,7 +94,7 @@ class LeaderHistoryTests(unittest.TestCase):
             self.assertEqual(identity('order',a),identity('order',b))
             self.assertNotEqual(history_identity(a),history_identity(b))
             self.assertEqual(history_identity(a),history_identity(dict(a,executedQty='1.00000000',avgPrice='0.10000000')))
-            self.assertEqual(history_identity(a),history_identity(dict(a,avgPrice='999',totalPnl='42')))
+            self.assertNotEqual(history_identity(a),history_identity(dict(a,avgPrice='999',totalPnl='42')))
             variant=dict(a,symbol=' btcusdt ',side=' buy ',positionSide=' long ',orderTime='1')
             self.assertEqual(history_identity(a),history_identity(variant))
             self.assertNotEqual(history_identity(a),history_identity(dict(a,side='SELL')))

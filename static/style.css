@@ -62,3 +62,5 @@ dialog{width:min(560px,calc(100vw - 32px));max-width:calc(100vw - 32px);max-heig
 .leader-card{flex-basis:168px}.leader-circle{width:168px;height:168px}.leader-circle .leader-actions{flex-wrap:nowrap}.leader-circle .leader-actions .row-action{padding:4px 6px}.leader-circle .sort-arrows button{width:18px}
 @media(max-width:700px){.leader-card{flex-basis:154px}.leader-circle{width:154px;height:154px}.leader-circle .avatar{width:30px;height:30px}.leader-circle{gap:3px}.leader-circle .leader-actions .row-action{padding:3px 5px}}
 .leader-circle .leader-actions{transform:translateY(-4px)}
+
+.selected-funds{grid-template-columns:repeat(4,minmax(0,1fr))}@media(max-width:700px){.selected-funds{grid-template-columns:repeat(2,minmax(0,1fr))}}
