@@ -84,7 +84,7 @@ def market_rule(exchange, symbol):
     return lot, rules.get('MIN_NOTIONAL',{})
 
 
-def plan(row, action, before, attributed, lead_balance, balances, positions, mode, quote, exchange, mark_price=None, leverage=None):
+def plan(row, action, before, attributed, lead_balance, balances, positions, mode, quote, exchange, mark_price=None, leverage=None, cumulative_row=None, already_filled='0'):
     symbol=row['symbol']; side=row['side']; ps=row['positionSide']
     if (side,ps) not in (('BUY','LONG'),('SELL','LONG'),('SELL','SHORT'),('BUY','SHORT')): raise ValueError('订单方向无效')
     bid,ask=quote['bidPrice'],quote['askPrice']
@@ -131,7 +131,8 @@ def plan(row, action, before, attributed, lead_balance, balances, positions, mod
             raise ValueError('未获取到有效的 USDT 钱包余额或可用余额') from None
         if not wallet.is_finite() or wallet<=0: raise ValueError('USDT 钱包余额必须大于零')
         if not available.is_finite() or available<0: raise ValueError('USDT 可用余额无效')
-        qty=opening_quantity(row['executedQty'],row['avgPrice'],lead_balance,wallet,px,lot['stepSize'])
+        source=cumulative_row if cumulative_row is not None else row
+        qty=opening_quantity(source['executedQty'],source['avgPrice'],lead_balance,wallet,px,lot['stepSize'])
         try:
             mark=Decimal(str(mark_price)); actual_leverage=Decimal(str(leverage))
         except (ValueError, ArithmeticError):
@@ -145,6 +146,13 @@ def plan(row, action, before, attributed, lead_balance, balances, positions, mod
         minimum_qty=steps_quantity(Fraction(step)*min_steps,step)
         if qty<minimum_qty:
             qty=minimum_qty
+        if cumulative_row is not None:
+            filled=Decimal(str(already_filled))
+            if not filled.is_finite() or filled<0: raise ValueError('已成交数量无效，无法计算增量')
+            remaining=Fraction(qty)-Fraction(filled)
+            if remaining<=0: raise ValueError('累计跟单数量已达到目标，跳过增量')
+            qty=steps_quantity(remaining,step)
+            if qty<minimum_qty: raise ValueError('增量不足最小下单量，暂不加仓')
         # Reserve at least the margin required at 10x, or more if the actual
         # exchange leverage is lower; this does not change Binance leverage.
         estimated_margin=Fraction(qty)*max(Fraction(mark),Fraction(Decimal(px)))/min(Fraction(actual_leverage),Fraction(10))

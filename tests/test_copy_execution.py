@@ -76,6 +76,56 @@ class CopyExecutionTests(unittest.TestCase):
         self.assertEqual(self.rows('SELECT enabled FROM copy_live')[0]['enabled'],1)
         self.assertEqual(len(self.rows('SELECT * FROM leader_history WHERE stamp=101')),7)
 
+    def test_order_type_change_does_not_replay_previous_fill(self):
+        row=order(101,'1');row['avgPrice']='100';row['type']='MARKET';self.api.orders.insert(0,row);self.monitor.poll(PID)
+        later=order(101,'2');later['avgPrice']='100';later['type']='LIMIT';self.api.orders.insert(0,later);self.monitor.poll(PID)
+        import json
+        tasks=[json.loads(x['body']) for x in self.rows('SELECT body FROM copy_tasks ORDER BY id')]
+        self.assertEqual([x['executedQty'] for x in tasks],['1','2'])
+
+    def test_existing_legacy_order_key_is_reused(self):
+        import hashlib, json
+        row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
+        old_key=hashlib.sha256(json.dumps([row['symbol'],row['side'],row['positionSide'],row['type'],row['orderTime']],separators=(',',':')).encode()).hexdigest()
+        with self.store.db() as db:
+            db.execute('UPDATE records SET key=? WHERE target=? AND stamp=101',(old_key,PID))
+            db.execute('UPDATE virtual_events SET order_key=? WHERE target_id=? AND stamp=101',(old_key,PID))
+            db.execute('UPDATE copy_tasks SET order_key=? WHERE target_id=?',(old_key,PID))
+        later=order(101,'2');later['avgPrice']='100';later['type']='LIMIT';self.api.orders.insert(0,later);self.monitor.poll(PID)
+        tasks=self.rows('SELECT order_key,body FROM copy_tasks ORDER BY id')
+        self.assertEqual([json.loads(x['body'])['executedQty'] for x in tasks],['1','2'])
+        self.assertEqual(tasks[1]['order_key'],old_key+':3')
+
+    def test_increment_does_not_repeat_minimum_order(self):
+        first=order(101,'0.001');first['avgPrice']='100';self.api.orders.insert(0,first);self.monitor.poll(PID)
+        FakeExchange.result={'status':'FILLED','executedQty':'0.05','orderId':1}
+        try:
+            with patch('app.FuturesClient',FakeExchange):
+                self.monitor.execute_copy()
+                later=order(101,'0.002');later['avgPrice']='100';self.api.orders.insert(0,later);self.monitor.poll(PID)
+                self.monitor.execute_copy()
+            tasks=self.rows('SELECT state,error FROM copy_tasks ORDER BY id')
+            self.assertEqual([t['state'] for t in tasks],['filled','skipped'])
+            self.assertIn('累计跟单数量已达到目标',tasks[1]['error'])
+            self.assertEqual(len(FakeExchange.calls),1)
+        finally:
+            FakeExchange.result={'status':'FILLED','executedQty':'0.999','orderId':1}
+
+    def test_detail_failure_keeps_monitoring_and_recovers_balance(self):
+        self.api.fail=True
+        stamp=int(time.time()*1000);self.monitor.now_ms=lambda:stamp
+        row=order(stamp,'1');row['avgPrice']='100';self.api.orders.insert(0,row)
+        self.monitor.poll(PID)
+        self.assertEqual(self.rows('SELECT lead_balance FROM copy_tasks')[0]['lead_balance'],'')
+        self.assertEqual(len(self.rows('SELECT * FROM events WHERE stamp=%s' % stamp)),1)
+        with patch('app.FuturesClient',FakeExchange):
+            self.monitor.execute_copy()
+            self.assertEqual(FakeExchange.calls,[])
+            self.api.fail=False
+            with self.store.db() as db: db.execute('UPDATE copy_tasks SET next_check=0')
+            self.monitor.execute_copy()
+        self.assertEqual(self.rows('SELECT state FROM copy_tasks')[0]['state'],'filled')
+
     def test_first_poll_follows_only_trades_after_enable(self):
         with self.store.db() as db:
             db.execute('UPDATE targets SET initialized=0 WHERE id=?',(PID,))

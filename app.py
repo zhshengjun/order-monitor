@@ -86,7 +86,7 @@ def direction(row):
 
 
 def identity(kind, row):
-    fields = ('symbol', 'side', 'positionSide', 'type', 'orderTime') if kind == 'order' else (
+    fields = ('symbol', 'side', 'positionSide', 'orderTime') if kind == 'order' else (
         'time', 'coin', 'amount', 'from', 'to', 'transType')
     return hashlib.sha256(dumps([row.get(k) for k in fields]).encode()).hexdigest()
 
@@ -609,7 +609,7 @@ class Monitor:
                 continue
             client_id = 'cp_' + hashlib.sha256((str(aid)+':'+pid+':'+key).encode()).hexdigest()[:30]
             created = db.execute('INSERT OR IGNORE INTO copy_tasks(account_id,target_id,order_key,body,action,before_qty,lead_balance,client_id,created) VALUES(?,?,?,?,?,?,?,?,?)',
-                       (aid,pid,key,dumps(row),change['action'],change['before'],str(lead_balance),client_id,int(time.time()*1000)))
+                       (aid,pid,key,dumps(row),change['action'],change['before'],'' if lead_balance is None else str(lead_balance),client_id,int(time.time()*1000)))
             LOG.info('copy decision target=%s account=%s symbol=%s order_time=%s action=%s result=%s',pid,aid,symbol,row['orderTime'],change['action'],'queued' if created.rowcount else 'existing_task')
             if change['action'] != 'unmatched_close':
                 db.execute('INSERT OR REPLACE INTO virtual_positions VALUES(?,?,?,?,?)', (aid,pid,symbol,side,change['after']))
@@ -627,7 +627,7 @@ class Monitor:
     def apply_increment(self, db, pid, key, old, row, lead_balance, new_qty):
         """Copy only the part of an order reported after the previous poll."""
         if not db.execute('SELECT 1 FROM virtual_events WHERE target_id=? AND order_key=?', (pid,key)).fetchone():
-            LOG.info('copy fill update target=%s symbol=%s order_time=%s cumulative=%s result=not_followed',pid,row['symbol'],row['orderTime'],decimal_text(new_qty))
+            LOG.info('copy fill update target=%s symbol=%s order_time=%s cumulative=%s result=not_followed',pid,row['symbol'],row['orderTime'],decimal_string(new_qty))
             return
         try:
             delta = incremental_fill(old, row)
@@ -635,7 +635,7 @@ class Monitor:
             self.stop_copy(db, pid, '%s 订单 %s 的成交明细无法合并：%s；已关闭跟单，请核对记录' % (row['symbol'],row['orderTime'],exc))
             return
         LOG.info('copy fill update target=%s symbol=%s order_time=%s cumulative=%s delta=%s result=applied',
-                 pid,row['symbol'],row['orderTime'],decimal_text(new_qty),delta['executedQty'])
+                 pid,row['symbol'],row['orderTime'],decimal_string(new_qty),delta['executedQty'])
         self.virtual_apply(db, pid, key + ':' + decimal_string(new_qty), delta, lead_balance)
 
     def poll(self, pid):
@@ -645,7 +645,13 @@ class Monitor:
             return
         LOG.info('poll start target=%s initialized=%s',pid,target['initialized'])
         try:
-            detail = self.api.detail(pid)
+            detail_error = ''
+            try:
+                detail = self.api.detail(pid)
+            except (UpstreamError, ValueError, InvalidOperation, KeyError) as exc:
+                detail_error = str(exc)[:300]
+                LOG.warning('portfolio %s detail failed; continuing order polling: %s',pid,detail_error)
+                detail = {'nickname':target['name'], 'marginBalance':None}
             histories = {'order': self.collect(pid,'order',target['initialized'])}
             with self.lock, self.store.db() as db:
                 current = db.execute('SELECT initialized,enabled FROM targets WHERE id=?', (pid,)).fetchone()
@@ -669,7 +675,15 @@ class Monitor:
                     for row in sorted(rows, key=lambda r: int(r[time_key])):
                         key, stamp = identity(kind, row), int(row[time_key])
                         previous = db.execute('SELECT body FROM records WHERE target=? AND kind=? AND key=?', (pid, kind, key)).fetchone()
-                        if previous and json.loads(previous[0]) == row:
+                        if kind == 'order':
+                            candidates = db.execute("SELECT key,body FROM records WHERE target=? AND kind='order' AND stamp=?",(pid,stamp)).fetchall()
+                            matching = [x for x in candidates if identity('order',json.loads(x['body']))==key]
+                            if len(matching)>1:
+                                self.stop_copy(db,pid,'%s 同一成交存在多个旧记录，已关闭跟单，请核对记录' % row['symbol'])
+                                continue
+                            if matching and not previous:
+                                key, previous = matching[0]['key'], matching[0]
+                        if previous and json.loads(previous['body']) == row:
                             continue
                         db.execute('INSERT OR REPLACE INTO records VALUES(?,?,?,?,?)', (pid, kind, key, dumps(row), stamp))
                         body = dict(row)
@@ -693,7 +707,7 @@ class Monitor:
                             # Refresh the original display row; never enqueue an update as a new order.
                             candidates = db.execute('SELECT id,body FROM events WHERE target=? AND kind=? AND stamp=?', (pid, kind, stamp)).fetchall()
                             for event in candidates:
-                                if identity(kind, json.loads(event['body'])) == key:
+                                if identity(kind, json.loads(event['body'])) == identity(kind,row):
                                     db.execute('UPDATE events SET body=? WHERE id=?', (dumps(body), event['id']))
                             continue
                         live_started = db.execute('SELECT 1 FROM copy_live WHERE target_id=? AND enabled=1 AND started_at<? LIMIT 1',(pid,stamp)).fetchone() if kind == 'order' else None
@@ -705,9 +719,10 @@ class Monitor:
                             self.virtual_apply(db, pid, key, row, detail['marginBalance'])
                     if first_kind:
                         db.execute('INSERT OR REPLACE INTO baseline_watermarks VALUES(?,?,?)', (pid,kind,max((int(r[time_key]) for r in rows),default=0)))
-                balance = decimal_text(detail['marginBalance'])
-                db.execute('UPDATE targets SET name=?,detail=?,balance=?,initialized=1,last_check=?,next_check=?,failures=0,error=\'\' WHERE id=?',
-                           (detail['nickname'], dumps(detail), balance, time.time(), time.time() + settings['interval'], pid))
+                balance = decimal_text(detail['marginBalance']) if detail['marginBalance'] is not None else target['balance']
+                saved_detail = dumps(detail) if not detail_error else target['detail']
+                db.execute('UPDATE targets SET name=?,detail=?,balance=?,initialized=1,last_check=?,next_check=?,failures=0,error=? WHERE id=?',
+                           (detail['nickname'], saved_detail, balance, time.time(), time.time() + settings['interval'], detail_error, pid))
             LOG.info('poll orders complete target=%s orders=%s',pid,len(histories['order']))
             self.schedule_transfers(pid,detail['nickname'])
         except Exception as exc:
@@ -843,6 +858,13 @@ class Monitor:
                             self.copy_notice(db,task,'%s 跟单跳过：%s' % (row['symbol'],reason))
                             return
                 try:
+                    lead_balance=task['lead_balance']
+                    if not lead_balance:
+                        recovered=self.api.detail(task['target_id'])
+                        lead_balance=decimal_text(recovered['marginBalance'])
+                        if number(lead_balance)<=0: raise ValueError('带单员余额无效')
+                        with self.store.db() as db:
+                            db.execute('UPDATE copy_tasks SET lead_balance=? WHERE id=? AND state=\'pending\'',(lead_balance,task['id']))
                     with self.store.db() as db:
                         old=db.execute('SELECT quantity FROM copied_positions WHERE account_id=? AND target_id=? AND symbol=? AND position_side=?',(task['account_id'],task['target_id'],row['symbol'],row['positionSide'])).fetchone()
                     positions = None
@@ -892,12 +914,24 @@ class Monitor:
                             plan_action, before_qty = 'close', prior['quantity']
                             if unmatched:
                                 owned_qty = str(close_position(positions,row['symbol'],row['positionSide']))
-                    params=plan(row,plan_action,before_qty,owned_qty,task['lead_balance'],balances,positions,mode,quote,rules,mark_price=mark_price,leverage=leverage)
+                    cumulative_row=None
+                    already_filled='0'
+                    if plan_action=='open' and row.get('incremental'):
+                        base_key=task['order_key'].split(':',1)[0]
+                        with self.store.db() as db:
+                            original=db.execute("SELECT body FROM records WHERE target=? AND kind='order' AND key=?",(task['target_id'],base_key)).fetchone()
+                            prior=db.execute("SELECT result FROM copy_tasks WHERE account_id=? AND target_id=? AND id<? AND (order_key=? OR order_key LIKE ?) AND state IN ('filled','finished')",(task['account_id'],task['target_id'],task['id'],base_key,base_key+':%')).fetchall()
+                        if not original: raise ValueError('缺少累计成交记录，无法计算增量')
+                        cumulative_row=json.loads(original['body'])
+                        if identity('order',cumulative_row)!=identity('order',row): raise ValueError('累计成交记录不匹配')
+                        filled=sum((Fraction(number(json.loads(item['result'])['executedQty'])) for item in prior),Fraction(0))
+                        already_filled=decimal_string(filled)
+                    params=plan(row,plan_action,before_qty,owned_qty,lead_balance,balances,positions,mode,quote,rules,mark_price=mark_price,leverage=leverage,cumulative_row=cumulative_row,already_filled=already_filled)
                     price=quote['askPrice'] if row['side']=='BUY' else quote['bidPrice']
-                except (ValueError,ExchangeError,KeyError,InvalidOperation) as exc:
+                except (ValueError,ExchangeError,UpstreamError,KeyError,InvalidOperation) as exc:
                     LOG.warning('跟单预检查失败 account=%s symbol=%s: %s', task['account_id'], row.get('symbol',''), str(exc)[:200])
                     with self.store.db() as db:
-                        transient = isinstance(exc, ExchangeError) and (exc.status is None or exc.status in (408, 418, 429, 451) or 500 <= exc.status <= 599)
+                        transient = isinstance(exc, UpstreamError) or (isinstance(exc, ExchangeError) and (exc.status is None or exc.status in (408, 418, 429, 451) or 500 <= exc.status <= 599))
                         retries = task['retry_count']
                         if transient and retries < 3:
                             retries += 1
@@ -911,7 +945,7 @@ class Monitor:
                 params['newClientOrderId']=task['client_id']
                 # Persist intent before touching the exchange, so process crashes cannot duplicate a POST.
                 with self.store.db() as db:
-                    db.execute('INSERT OR REPLACE INTO copy_task_audit(task_id,balance_time,asset,wallet_balance,available_balance,lead_balance,reference_price,planned_quantity) VALUES(?,?,?,?,?,?,?,?)', (task['id'],balance_time,'USDT',str(usdt['balance']) if usdt and 'balance' in usdt else None,str(usdt['availableBalance']) if usdt and 'availableBalance' in usdt else None,task['lead_balance'],str(price),params['quantity']))
+                    db.execute('INSERT OR REPLACE INTO copy_task_audit(task_id,balance_time,asset,wallet_balance,available_balance,lead_balance,reference_price,planned_quantity) VALUES(?,?,?,?,?,?,?,?)', (task['id'],balance_time,'USDT',str(usdt['balance']) if usdt and 'balance' in usdt else None,str(usdt['availableBalance']) if usdt and 'availableBalance' in usdt else None,lead_balance,str(price),params['quantity']))
                     changed = db.execute("UPDATE copy_tasks SET state='submitted',quantity=? WHERE id=? AND state='pending' AND EXISTS (SELECT 1 FROM copy_live l JOIN copy_bindings b ON b.account_id=l.account_id AND b.target_id=l.target_id JOIN targets t ON t.id=l.target_id WHERE l.account_id=copy_tasks.account_id AND l.target_id=copy_tasks.target_id AND l.enabled=1 AND t.enabled=1)",(params['quantity'],task['id'])).rowcount
                     if not changed:
                         still_pending = db.execute("SELECT 1 FROM copy_tasks WHERE id=? AND state='pending'",(task['id'],)).fetchone()
@@ -952,7 +986,6 @@ class Monitor:
                 with self.store.db() as db:
                     db.execute("UPDATE copy_tasks SET error='订单响应与提交信息不一致，等待人工核对',next_check=strftime('%s','now')+15 WHERE id=?",(task['id'],))
                 return
-            from virtual_position import decimal_string
             with self.store.db() as db:
                 current=db.execute('SELECT state FROM copy_tasks WHERE id=?',(task['id'],)).fetchone()
                 if not current or current['state']!='submitted': return
@@ -1228,10 +1261,13 @@ def handler_factory(store, monitor, token):
                         virtual_events = [dict(r) for r in db.execute("SELECT account_id,target_id,symbol,position_side,stamp,action,quantity FROM virtual_events WHERE action='unmatched_close' ORDER BY stamp DESC LIMIT 20")]
                         counts = dict(db.execute('SELECT status,COUNT(*) FROM outbox GROUP BY status').fetchall())
                         errors = [dict(r) for r in db.execute("SELECT channel,attempts,error FROM outbox WHERE status='pending' AND error!='' ORDER BY id DESC LIMIT 5")]
+                        unresolved = [dict(r) for r in db.execute("SELECT c.id,c.body,c.error,a.name AS account_name,t.name AS target_name FROM copy_tasks c JOIN futures_accounts a ON a.id=c.account_id JOIN targets t ON t.id=c.target_id WHERE c.state='submitted' ORDER BY c.id")]
+                        for item in unresolved:
+                            item['symbol'] = json.loads(item.pop('body')).get('symbol','')
                     settings = store.settings()
                     for key in SECRETS:
                         settings[key + '_configured'] = bool(settings.pop(key))
-                    return self.reply({'targets': targets, 'settings': settings, 'notifications': counts, 'notification_errors': errors, 'futures_accounts': accounts, 'copy_bindings': bindings, 'virtual_sessions': virtual_sessions, 'virtual_positions': virtual_positions, 'virtual_events': virtual_events, 'copy_tasks': copy_tasks, 'copy_live': copy_live})
+                    return self.reply({'targets': targets, 'settings': settings, 'notifications': counts, 'notification_errors': errors, 'unresolved_orders': unresolved, 'futures_accounts': accounts, 'copy_bindings': bindings, 'virtual_sessions': virtual_sessions, 'virtual_positions': virtual_positions, 'virtual_events': virtual_events, 'copy_tasks': copy_tasks, 'copy_live': copy_live})
                 if parsed.path == '/api/futures-network':
                     proxies = urllib.request.getproxies()
                     via_proxy = bool(proxies.get('https')) and not urllib.request.proxy_bypass('fapi.binance.com')
