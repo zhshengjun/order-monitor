@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app import Monitor, Store
+from app import Monitor, Store, history_identity, identity
 from leader_replay import replay
 from test_monitor import FakeAPI, PID, order
 
@@ -69,4 +69,29 @@ class LeaderHistoryTests(unittest.TestCase):
                 self.assertEqual(db.execute('SELECT COUNT(*) FROM leader_history').fetchone()[0],25)
                 self.assertEqual(db.execute('SELECT complete FROM leader_history_sync').fetchone()[0],1)
             self.assertEqual([x[1] for x in api.calls], [1,2,3])
+
+    def test_distinct_same_time_fills_are_preserved_after_restart(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            store=Store(Path(tmp)/'db');api=FakeAPI();monitor=Monitor(store,api);monitor.add(PID)
+            a=order(1,'1');b=order(1,'2')
+            self.assertEqual(identity('order',a),identity('order',b))
+            self.assertNotEqual(history_identity(a),history_identity(b))
+            api.orders=[a,b];monitor.sync_history(PID)
+            store=Store(store.path)
+            with store.db() as db:
+                self.assertEqual(db.execute('SELECT COUNT(*) FROM leader_history').fetchone()[0],2)
+
+    def test_repeated_page_reports_error_instead_of_infinite_sync(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store=Store(Path(tmp)/'db');api=FakeAPI();monitor=Monitor(store,api);monitor.add(PID)
+            api.history=lambda *args: {'total':100,'list':[order(10)]}
+            monitor.sync_history(PID)
+            with store.db() as db: db.execute('UPDATE leader_history_sync SET next_check=0')
+            monitor.sync_history(PID)
+            with store.db() as db:
+                sync=db.execute('SELECT * FROM leader_history_sync').fetchone()
+                self.assertEqual(sync['page'],2)
+                self.assertEqual(sync['complete'],0)
+                self.assertIn('相同',sync['error'])
 

@@ -90,6 +90,15 @@ def identity(kind, row):
     return hashlib.sha256(dumps([row.get(k) for k in fields]).encode()).hexdigest()
 
 
+def history_identity(row):
+    for field in ('orderId', 'tradeId'):
+        value = row.get(field)
+        if value is not None and str(value).strip() and str(value) != '0':
+            return hashlib.sha256(dumps([field,str(value),row.get('symbol')]).encode()).hexdigest()
+    fields = ('symbol','side','positionSide','type','orderTime','executedQty','avgPrice','totalPnl')
+    return hashlib.sha256(dumps([row.get(k) for k in fields]).encode()).hexdigest()
+
+
 class UpstreamError(Exception):
     pass
 
@@ -221,6 +230,7 @@ class Store:
             CREATE TABLE IF NOT EXISTS leader_history_sync (
               target TEXT PRIMARY KEY, page INTEGER NOT NULL DEFAULT 1, complete INTEGER NOT NULL DEFAULT 0,
               total INTEGER NOT NULL DEFAULT 0, next_check REAL NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '', updated REAL);
+            CREATE TABLE IF NOT EXISTS app_migrations (name TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS baseline_watermarks (
               target TEXT NOT NULL, kind TEXT NOT NULL, stamp INTEGER NOT NULL,
               PRIMARY KEY(target,kind));
@@ -277,7 +287,17 @@ class Store:
             if 'retry_count' not in columns:
                 db.execute('ALTER TABLE copy_tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0')
             db.execute('INSERT OR IGNORE INTO settings VALUES(1,?)', (dumps(DEFAULTS),))
-            db.execute("INSERT OR IGNORE INTO leader_history SELECT target,key,stamp,body FROM records WHERE kind='order'")
+            sync_columns = {row['name'] for row in db.execute('PRAGMA table_info(leader_history_sync)')}
+            if 'last_batch' not in sync_columns:
+                db.execute("ALTER TABLE leader_history_sync ADD COLUMN last_batch TEXT NOT NULL DEFAULT ''")
+            if not db.execute("SELECT 1 FROM app_migrations WHERE name='history_identity_v2'").fetchone():
+                saved = db.execute('SELECT target,stamp,body FROM leader_history').fetchall()
+                existing_records = db.execute("SELECT target,stamp,body FROM records WHERE kind='order'").fetchall()
+                db.execute('DELETE FROM leader_history')
+                for row in saved + existing_records:
+                    db.execute('INSERT OR REPLACE INTO leader_history VALUES(?,?,?,?)',(row['target'],history_identity(json.loads(row['body'])),row['stamp'],row['body']))
+                db.execute("UPDATE leader_history_sync SET page=1,complete=0,next_check=0,last_batch='',error=''")
+                db.execute("INSERT INTO app_migrations VALUES('history_identity_v2')")
             db.execute('INSERT OR IGNORE INTO baseline_watermarks SELECT r.target,r.kind,MAX(r.stamp) FROM records r JOIN targets t ON t.id=r.target WHERE t.initialized=1 GROUP BY r.target,r.kind')
         os.chmod(self.path, 0o600)
 
@@ -471,7 +491,7 @@ class Monitor:
                     for row in sorted(rows, key=lambda r: int(r[time_key])):
                         key, stamp = identity(kind, row), int(row[time_key])
                         if kind == 'order':
-                            db.execute('INSERT OR REPLACE INTO leader_history VALUES(?,?,?,?)', (pid,key,stamp,dumps(row)))
+                            db.execute('INSERT OR REPLACE INTO leader_history VALUES(?,?,?,?)', (pid,history_identity(row),stamp,dumps(row)))
                         previous = db.execute('SELECT body FROM records WHERE target=? AND kind=? AND key=?', (pid, kind, key)).fetchone()
                         if previous and json.loads(previous[0]) == row:
                             continue
@@ -777,12 +797,15 @@ class Monitor:
             data = self.api.history(pid,'order',page,20)
             rows, total = data['list'], int(data['total'])
             if total < 0: raise ValueError('历史总数无效')
+            fingerprint = hashlib.sha256(dumps([history_identity(row) for row in rows]).encode()).hexdigest() if rows else ''
+            if page > 1 and fingerprint and fingerprint == sync['last_batch']:
+                raise UpstreamError('上游连续返回相同的历史页面，请检查分页接口；同步未完成')
             with self.store.db() as db:
                 for row in rows:
-                    db.execute('INSERT OR REPLACE INTO leader_history VALUES(?,?,?,?)', (pid,identity('order',row),int(row['orderTime']),dumps(row)))
+                    db.execute('INSERT OR REPLACE INTO leader_history VALUES(?,?,?,?)', (pid,history_identity(row),int(row['orderTime']),dumps(row)))
                 complete = not rows
-                db.execute('UPDATE leader_history_sync SET page=?,complete=?,total=?,next_check=?,error=?,updated=? WHERE target=?',
-                           (1 if complete else page+1,int(complete),total,time.time()+(3600 if complete else 1),'',time.time(),pid))
+                db.execute('UPDATE leader_history_sync SET page=?,complete=?,total=?,next_check=?,error=?,updated=?,last_batch=? WHERE target=?',
+                           (1 if complete else page+1,int(complete),total,time.time()+(3600 if complete else 1),'',time.time(),fingerprint,pid))
         except Exception as exc:
             reason = str(exc)[:200] if isinstance(exc,(UpstreamError,ValueError)) else '历史同步失败'
             with self.store.db() as db:
@@ -975,7 +998,7 @@ def handler_factory(store, monitor, token):
                         if not db.execute('SELECT 1 FROM targets WHERE id=?',(pid,)).fetchone():
                             raise ValueError('带单员不存在')
                         rows = [json.loads(r['body']) for r in db.execute('SELECT body FROM leader_history WHERE target=? ORDER BY stamp,key',(pid,))]
-                        sync = db.execute('SELECT complete,total,error,updated FROM leader_history_sync WHERE target=?',(pid,)).fetchone()
+                        sync = db.execute('SELECT page,complete,total,error,updated FROM leader_history_sync WHERE target=?',(pid,)).fetchone()
                     return self.reply({'positions':replay(rows), 'count':len(rows), 'sync':dict(sync) if sync else None})
                 if parsed.path == '/api/copy-tasks':
                     account_id=int(query.get('account_id', ['0'])[0])
@@ -1052,7 +1075,7 @@ def handler_factory(store, monitor, token):
                     with monitor.history_lock, store.db() as db:
                         if not db.execute('SELECT 1 FROM targets WHERE id=? AND enabled=1',(pid,)).fetchone():
                             raise ValueError('请先开启该带单员的监听')
-                        db.execute("INSERT INTO leader_history_sync(target,page,complete,total,next_check,error) VALUES(?,1,0,0,0,'') ON CONFLICT(target) DO UPDATE SET page=1,complete=0,total=0,next_check=0,error=''",(pid,))
+                        db.execute("INSERT INTO leader_history_sync(target,page,complete,total,next_check,error,last_batch) VALUES(?,1,0,0,0,'','') ON CONFLICT(target) DO UPDATE SET page=1,complete=0,total=0,next_check=0,error='',last_batch=''",(pid,))
                 elif self.path == '/api/toggle':
                     monitor.toggle(str(data.get('id')), data.get('enabled'))
                 elif self.path == '/api/futures-account':
