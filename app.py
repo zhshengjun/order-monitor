@@ -1,5 +1,6 @@
 """Single-process Binance lead portfolio monitor. Python standard library only."""
 import contextlib
+import calendar
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import hmac
@@ -32,6 +33,46 @@ DEFAULTS = {'interval': 60, 'page_size': 20, 'balance_threshold': '0', 'telegram
 SECRETS = ('telegram_token', 'bark_key')
 LOG = logging.getLogger('monitor')
 MAX_ORDER_AGE_MS = 180000
+
+
+class HourlyLogHandler(logging.Handler):
+    """Keep each UTC-hour file until all its entries are at least 24h old."""
+    def __init__(self, directory):
+        super().__init__()
+        self.directory=Path(directory)
+        self.directory.mkdir(parents=True,exist_ok=True,mode=0o700)
+        self.closed_event=threading.Event()
+        self.cleanup()
+        self.cleaner=threading.Thread(target=self._clean_loop,daemon=True)
+        self.cleaner.start()
+
+    def cleanup(self, now=None):
+        now=time.time() if now is None else now
+        for path in self.directory.glob('monitor-????-??-??-??.log'):
+            bucket=path.name[len('monitor-'):-len('.log')]
+            try:
+                parsed=time.strptime(bucket,'%Y-%m-%d-%H')
+                if time.strftime('%Y-%m-%d-%H',parsed)!=bucket: continue
+                stamp=calendar.timegm(parsed)
+                if now-(stamp+3600)>=24*3600: path.unlink(missing_ok=True)
+            except (ValueError,OverflowError,OSError):
+                continue
+
+    def _clean_loop(self):
+        while not self.closed_event.wait(60): self.cleanup()
+
+    def emit(self, record):
+        try:
+            name='monitor-'+time.strftime('%Y-%m-%d-%H',time.gmtime())+'.log'
+            fd=os.open(self.directory/name,os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600)
+            with os.fdopen(fd,'a',encoding='utf-8') as output:
+                output.write(self.format(record)+'\n')
+        except Exception:
+            self.handleError(record)
+
+    def close(self):
+        self.closed_event.set()
+        super().close()
 
 
 def dumps(value):
@@ -1633,7 +1674,9 @@ def handler_factory(store, monitor, token):
 
 
 def main():
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+    log_dir=os.environ.get('LOG_DIR')
+    handlers=[HourlyLogHandler(log_dir)] if log_dir else None
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',handlers=handlers)
     token = os.environ.get('ADMIN_TOKEN', '')
     if len(token) < 16:
         raise SystemExit('请设置至少 16 位的 ADMIN_TOKEN 环境变量')

@@ -134,7 +134,7 @@ node --check static/app.js
 
 ### 排查搜索或同步失败
 
-使用 `docker compose logs --tail=100 order-monitor` 查看脱敏日志。日志区分 DNS、TLS、超时、HTTP 状态和 JSON 格式错误；不记录代理地址、凭证、请求头或响应正文。`docker compose logs -f order-monitor` 可实时查看。容器内代理地址应使用容器可访问的地址，不能直接使用宿主机的 `127.0.0.1`。
+应用日志保存在数据卷的 `/data/logs`，按 UTC 小时切分；每分钟清理一次整段已满 24 小时的日志，因此每条日志大约保留 24～25 小时。查看最近日志：`docker compose exec -T order-monitor sh -c 'cat /data/logs/monitor-*.log | tail -n 100'`。实时查看当前小时：`docker compose exec order-monitor sh -c 'tail -f /data/logs/monitor-$(date -u +%Y-%m-%d-%H).log'`（跨小时后需重新执行）。应用正常日志不再写入 `docker compose logs`；容器入口或进程启动失败仍可能输出到该处。日志区分 DNS、TLS、超时、HTTP 状态和 JSON 格式错误；不记录代理地址、凭证、请求头或响应正文。容器内代理地址应使用容器可访问的地址，不能直接使用宿主机的 `127.0.0.1`。
 
 跟单排查可搜索 `copy switch`、`copy decision`、`copy task` 和 `copy result`。其中 `disabled` 表示关联的自动跟单开关未开启，`before_start` 表示成交时间早于启用时间，`queued` 表示已创建跟单任务；预检查或下单失败会记录原因。日志不记录 API 密钥。
 
