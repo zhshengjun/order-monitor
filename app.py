@@ -573,7 +573,7 @@ class Monitor:
                     with self.store.db() as db:
                         old=db.execute('SELECT quantity FROM copied_positions WHERE account_id=? AND target_id=? AND symbol=? AND position_side=?',(task['account_id'],task['target_id'],row['symbol'],row['positionSide'])).fetchone()
                     positions = None
-                    if task['action'] == 'close':
+                    if task['action'] in ('close','unmatched_close'):
                         from market_guard import close_position
                         positions = client.positions()
                         if not isinstance(positions, list): raise ValueError('账户持仓响应格式错误')

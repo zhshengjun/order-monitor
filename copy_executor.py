@@ -87,7 +87,6 @@ def market_rule(exchange, symbol):
 def plan(row, action, before, attributed, lead_balance, balances, positions, mode, quote, exchange, mark_price=None, leverage=None):
     symbol=row['symbol']; side=row['side']; ps=row['positionSide']
     if (side,ps) not in (('BUY','LONG'),('SELL','LONG'),('SELL','SHORT'),('BUY','SHORT')): raise ValueError('订单方向无效')
-    if action=='unmatched_close': raise ValueError('虚拟仓位不足，跳过平仓')
     bid,ask=quote['bidPrice'],quote['askPrice']
     guard=check_price(row['avgPrice'],bid,ask,side)
     if not guard['allowed']: raise ValueError('价格偏离超过 3%')
@@ -105,15 +104,23 @@ def plan(row, action, before, attributed, lead_balance, balances, positions, mod
         opposite='SHORT' if ps=='LONG' else 'LONG'
         if close_position(positions,symbol,opposite)>0:
             raise ValueError('单向持仓存在反向仓位，无法按方向开仓')
-    if action=='close':
+    if action in ('close','unmatched_close'):
         actual=close_position(positions,symbol,ps)
         if actual<=0: raise ValueError('没有对应方向持仓，跳过平仓')
-        owned=Decimal(str(attributed))
-        if owned<=0: raise ValueError('该跟单关联没有已成交持仓，跳过平仓')
-        qty=closing_quantity(before,row['executedQty'],min(actual,owned),lot['stepSize'])
+        if action=='unmatched_close':
+            usdt=next((x for x in balances if x.get('asset')=='USDT'),None)
+            if not usdt or 'balance' not in usdt: raise ValueError('未获取到 USDT 账户余额')
+            qty=opening_quantity(row['executedQty'],row['avgPrice'],lead_balance,usdt['balance'],px,lot['stepSize'])
+            qty=steps_quantity(min(Fraction(qty),Fraction(actual)),step)
+            limit=actual
+        else:
+            owned=Decimal(str(attributed))
+            if owned<=0: raise ValueError('该跟单关联没有已成交持仓，跳过平仓')
+            qty=closing_quantity(before,row['executedQty'],min(actual,owned),lot['stepSize'])
+            limit=min(actual,owned)
         if Fraction(qty)<Fraction(step)*min_steps:
             qty=steps_quantity(Fraction(step)*min_steps,step)
-            if qty>min(actual,owned): raise ValueError('可平仓数量低于交易对最小数量')
+            if qty>limit: raise ValueError('可平仓数量低于交易对最小数量')
         if not hedged: params['reduceOnly']='true'
     elif action=='open':
         usdt=next((x for x in balances if x.get('asset')=='USDT'),None)

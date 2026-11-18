@@ -213,6 +213,29 @@ class CopyExecutionTests(unittest.TestCase):
         self.assertEqual((task['state'],task['retry_count']),('skipped',0))
         self.assertIn('没有对应方向持仓',task['error'])
         self.assertEqual(FakeExchange.calls,[])
+
+    def test_unmatched_close_uses_actual_position_and_balance_ratio(self):
+        row=order(101,'1');row['avgPrice']='100';row['side']='SELL';self.api.orders.insert(0,row);self.monitor.poll(PID)
+        positions=[{'symbol':'BTCUSDT','positionSide':'BOTH','positionAmt':'2'}]
+        with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'positions',return_value=positions), patch.object(FakeExchange,'result',{'status':'FILLED','executedQty':'1.001','orderId':1}):
+            self.monitor.execute_copy()
+        self.assertEqual(FakeExchange.calls[0][1]['quantity'],'1.001')
+        self.assertEqual(FakeExchange.calls[0][1]['reduceOnly'],'true')
+        self.assertEqual(self.rows('SELECT state FROM copy_tasks')[0]['state'],'filled')
+
+    def test_unmatched_close_never_exceeds_real_position(self):
+        row=order(101,'100');row['avgPrice']='100';row['side']='SELL'
+        positions=[{'symbol':'BTCUSDT','positionSide':'BOTH','positionAmt':'2'}]
+        result=plan(row,'unmatched_close','0','0','100',BALANCES,positions,{'dualSidePosition':False},QUOTE,RULES)
+        self.assertEqual(result['quantity'],'2.000')
+        self.assertEqual(result['reduceOnly'],'true')
+
+    def test_unmatched_close_without_position_is_skipped(self):
+        row=order(101,'1');row['avgPrice']='100';row['side']='SELL';self.api.orders.insert(0,row);self.monitor.poll(PID)
+        with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'positions',return_value=[]):
+            self.monitor.execute_copy()
+        self.assertEqual(FakeExchange.calls,[])
+        self.assertIn('没有对应方向持仓',self.rows('SELECT error FROM copy_tasks')[0]['error'])
     def test_reduce_only_not_blocked_by_opening_minimum_notional(self):
         row=order(101,'0.01');row['avgPrice']='100';row['side']='SELL'
         p=plan(row,'close','0.01','0.01','100',BALANCES,[{'symbol':'BTCUSDT','positionSide':'BOTH','positionAmt':'0.01'}],{'dualSidePosition':False},QUOTE,RULES)
