@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import time
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -13,9 +14,21 @@ from market_guard import check_price, close_position
 
 BASE = 'https://fapi.binance.com'
 
-class ExchangeError(Exception): pass
+class ExchangeError(Exception):
+    def __init__(self, message, status=None, code=None):
+        super().__init__(message)
+        self.status, self.code = status, code
+
+    @property
+    def definitively_rejected(self):
+        # Only Binance's explicit order validation/rejection codes; unknown errors
+        # and timeouts must still be reconciled without submitting again.
+        return self.status == 400 and self.code in (-1013, -1100, -1101, -1102, -1111, -2010, -2019, -2021, -2022, -2027, -2028)
 
 class FuturesClient:
+    _rules_lock = threading.Lock()
+    _rules_value = None
+    _rules_until = 0
     def __init__(self, key, secret):
         self.key, self.secret = key, secret
 
@@ -39,7 +52,7 @@ class FuturesClient:
             code = code if type(code) is int else 'unknown'
             detail = 'HTTP %s; code %s; 接口 %s' % (e.code,code,path)
             if e.code == 451: detail += '；请检查容器代理与合约 API 出口'
-            raise ExchangeError(detail) from None
+            raise ExchangeError(detail, e.code, code) from None
         except Exception:
             raise ExchangeError('接口 %s 网络请求失败或响应无效' % path) from None
 
@@ -47,7 +60,15 @@ class FuturesClient:
     def positions(self): return self.request('/fapi/v3/positionRisk',signed=True)
     def mode(self): return self.request('/fapi/v1/positionSide/dual',signed=True)
     def quote(self,symbol): return self.request('/fapi/v1/ticker/bookTicker',{'symbol':symbol})
-    def rules(self): return self.request('/fapi/v1/exchangeInfo')
+    def rules(self):
+        with FuturesClient._rules_lock:
+            if time.monotonic() >= FuturesClient._rules_until:
+                value = self.request('/fapi/v1/exchangeInfo')
+                if not isinstance(value, dict) or not isinstance(value.get('symbols'), list):
+                    raise ExchangeError('交易规则响应格式异常')
+                FuturesClient._rules_value = value
+                FuturesClient._rules_until = time.monotonic() + 300
+            return FuturesClient._rules_value
     def mark_price(self,symbol): return self.request('/fapi/v1/premiumIndex',{'symbol':symbol})
     def symbol_config(self,symbol): return self.request('/fapi/v1/symbolConfig',{'symbol':symbol},signed=True)
     def place(self,params): return self.request('/fapi/v1/order',params,method='POST',signed=True)

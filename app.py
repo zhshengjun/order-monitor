@@ -212,6 +212,10 @@ class Store:
             CREATE TABLE IF NOT EXISTS records (
               target TEXT NOT NULL, kind TEXT NOT NULL, key TEXT NOT NULL, body TEXT NOT NULL,
               stamp INTEGER NOT NULL, PRIMARY KEY(target,kind,key));
+            CREATE INDEX IF NOT EXISTS records_target_time ON records(target,kind,stamp DESC);
+            CREATE TABLE IF NOT EXISTS baseline_watermarks (
+              target TEXT NOT NULL, kind TEXT NOT NULL, stamp INTEGER NOT NULL,
+              PRIMARY KEY(target,kind));
             CREATE TABLE IF NOT EXISTS events (
               id INTEGER PRIMARY KEY AUTOINCREMENT, target TEXT NOT NULL, name TEXT NOT NULL,
               kind TEXT NOT NULL, body TEXT NOT NULL, stamp INTEGER NOT NULL, historical INTEGER NOT NULL);
@@ -262,6 +266,7 @@ class Store:
               next_try REAL NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '', UNIQUE(event,channel));
             ''')
             db.execute('INSERT OR IGNORE INTO settings VALUES(1,?)', (dumps(DEFAULTS),))
+            db.execute('INSERT OR IGNORE INTO baseline_watermarks SELECT r.target,r.kind,MAX(r.stamp) FROM records r JOIN targets t ON t.id=r.target WHERE t.initialized=1 GROUP BY r.target,r.kind')
         os.chmod(self.path, 0o600)
 
     @contextlib.contextmanager
@@ -388,6 +393,7 @@ class Monitor:
             page_size = self.store.settings(db)['page_size'] if initialized else 20
         rows = []
         time_key = 'orderTime' if kind == 'order' else 'time'
+        crossed = False
         for page in range(1, 51):
             data = self.api.history(pid, kind, page, page_size)
             batch = data['list']
@@ -396,8 +402,10 @@ class Monitor:
                 return rows  # Initial page is a baseline, not a notification backlog.
             if not batch or len(rows) >= int(data['total']):
                 return rows
-            if watermark is not None and min(int(x[time_key]) for x in batch) < watermark:
+            if crossed:
                 return rows
+            if watermark is not None and min(int(x[time_key]) for x in batch) < watermark:
+                crossed = True  # Fetch one overlap page for records arriving out of order.
         raise UpstreamError('新增记录超过 %s 条，未推进同步位置；可增加每页数量后重试' % (50 * page_size))
 
     def virtual_apply(self, db, pid, key, row, lead_balance):
@@ -409,6 +417,13 @@ class Monitor:
             if db.execute('SELECT 1 FROM virtual_events WHERE account_id=? AND target_id=? AND order_key=?', (aid, pid, key)).fetchone():
                 continue
             symbol, side = row['symbol'], row['positionSide']
+            latest = db.execute('SELECT MAX(stamp) FROM virtual_events WHERE account_id=? AND target_id=? AND symbol=? AND position_side=?', (aid,pid,symbol,side)).fetchone()[0]
+            if latest is not None and int(row['orderTime']) < latest:
+                db.execute('UPDATE copy_live SET enabled=0 WHERE account_id=? AND target_id=?', (aid,pid))
+                db.execute('UPDATE virtual_sessions SET active=0 WHERE account_id=? AND target_id=?', (aid,pid))
+                db.execute("UPDATE copy_tasks SET state='cancelled',error='交易记录乱序' WHERE account_id=? AND target_id=? AND state='pending'", (aid,pid))
+                self.copy_notice(db, {'target_id':pid}, '%s 交易记录延迟到达，顺序无法确认，已暂停跟单，请核对持仓' % symbol)
+                continue
             position = db.execute('SELECT quantity FROM virtual_positions WHERE account_id=? AND target_id=? AND symbol=? AND position_side=?', (aid, pid, symbol, side)).fetchone()
             change = transition(position['quantity'] if position else '0', row['side'], side, row['executedQty'])
             db.execute('INSERT INTO virtual_events VALUES(?,?,?,?,?,?,?,?,?,?)', (aid, pid, key, symbol, side, int(row['orderTime']), change['action'], str(row['executedQty']), change['before'], change['after']))
@@ -424,60 +439,64 @@ class Monitor:
                 db.execute('INSERT OR REPLACE INTO virtual_positions VALUES(?,?,?,?,?)', (aid,pid,symbol,side,change['after']))
 
     def poll(self, pid):
-        with self.lock:
+        with self.store.db() as db:
+            target = db.execute('SELECT * FROM targets WHERE id=?', (pid,)).fetchone()
+        if not target or not target['enabled']:
+            return
+        try:
+            detail = self.api.detail(pid)
+            histories = {kind: self.collect(pid, kind, target['initialized']) for kind in ('order', 'transfer')}
+            with self.lock, self.store.db() as db:
+                current = db.execute('SELECT initialized,enabled FROM targets WHERE id=?', (pid,)).fetchone()
+                if not current or not current['enabled'] or current['initialized'] != target['initialized']:
+                    return
+                settings = self.store.settings(db)
+                first = not target['initialized']
+                for kind, rows in histories.items():
+                    time_key = 'orderTime' if kind == 'order' else 'time'
+                    baseline = db.execute('SELECT stamp FROM baseline_watermarks WHERE target=? AND kind=?', (pid,kind)).fetchone()
+                    for row in sorted(rows, key=lambda r: int(r[time_key])):
+                        key, stamp = identity(kind, row), int(row[time_key])
+                        previous = db.execute('SELECT body FROM records WHERE target=? AND kind=? AND key=?', (pid, kind, key)).fetchone()
+                        if previous and json.loads(previous[0]) == row:
+                            continue
+                        db.execute('INSERT OR REPLACE INTO records VALUES(?,?,?,?,?)', (pid, kind, key, dumps(row), stamp))
+                        body = dict(row)
+                        if kind == 'order':
+                            body.update(direction=direction(row), notional=decimal_text(number(row['executedQty']) * number(row['avgPrice'])), updated=bool(previous))
+                        if previous:
+                            # A reused identity with different immutable execution fields is ambiguous.
+                            # Stop copying and cancel pending tasks rather than treating it as an update.
+                            old = json.loads(previous['body'])
+                            if kind == 'order' and any(str(old.get(field)) != str(row.get(field)) for field in ('executedQty','avgPrice')):
+                                sessions = db.execute('SELECT account_id,target_id FROM copy_live WHERE target_id=? AND enabled=1', (pid,)).fetchall()
+                                for session in sessions:
+                                    db.execute('UPDATE copy_live SET enabled=0 WHERE account_id=? AND target_id=?', (session['account_id'],pid))
+                                    db.execute('UPDATE virtual_sessions SET active=0 WHERE account_id=? AND target_id=?', (session['account_id'],pid))
+                                    db.execute("UPDATE copy_tasks SET state='cancelled',error='订单标识冲突' WHERE account_id=? AND target_id=? AND state='pending'", (session['account_id'],pid))
+                                    self.copy_notice(db, {'target_id':pid}, '%s 订单标识冲突，已关闭跟单，请核对记录' % row['symbol'])
+                            # Refresh the original display row; never enqueue an update as a new order.
+                            candidates = db.execute('SELECT id,body FROM events WHERE target=? AND kind=? AND stamp=?', (pid, kind, stamp)).fetchall()
+                            for event in candidates:
+                                if identity(kind, json.loads(event['body'])) == key:
+                                    db.execute('UPDATE events SET body=? WHERE id=?', (dumps(body), event['id']))
+                            continue
+                        historical = first or (baseline is not None and stamp <= baseline['stamp'])
+                        self.store.event(db, pid, detail['nickname'], kind, body, stamp, historical, settings)
+                        if kind == 'order' and not historical:
+                            self.virtual_apply(db, pid, key, row, detail['marginBalance'])
+                    if first and rows:
+                        db.execute('INSERT OR REPLACE INTO baseline_watermarks VALUES(?,?,?)', (pid,kind,max(int(r[time_key]) for r in rows)))
+                balance = decimal_text(detail['marginBalance'])
+                db.execute('UPDATE targets SET name=?,detail=?,balance=?,initialized=1,last_check=?,next_check=?,failures=0,error=\'\' WHERE id=?',
+                           (detail['nickname'], dumps(detail), balance, time.time(), time.time() + settings['interval'], pid))
+        except Exception as exc:
+            message = str(exc) if isinstance(exc, (UpstreamError, ValueError, InvalidOperation)) else '同步失败，保留原同步位置'
             with self.store.db() as db:
-                target = db.execute('SELECT * FROM targets WHERE id=?', (pid,)).fetchone()
-            if not target or not target['enabled']:
-                return
-            try:
-                detail = self.api.detail(pid)
-                histories = {kind: self.collect(pid, kind, target['initialized']) for kind in ('order', 'transfer')}
-                with self.store.db() as db:
-                    settings = self.store.settings(db)
-                    first = not target['initialized']
-                    for kind, rows in histories.items():
-                        time_key = 'orderTime' if kind == 'order' else 'time'
-                        watermark = db.execute('SELECT MAX(stamp) FROM records WHERE target=? AND kind=?', (pid, kind)).fetchone()[0]
-                        for row in sorted(rows, key=lambda r: int(r[time_key])):
-                            key, stamp = identity(kind, row), int(row[time_key])
-                            previous = db.execute('SELECT body FROM records WHERE target=? AND kind=? AND key=?', (pid, kind, key)).fetchone()
-                            if previous and json.loads(previous[0]) == row:
-                                continue
-                            db.execute('INSERT OR REPLACE INTO records VALUES(?,?,?,?,?)', (pid, kind, key, dumps(row), stamp))
-                            body = dict(row)
-                            if kind == 'order':
-                                body.update(direction=direction(row), notional=decimal_text(number(row['executedQty']) * number(row['avgPrice'])), updated=bool(previous))
-                            if previous:
-                                # A reused identity with different immutable execution fields is ambiguous.
-                                # Stop copying and cancel pending tasks rather than treating it as an update.
-                                old = json.loads(previous['body'])
-                                if kind == 'order' and any(str(old.get(field)) != str(row.get(field)) for field in ('executedQty','avgPrice')):
-                                    sessions = db.execute('SELECT account_id,target_id FROM copy_live WHERE target_id=? AND enabled=1', (pid,)).fetchall()
-                                    for session in sessions:
-                                        db.execute('UPDATE copy_live SET enabled=0 WHERE account_id=? AND target_id=?', (session['account_id'],pid))
-                                        db.execute('UPDATE virtual_sessions SET active=0 WHERE account_id=? AND target_id=?', (session['account_id'],pid))
-                                        db.execute("UPDATE copy_tasks SET state='cancelled',error='订单标识冲突' WHERE account_id=? AND target_id=? AND state='pending'", (session['account_id'],pid))
-                                        self.copy_notice(db, {'target_id':pid}, '%s 订单标识冲突，已关闭跟单，请核对记录' % row['symbol'])
-                                # Refresh the original display row; never enqueue an update as a new order.
-                                candidates = db.execute('SELECT id,body FROM events WHERE target=? AND kind=? AND stamp=?', (pid, kind, stamp)).fetchall()
-                                for event in candidates:
-                                    if identity(kind, json.loads(event['body'])) == key:
-                                        db.execute('UPDATE events SET body=? WHERE id=?', (dumps(body), event['id']))
-                                continue
-                            historical = first or (watermark is not None and stamp < watermark)
-                            self.store.event(db, pid, detail['nickname'], kind, body, stamp, historical, settings)
-                            if kind == 'order' and not historical:
-                                self.virtual_apply(db, pid, key, row, detail['marginBalance'])
-                    balance = decimal_text(detail['marginBalance'])
-                    db.execute('UPDATE targets SET name=?,detail=?,balance=?,initialized=1,last_check=?,next_check=?,failures=0,error=\'\' WHERE id=?',
-                               (detail['nickname'], dumps(detail), balance, time.time(), time.time() + settings['interval'], pid))
-            except Exception as exc:
-                message = str(exc) if isinstance(exc, (UpstreamError, ValueError, InvalidOperation)) else '同步失败，保留原同步位置'
-                with self.store.db() as db:
-                    failures = target['failures'] + 1
-                    delay = min(3600, self.store.settings(db)['interval'] * 2 ** min(failures, 6))
-                    db.execute('UPDATE targets SET error=?,failures=?,next_check=? WHERE id=?', (message[:300], failures, time.time() + delay, pid))
-                LOG.warning('portfolio %s: %s', pid, message)
+                failures = target['failures'] + 1
+                delay = min(3600, self.store.settings(db)['interval'] * 2 ** min(failures, 6))
+                db.execute('UPDATE targets SET error=?,failures=?,next_check=? WHERE id=?', (message[:300], failures, time.time() + delay, pid))
+            LOG.warning('portfolio %s: %s', pid, message)
 
     @staticmethod
     def message(event):
@@ -500,28 +519,27 @@ class Monitor:
         return title, text
 
     def deliver(self):
-        with self.lock:
-            settings = self.store.settings()
-            with self.store.db() as db:
-                tasks = db.execute("SELECT o.id AS task_id,o.channel,o.attempts,e.* FROM outbox o JOIN events e ON e.id=o.event WHERE o.status='pending' AND e.kind != 'balance' AND o.next_try<=? ORDER BY o.id LIMIT 10", (time.time(),)).fetchall()
-            for task in tasks:
-                channel = task['channel']
-                if not settings[channel + '_enabled']:
-                    with self.store.db() as db:
-                        db.execute("UPDATE outbox SET status='cancelled' WHERE id=?", (task['task_id'],))
-                    continue
-                title, message = self.message(task)
-                try:
-                    send_notification(channel, settings, title, message)
-                    with self.store.db() as db:
-                        db.execute("UPDATE outbox SET status='sent',error='' WHERE id=?", (task['task_id'],))
-                except Exception as exc:
-                    attempts = task['attempts'] + 1
-                    reason = notification_error(exc)
-                    LOG.warning('notification channel=%s event=%s attempt=%s: %s', channel, task['id'], attempts, reason)
-                    with self.store.db() as db:
-                        db.execute('UPDATE outbox SET attempts=?,next_try=?,error=? WHERE id=?',
-                                   (attempts, time.time() + min(3600, 10 * 2 ** min(attempts, 8)), reason, task['task_id']))
+        settings = self.store.settings()
+        with self.store.db() as db:
+            tasks = db.execute("SELECT o.id AS task_id,o.channel,o.attempts,e.* FROM outbox o JOIN events e ON e.id=o.event WHERE o.status='pending' AND e.kind != 'balance' AND o.next_try<=? ORDER BY o.id LIMIT 10", (time.time(),)).fetchall()
+        for task in tasks:
+            channel = task['channel']
+            if not settings[channel + '_enabled']:
+                with self.store.db() as db:
+                    db.execute("UPDATE outbox SET status='cancelled' WHERE id=?", (task['task_id'],))
+                continue
+            title, message = self.message(task)
+            try:
+                send_notification(channel, settings, title, message)
+                with self.store.db() as db:
+                    db.execute("UPDATE outbox SET status='sent',error='' WHERE id=?", (task['task_id'],))
+            except Exception as exc:
+                attempts = task['attempts'] + 1
+                reason = notification_error(exc)
+                LOG.warning('notification channel=%s event=%s attempt=%s: %s', channel, task['id'], attempts, reason)
+                with self.store.db() as db:
+                    db.execute('UPDATE outbox SET attempts=?,next_try=?,error=? WHERE id=?',
+                               (attempts, time.time() + min(3600, 10 * 2 ** min(attempts, 8)), reason, task['task_id']))
 
     def copy_notice(self, db, task, message):
         name = db.execute('SELECT name FROM targets WHERE id=?', (task['target_id'],)).fetchone()
@@ -542,7 +560,6 @@ class Monitor:
                     balance_time=int(time.time()*1000)
                     if not isinstance(balances,list): raise ValueError('账户余额响应格式错误')
                     usdt=next((asset for asset in balances if asset.get('asset')=='USDT'),None)
-                    quote=client.quote(row['symbol'])
                     mark_price = leverage = None
                     if task['action'] == 'open':
                         mark = client.mark_price(row['symbol'])
@@ -552,7 +569,16 @@ class Monitor:
                         config = next((c for c in configs if isinstance(c,dict) and c.get('symbol') == row['symbol']), None)
                         if not config: raise ValueError('未获取到交易对杠杆配置')
                         mark_price, leverage = mark.get('markPrice'), config.get('leverage')
-                    params=plan(row,task['action'],task['before_qty'],old['quantity'] if old else '0',task['lead_balance'],balances,client.positions(),client.mode(),quote,client.rules(),mark_price=mark_price,leverage=leverage)
+                    positions, mode, rules = client.positions(), client.mode(), client.rules()
+                    if task['action'] == 'close':
+                        from market_guard import close_position
+                        with self.store.db() as db:
+                            amounts = db.execute('SELECT quantity FROM copied_positions WHERE account_id=? AND symbol=? AND position_side=?', (task['account_id'],row['symbol'],row['positionSide'])).fetchall()
+                        total = sum((Fraction(number(x['quantity'])) for x in amounts), Fraction(0))
+                        if total > Fraction(close_position(positions,row['symbol'],row['positionSide'])):
+                            raise ValueError('跟单持仓记录超过账户实际持仓，请先核对')
+                    quote=client.quote(row['symbol'])
+                    params=plan(row,task['action'],task['before_qty'],old['quantity'] if old else '0',task['lead_balance'],balances,positions,mode,quote,rules,mark_price=mark_price,leverage=leverage)
                     price=quote['askPrice'] if row['side']=='BUY' else quote['bidPrice']
                 except (ValueError,ExchangeError,KeyError,InvalidOperation) as exc:
                     LOG.warning('跟单预检查失败 account=%s symbol=%s: %s', task['account_id'], row.get('symbol',''), str(exc)[:200])
@@ -564,10 +590,17 @@ class Monitor:
                 # Persist intent before touching the exchange, so process crashes cannot duplicate a POST.
                 with self.store.db() as db:
                     db.execute('INSERT OR REPLACE INTO copy_task_audit(task_id,balance_time,asset,wallet_balance,available_balance,lead_balance,reference_price,planned_quantity) VALUES(?,?,?,?,?,?,?,?)', (task['id'],balance_time,'USDT',str(usdt['balance']) if usdt and 'balance' in usdt else None,str(usdt['availableBalance']) if usdt and 'availableBalance' in usdt else None,task['lead_balance'],str(price),params['quantity']))
-                    db.execute("UPDATE copy_tasks SET state='submitted',quantity=? WHERE id=? AND state='pending'",(params['quantity'],task['id']))
+                    changed = db.execute("UPDATE copy_tasks SET state='submitted',quantity=? WHERE id=? AND state='pending' AND EXISTS (SELECT 1 FROM copy_live l JOIN copy_bindings b ON b.account_id=l.account_id AND b.target_id=l.target_id JOIN targets t ON t.id=l.target_id WHERE l.account_id=copy_tasks.account_id AND l.target_id=copy_tasks.target_id AND l.enabled=1 AND t.enabled=1)",(params['quantity'],task['id'])).rowcount
+                    if not changed:
+                        return
                 try: result=client.place(params)
                 except ExchangeError as exc:
                     reason=str(exc)[:200]
+                    if exc.definitively_rejected:
+                        with self.store.db() as db:
+                            db.execute("UPDATE copy_tasks SET state='skipped',error=? WHERE id=? AND state='submitted'", (reason,task['id']))
+                            self.copy_notice(db,task,'%s 跟单被交易所拒绝：%s' % (row['symbol'],reason))
+                        return
                     LOG.warning('跟单提交结果未知 account=%s symbol=%s: %s', task['account_id'], row['symbol'], reason)
                     with self.store.db() as db:
                         db.execute("UPDATE copy_tasks SET error=?,next_check=strftime('%s','now')+15 WHERE id=?",('下单结果未知，等待查询确认：'+reason,task['id']))
@@ -654,6 +687,7 @@ class Monitor:
                 db.execute('DELETE FROM margin_alert_state WHERE account_id=? AND risk_key=?', (account['id'], old_key))
 
     def margin_monitor(self):
+        errors = {}
         while not self.stop.is_set():
             with self.store.db() as db:
                 accounts = [dict(row) for row in db.execute('SELECT id,name,api_key,api_secret FROM futures_accounts')]
@@ -662,23 +696,40 @@ class Monitor:
                     return
                 try:
                     self.check_margin(account)
+                    errors.pop(account['id'], None)
                 except Exception as exc:
                     LOG.warning('账户 %s 保证金风险检查失败：%s', account['id'], str(exc)[:200])
+                    reason = str(exc)[:200] if isinstance(exc, (ValueError, UpstreamError)) else '账户响应异常'
+                    if errors.get(account['id']) != reason:
+                        with self.store.db() as db:
+                            self.store.event(db, 'margin:%s' % account['id'], account['name'], 'margin', {'message': '保证金风险检查失败：%s，请检查账户及服务日志' % reason}, int(time.time()*1000), False, self.store.settings(db))
+                        errors[account['id']] = reason
             self.stop.wait(30)
 
     def run(self):
+        def copies():
+            while not self.stop.is_set():
+                try:
+                    self.execute_copy()
+                except Exception:
+                    LOG.exception('跟单任务处理异常，保留当前状态')
+                self.stop.wait(1)
+
+        def notifications():
+            while not self.stop.is_set():
+                try:
+                    self.deliver()
+                except Exception:
+                    LOG.exception('通知任务处理异常')
+                self.stop.wait(1)
+
+        threading.Thread(target=copies, daemon=True).start()
+        threading.Thread(target=notifications, daemon=True).start()
         while not self.stop.is_set():
             with self.store.db() as db:
                 ids = [r[0] for r in db.execute('SELECT id FROM targets WHERE enabled=1 AND next_check<=? ORDER BY next_check', (time.time(),))]
-            for pid in ids:
-                if self.stop.is_set():
-                    break
-                self.poll(pid)
-            self.deliver()
-            try:
-                self.execute_copy()
-            except Exception:
-                LOG.exception('跟单任务处理异常，保留当前状态')
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                list(pool.map(self.poll, ids))
             self.stop.wait(1)
 
 
@@ -907,7 +958,7 @@ def handler_factory(store, monitor, token):
                     account_id, target_id, selected = data.get('account_id'), str(data.get('target_id', '')), data.get('selected')
                     if not isinstance(account_id, int) or not isinstance(selected, bool):
                         raise ValueError('关联参数错误')
-                    with store.db() as db:
+                    with monitor.lock, store.db() as db:
                         if not db.execute('SELECT 1 FROM futures_accounts WHERE id=?', (account_id,)).fetchone() or not db.execute('SELECT 1 FROM targets WHERE id=?', (target_id,)).fetchone():
                             raise ValueError('账号或带单员不存在')
                         if selected:

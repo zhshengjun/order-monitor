@@ -1,6 +1,7 @@
 import copy
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -70,7 +71,7 @@ class MonitorTests(unittest.TestCase):
         self.api.calls.clear()
         self.api.orders.insert(0, order(3001))
         self.monitor.poll(PID)
-        self.assertEqual(self.api.calls, [('order', 1), ('transfer', 1)])
+        self.assertEqual(self.api.calls, [('order', 1), ('order', 2), ('transfer', 1)])
         self.assertEqual(len([r for r in self.rows('events') if not r['historical']]), 1)
 
     def test_restart_deduplicates(self):
@@ -78,6 +79,33 @@ class MonitorTests(unittest.TestCase):
         Monitor(Store(self.store.path), self.api).poll(PID)
         self.assertEqual(len(self.rows('events')), 1)
         self.assertEqual(self.rows('outbox'), [])
+
+    def test_late_record_after_baseline_is_new_and_deduplicated(self):
+        self.baseline()
+        self.api.orders.insert(0, order(102)); self.monitor.poll(PID)
+        self.api.orders.insert(1, order(101)); self.monitor.poll(PID); self.monitor.poll(PID)
+        events = {r['stamp']:r for r in self.rows('events')}
+        self.assertEqual(events[101]['historical'], 0)
+        self.assertEqual(len(self.rows('outbox')), 4)
+
+    def test_slow_poll_does_not_block_copy_worker(self):
+        entered, release, copied = threading.Event(), threading.Event(), threading.Event()
+        def slow_poll(_pid):
+            entered.set()
+            release.wait(3)
+        def execute():
+            if entered.wait(2): copied.set()
+        with patch.object(self.monitor, 'poll', side_effect=slow_poll), \
+             patch.object(self.monitor, 'execute_copy', side_effect=execute), \
+             patch.object(self.monitor, 'deliver'):
+            worker = threading.Thread(target=self.monitor.run)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                self.assertTrue(copied.wait(2))
+            finally:
+                self.monitor.stop.set(); release.set(); worker.join(3)
+        self.assertFalse(worker.is_alive())
 
     def test_new_order_only_once_and_both_channels(self):
         self.baseline()

@@ -28,6 +28,7 @@ class CopyExecutionTests(unittest.TestCase):
         self.tmp=tempfile.TemporaryDirectory(); self.store=Store(Path(self.tmp.name)/'db'); self.api=FakeAPI();self.monitor=Monitor(self.store,self.api);self.monitor.add(PID);self.monitor.poll(PID);FakeExchange.calls=[]
         with self.store.db() as db:
             db.execute('INSERT INTO futures_accounts VALUES(1,?,?,?)',('test','key','secret'))
+            db.execute('INSERT INTO copy_bindings VALUES(?,?)',(1,PID))
             db.execute('INSERT INTO virtual_sessions VALUES(?,?,?,1)',(1,PID,100))
             db.execute('INSERT INTO copy_live VALUES(?,?,1,?)',(1,PID,100))
     def tearDown(self): self.tmp.cleanup()
@@ -82,6 +83,51 @@ class CopyExecutionTests(unittest.TestCase):
             self.monitor.execute_copy()
         self.assertEqual([x[0] for x in FakeExchange.calls],['query'])
         self.assertEqual(self.rows('SELECT * FROM copy_tasks')[0]['state'],'filled')
+
+    def test_definitive_rejection_does_not_block_account(self):
+        row=order(101,'1'); row['avgPrice']='100'; self.api.orders.insert(0,row); self.monitor.poll(PID)
+        with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'place',side_effect=ExchangeError('insufficient margin',400,-2019)):
+            self.monitor.execute_copy()
+        self.assertEqual(self.rows('SELECT state FROM copy_tasks')[0]['state'],'skipped')
+
+    def test_cancelled_task_is_not_submitted(self):
+        row=order(101,'1'); row['avgPrice']='100'; self.api.orders.insert(0,row); self.monitor.poll(PID)
+        def cancel(_symbol):
+            with self.store.db() as db:
+                db.execute("UPDATE copy_tasks SET state='cancelled' WHERE state='pending'")
+            return QUOTE
+        with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'quote',side_effect=cancel):
+            self.monitor.execute_copy()
+        self.assertEqual(FakeExchange.calls,[])
+        self.assertEqual(self.rows('SELECT state FROM copy_tasks')[0]['state'],'cancelled')
+
+    def test_price_is_fetched_after_rules(self):
+        row=order(101,'1'); row['avgPrice']='100'; self.api.orders.insert(0,row); self.monitor.poll(PID)
+        calls=[]
+        def rules(): calls.append('rules'); return RULES
+        def quote(_): calls.append('quote'); return {'bidPrice':'119.9','askPrice':'120'}
+        with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'rules',side_effect=rules), patch.object(FakeExchange,'quote',side_effect=quote):
+            self.monitor.execute_copy()
+        self.assertEqual(calls,['rules','quote'])
+        self.assertEqual(FakeExchange.calls,[])
+        self.assertIn('3%',self.rows('SELECT error FROM copy_tasks')[0]['error'])
+
+    def test_attributed_position_exceeding_actual_is_not_closed(self):
+        row=order(101,'1'); row['avgPrice']='100'; self.api.orders.insert(0,row); self.monitor.poll(PID)
+        with self.store.db() as db:
+            db.execute('INSERT INTO copied_positions VALUES(?,?,?,?,?)',(1,PID,'BTCUSDT','LONG','2'))
+            db.execute("UPDATE copy_tasks SET action='close',before_qty='2'")
+        with patch('app.FuturesClient',FakeExchange): self.monitor.execute_copy()
+        self.assertEqual(FakeExchange.calls,[])
+        self.assertIn('超过账户实际持仓',self.rows('SELECT error FROM copy_tasks')[0]['error'])
+
+    def test_late_same_symbol_signal_is_not_applied_out_of_order(self):
+        newer=order(102,'1'); newer['avgPrice']='100'; self.api.orders.insert(0,newer); self.monitor.poll(PID)
+        late=order(101,'1'); late['avgPrice']='100'; self.api.orders.insert(1,late); self.monitor.poll(PID)
+        self.assertEqual(len(self.rows('SELECT * FROM copy_tasks')),1)
+        self.assertEqual(self.rows('SELECT state FROM copy_tasks')[0]['state'],'cancelled')
+        self.assertEqual(self.rows('SELECT enabled FROM copy_live')[0]['enabled'],0)
+        self.assertIn('延迟到达',self.rows("SELECT body FROM events WHERE kind='copy'")[0]['body'])
     def test_http_451_precheck_reports_failed_interface_without_placing(self):
         row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
         reason='HTTP 451; code 0; 接口 /fapi/v3/balance；请检查容器代理与合约 API 出口'
@@ -206,6 +252,17 @@ class CopyExecutionTests(unittest.TestCase):
         self.assertEqual(FakeExchange.calls,[])
 
 class FuturesTransportTests(unittest.TestCase):
+    def test_exchange_rules_cache_expires(self):
+        from copy_executor import FuturesClient
+        client=FuturesClient('key','secret')
+        with patch.object(FuturesClient,'_rules_value',None), patch.object(FuturesClient,'_rules_until',0), \
+             patch('copy_executor.time.monotonic',side_effect=[1,1,2,302,302]), \
+             patch.object(client,'request',side_effect=[RULES,RULES]) as request:
+            self.assertEqual(client.rules(),RULES)
+            self.assertEqual(client.rules(),RULES)
+            self.assertEqual(client.rules(),RULES)
+            self.assertEqual(request.call_count,2)
+
     def test_http_451_identifies_endpoint_without_response_body(self):
         import io, urllib.error
         from copy_executor import FuturesClient

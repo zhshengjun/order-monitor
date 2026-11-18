@@ -59,3 +59,14 @@ class MarginAlertTests(unittest.TestCase):
         self.info['multiAssetsMargin'] = True
         with self.assertRaisesRegex(ValueError, '多资产'): self.check()
         self.assertEqual(self.rows('SELECT * FROM events'), [])
+
+    def test_monitor_notifies_when_risk_check_fails(self):
+        with self.store.db() as db:
+            db.execute('INSERT INTO futures_accounts VALUES(?,?,?,?)', (1,'测试账户','key','secret'))
+        with patch.object(self.monitor, 'check_margin', side_effect=ValueError('暂不支持多资产模式')), \
+             patch.object(self.monitor.stop, 'wait', side_effect=lambda _: self.monitor.stop.set()):
+            self.monitor.margin_monitor()
+        events = self.rows("SELECT * FROM events WHERE kind='margin'")
+        self.assertEqual(len(events), 1)
+        self.assertIn('保证金风险检查失败', events[0]['body'])
+        self.assertEqual(len(self.rows('SELECT * FROM outbox')), 2)
