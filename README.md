@@ -136,6 +136,8 @@ node --check static/app.js
 
 使用 `docker compose logs --tail=100 order-monitor` 查看脱敏日志。日志区分 DNS、TLS、超时、HTTP 状态和 JSON 格式错误；不记录代理地址、凭证、请求头或响应正文。`docker compose logs -f order-monitor` 可实时查看。容器内代理地址应使用容器可访问的地址，不能直接使用宿主机的 `127.0.0.1`。
 
+跟单排查可搜索 `copy switch`、`copy decision`、`copy task` 和 `copy result`。其中 `disabled` 表示关联的自动跟单开关未开启，`before_start` 表示成交时间早于启用时间，`queued` 表示已创建跟单任务；预检查或下单失败会记录原因。日志不记录 API 密钥。
+
 ## 自动跟单
 
 在“带单员与账户”页面保存合约 API 账号、关联带单员并点击“开启跟单”，无需等待首次历史同步；只处理本次开启后的新成交。重新开启会保留已有的跟单持仓和虚拟持仓。关闭跟单会取消未执行任务；已发送但结果未知的订单仍会查询状态。

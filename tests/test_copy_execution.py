@@ -79,6 +79,32 @@ class CopyExecutionTests(unittest.TestCase):
         self.assertEqual(len(tasks),25)
         self.assertEqual(min(json.loads(x['body'])['orderTime'] for x in tasks),101)
         self.assertIn(('order',2),self.api.calls)
+
+    def test_enabled_copy_repairs_inactive_session_and_queues_order(self):
+        with self.store.db() as db: db.execute('UPDATE virtual_sessions SET active=0 WHERE account_id=1 AND target_id=?',(PID,))
+        row=order(101,'5.46');row.update(symbol='ZECUSDT',side='SELL',positionSide='SHORT',avgPrice='952.20873')
+        self.api.orders.insert(0,row)
+        with self.assertLogs('monitor',level='INFO') as captured: self.monitor.poll(PID)
+        self.assertEqual(self.rows('SELECT active FROM virtual_sessions')[0]['active'],1)
+        self.assertEqual(self.rows('SELECT state FROM copy_tasks')[0]['state'],'pending')
+        self.assertTrue(any('copy state repaired' in line for line in captured.output))
+        self.assertTrue(any('result=queued' in line for line in captured.output))
+
+    def test_copy_switch_survives_store_restart(self):
+        monitor=Monitor(Store(self.store.path),self.api)
+        row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row)
+        with self.assertLogs('monitor',level='INFO') as captured: monitor.poll(PID)
+        self.assertEqual(self.rows('SELECT state FROM copy_tasks')[0]['state'],'pending')
+        self.assertTrue(any('result=queued' in line for line in captured.output))
+
+    def test_missing_binding_marks_task_skipped_and_reports_reason(self):
+        row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
+        with self.store.db() as db: db.execute('DELETE FROM copy_bindings WHERE account_id=1 AND target_id=?',(PID,))
+        with patch('app.FuturesClient',FakeExchange): self.monitor.execute_copy()
+        task=self.rows('SELECT state,error FROM copy_tasks')[0]
+        self.assertEqual(task['state'],'skipped')
+        self.assertIn('关联或开关状态不一致',task['error'])
+        self.assertEqual(FakeExchange.calls,[])
     def test_notification_uses_actual_exchange_notional(self):
         import json
         row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)

@@ -495,6 +495,7 @@ class Monitor:
         with self.lock, self.store.db() as db:
             if not db.execute('UPDATE targets SET enabled=?,next_check=0 WHERE id=?', (int(enabled), pid)).rowcount:
                 raise ValueError('监听对象不存在')
+            LOG.info('monitor switch target=%s enabled=%s',pid,enabled)
             if not enabled:
                 db.execute("UPDATE outbox SET status='cancelled' WHERE status='pending' AND event IN (SELECT id FROM events WHERE target=?)", (pid,))
                 db.execute("UPDATE copy_tasks SET state='cancelled',error='监听已关闭' WHERE target_id=? AND state='pending'",(pid,))
@@ -526,10 +527,22 @@ class Monitor:
         raise UpstreamError('新增记录超过 %s 条，未推进同步位置；可增加每页数量后重试' % (50 * page_size))
 
     def virtual_apply(self, db, pid, key, row, lead_balance):
+        states = db.execute('SELECT b.account_id,COALESCE(l.enabled,0) AS enabled,l.started_at AS live_start,v.active,v.started_at AS session_start FROM copy_bindings b LEFT JOIN copy_live l ON l.account_id=b.account_id AND l.target_id=b.target_id LEFT JOIN virtual_sessions v ON v.account_id=b.account_id AND v.target_id=b.target_id WHERE b.target_id=?',(pid,)).fetchall()
+        for state in states:
+            aid=state['account_id']
+            if not state['enabled']:
+                LOG.info('copy decision target=%s account=%s symbol=%s order_time=%s result=disabled',pid,aid,row['symbol'],row['orderTime'])
+                continue
+            if state['active'] != 1:
+                start=max(state['live_start'] or 0,state['session_start'] or 0)
+                db.execute('INSERT INTO virtual_sessions(account_id,target_id,started_at,active) VALUES(?,?,?,1) ON CONFLICT(account_id,target_id) DO UPDATE SET active=1,started_at=excluded.started_at',(aid,pid,start))
+                LOG.warning('copy state repaired target=%s account=%s reason=inactive_or_missing_session',pid,aid)
+                self.copy_notice(db,{'target_id':pid},'账户 %s 的跟单状态不一致，已修复并检查 %s 订单' % (aid,row['symbol']))
         sessions = db.execute('SELECT account_id,started_at FROM virtual_sessions WHERE target_id=? AND active=1', (pid,)).fetchall()
         for session in sessions:
             aid, started = session['account_id'], session['started_at']
             if int(row['orderTime']) <= started:
+                LOG.info('copy decision target=%s account=%s symbol=%s order_time=%s result=before_start',pid,aid,row['symbol'],row['orderTime'])
                 continue
             if db.execute('SELECT 1 FROM virtual_events WHERE account_id=? AND target_id=? AND order_key=?', (aid, pid, key)).fetchone():
                 continue
@@ -546,12 +559,14 @@ class Monitor:
             db.execute('INSERT INTO virtual_events VALUES(?,?,?,?,?,?,?,?,?,?)', (aid, pid, key, symbol, side, int(row['orderTime']), change['action'], str(row['executedQty']), change['before'], change['after']))
             live=db.execute('SELECT enabled,started_at FROM copy_live WHERE account_id=? AND target_id=?', (aid,pid)).fetchone()
             if not live or not live['enabled'] or int(row['orderTime']) <= live['started_at']:
+                LOG.info('copy decision target=%s account=%s symbol=%s order_time=%s result=copy_disabled_or_before_start',pid,aid,row['symbol'],row['orderTime'])
                 if change['action'] != 'unmatched_close':
                     db.execute('INSERT OR REPLACE INTO virtual_positions VALUES(?,?,?,?,?)',(aid,pid,symbol,side,change['after']))
                 continue
             client_id = 'cp_' + hashlib.sha256((str(aid)+':'+pid+':'+key).encode()).hexdigest()[:30]
-            db.execute('INSERT OR IGNORE INTO copy_tasks(account_id,target_id,order_key,body,action,before_qty,lead_balance,client_id,created) VALUES(?,?,?,?,?,?,?,?,?)',
+            created = db.execute('INSERT OR IGNORE INTO copy_tasks(account_id,target_id,order_key,body,action,before_qty,lead_balance,client_id,created) VALUES(?,?,?,?,?,?,?,?,?)',
                        (aid,pid,key,dumps(row),change['action'],change['before'],str(lead_balance),client_id,int(time.time()*1000)))
+            LOG.info('copy decision target=%s account=%s symbol=%s order_time=%s action=%s result=%s',pid,aid,symbol,row['orderTime'],change['action'],'queued' if created.rowcount else 'existing_task')
             if change['action'] != 'unmatched_close':
                 db.execute('INSERT OR REPLACE INTO virtual_positions VALUES(?,?,?,?,?)', (aid,pid,symbol,side,change['after']))
 
@@ -560,6 +575,7 @@ class Monitor:
             target = db.execute('SELECT * FROM targets WHERE id=?', (pid,)).fetchone()
         if not target or not target['enabled']:
             return
+        LOG.info('poll start target=%s initialized=%s',pid,target['initialized'])
         try:
             detail = self.api.detail(pid)
             histories = {kind: self.collect(pid, kind, target['initialized']) for kind in ('order', 'transfer')}
@@ -617,6 +633,7 @@ class Monitor:
                 balance = decimal_text(detail['marginBalance'])
                 db.execute('UPDATE targets SET name=?,detail=?,balance=?,initialized=1,last_check=?,next_check=?,failures=0,error=\'\' WHERE id=?',
                            (detail['nickname'], dumps(detail), balance, time.time(), time.time() + settings['interval'], pid))
+            LOG.info('poll complete target=%s orders=%s transfers=%s',pid,len(histories['order']),len(histories['transfer']))
         except Exception as exc:
             message = str(exc) if isinstance(exc, (UpstreamError, ValueError, InvalidOperation)) else '同步失败，保留原同步位置'
             with self.store.db() as db:
@@ -679,6 +696,7 @@ class Monitor:
                 task=db.execute("SELECT c.*,a.api_key,a.api_secret FROM copy_tasks c JOIN futures_accounts a ON a.id=c.account_id JOIN virtual_sessions s ON s.account_id=c.account_id AND s.target_id=c.target_id JOIN targets t ON t.id=c.target_id WHERE (c.state='submitted' AND c.next_check<=strftime('%s','now')) OR (c.state='pending' AND c.next_check<=strftime('%s','now') AND s.active=1 AND t.enabled=1 AND NOT EXISTS (SELECT 1 FROM copy_tasks u WHERE u.account_id=c.account_id AND (u.state='submitted' OR (u.state='pending' AND u.id<c.id)))) ORDER BY CASE WHEN c.state='submitted' THEN 0 ELSE 1 END,c.id LIMIT 1").fetchone()
             if not task: return
             client=FuturesClient(task['api_key'],task['api_secret']); row=json.loads(task['body'])
+            LOG.info('copy task id=%s account=%s target=%s symbol=%s action=%s state=%s retries=%s',task['id'],task['account_id'],task['target_id'],row.get('symbol'),task['action'],task['state'],task['retry_count'])
             if task['state']=='pending':
                 if task['action']=='open' and task['retry_count']:
                     with self.store.db() as db:
@@ -762,6 +780,12 @@ class Monitor:
                     db.execute('INSERT OR REPLACE INTO copy_task_audit(task_id,balance_time,asset,wallet_balance,available_balance,lead_balance,reference_price,planned_quantity) VALUES(?,?,?,?,?,?,?,?)', (task['id'],balance_time,'USDT',str(usdt['balance']) if usdt and 'balance' in usdt else None,str(usdt['availableBalance']) if usdt and 'availableBalance' in usdt else None,task['lead_balance'],str(price),params['quantity']))
                     changed = db.execute("UPDATE copy_tasks SET state='submitted',quantity=? WHERE id=? AND state='pending' AND EXISTS (SELECT 1 FROM copy_live l JOIN copy_bindings b ON b.account_id=l.account_id AND b.target_id=l.target_id JOIN targets t ON t.id=l.target_id WHERE l.account_id=copy_tasks.account_id AND l.target_id=copy_tasks.target_id AND l.enabled=1 AND t.enabled=1)",(params['quantity'],task['id'])).rowcount
                     if not changed:
+                        still_pending = db.execute("SELECT 1 FROM copy_tasks WHERE id=? AND state='pending'",(task['id'],)).fetchone()
+                        if still_pending:
+                            reason='跟单关联或开关状态不一致，未提交订单'
+                            db.execute("UPDATE copy_tasks SET state='skipped',error=? WHERE id=? AND state='pending'",(reason,task['id']))
+                            self.copy_notice(db,task,'%s 跟单跳过：%s' % (row['symbol'],reason))
+                            LOG.warning('copy task id=%s account=%s target=%s symbol=%s result=invalid_binding',task['id'],task['account_id'],task['target_id'],row['symbol'])
                         return
                 try: result=client.place(params)
                 except ExchangeError as exc:
@@ -804,6 +828,7 @@ class Monitor:
                 db.execute('INSERT OR REPLACE INTO copied_positions VALUES(?,?,?,?,?)',(task['account_id'],task['target_id'],row['symbol'],row['positionSide'],decimal_string(after)))
                 actual_notional = actual_copy_notional(result, executed)
                 db.execute("UPDATE copy_tasks SET state=?,result=?,error='' WHERE id=?",('filled' if status=='FILLED' else 'finished',dumps({'status':status,'executedQty':str(executed),'orderId':result.get('orderId'), 'cumQuote':actual_notional}),task['id']))
+                LOG.info('copy result task=%s account=%s symbol=%s status=%s executed_qty=%s',task['id'],task['account_id'],row['symbol'],status,executed)
                 self.copy_notice(db,task,'%s %s，状态 %s\n实际成交数量：%s %s\n跟单金额：%s %s' % (row['symbol'],direction(row),status,notification_number(executed),row.get('baseAsset',''),notification_number(actual_notional),row.get('quoteAsset','USDT')))
 
     def check_margin(self, account):
@@ -1227,6 +1252,7 @@ def handler_factory(store, monitor, token):
                             db.execute('UPDATE virtual_sessions SET active=0 WHERE account_id=? AND target_id=?', (account_id,target_id))
                             db.execute("UPDATE copy_tasks SET state='cancelled',error='跟单已关闭' WHERE account_id=? AND target_id=? AND state='pending'",(account_id,target_id))
                             db.execute('DELETE FROM copy_bindings WHERE account_id=? AND target_id=?', (account_id, target_id))
+                        LOG.info('copy binding account=%s target=%s selected=%s',account_id,target_id,selected)
                 elif self.path == '/api/virtual-session':
                     account_id, target_id, active = data.get('account_id'), str(data.get('target_id', '')), data.get('active')
                     if not isinstance(account_id, int) or not isinstance(active, bool):
@@ -1255,16 +1281,19 @@ def handler_factory(store, monitor, token):
                             if not binding['enabled']: raise ValueError('请先开启监听')
                             current_live=db.execute('SELECT enabled FROM copy_live WHERE account_id=? AND target_id=?',(account_id,target_id)).fetchone()
                             if current_live and current_live['enabled']:
+                                LOG.info('copy switch account=%s target=%s enabled=true unchanged=true',account_id,target_id)
                                 return self.reply({'ok': True})
                             if db.execute("SELECT 1 FROM copy_tasks WHERE account_id=? AND state='submitted'", (account_id,)).fetchone(): raise ValueError('该账号有结果未确认的订单，请先核对')
                             now=int(time.time()*1000)
                             db.execute('INSERT OR REPLACE INTO virtual_sessions VALUES(?,?,?,1)',(account_id,target_id,now))
                             db.execute('INSERT OR REPLACE INTO copy_live VALUES(?,?,1,?)',(account_id,target_id,now))
                             db.execute('UPDATE targets SET next_check=0 WHERE id=?',(target_id,))
+                            LOG.info('copy switch account=%s target=%s enabled=true started_at=%s',account_id,target_id,now)
                         else:
                             db.execute('UPDATE copy_live SET enabled=0 WHERE account_id=? AND target_id=?',(account_id,target_id))
                             db.execute('UPDATE virtual_sessions SET active=0 WHERE account_id=? AND target_id=?',(account_id,target_id))
                             db.execute("UPDATE copy_tasks SET state='cancelled',error='跟单已关闭' WHERE account_id=? AND target_id=? AND state='pending'",(account_id,target_id))
+                            LOG.info('copy switch account=%s target=%s enabled=false',account_id,target_id)
                 elif self.path == '/api/test-notification':
                     channel = data.get('channel')
                     if channel not in ('telegram', 'bark'):
