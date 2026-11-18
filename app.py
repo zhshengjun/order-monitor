@@ -19,6 +19,7 @@ from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from virtual_position import transition
+from leader_replay import replay
 from copy_executor import FuturesClient, ExchangeError, plan
 from fractions import Fraction
 
@@ -213,6 +214,13 @@ class Store:
               target TEXT NOT NULL, kind TEXT NOT NULL, key TEXT NOT NULL, body TEXT NOT NULL,
               stamp INTEGER NOT NULL, PRIMARY KEY(target,kind,key));
             CREATE INDEX IF NOT EXISTS records_target_time ON records(target,kind,stamp DESC);
+            CREATE TABLE IF NOT EXISTS leader_history (
+              target TEXT NOT NULL, key TEXT NOT NULL, stamp INTEGER NOT NULL, body TEXT NOT NULL,
+              PRIMARY KEY(target,key));
+            CREATE INDEX IF NOT EXISTS leader_history_time ON leader_history(target,stamp);
+            CREATE TABLE IF NOT EXISTS leader_history_sync (
+              target TEXT PRIMARY KEY, page INTEGER NOT NULL DEFAULT 1, complete INTEGER NOT NULL DEFAULT 0,
+              total INTEGER NOT NULL DEFAULT 0, next_check REAL NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '', updated REAL);
             CREATE TABLE IF NOT EXISTS baseline_watermarks (
               target TEXT NOT NULL, kind TEXT NOT NULL, stamp INTEGER NOT NULL,
               PRIMARY KEY(target,kind));
@@ -269,6 +277,7 @@ class Store:
             if 'retry_count' not in columns:
                 db.execute('ALTER TABLE copy_tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0')
             db.execute('INSERT OR IGNORE INTO settings VALUES(1,?)', (dumps(DEFAULTS),))
+            db.execute("INSERT OR IGNORE INTO leader_history SELECT target,key,stamp,body FROM records WHERE kind='order'")
             db.execute('INSERT OR IGNORE INTO baseline_watermarks SELECT r.target,r.kind,MAX(r.stamp) FROM records r JOIN targets t ON t.id=r.target WHERE t.initialized=1 GROUP BY r.target,r.kind')
         os.chmod(self.path, 0o600)
 
@@ -367,6 +376,7 @@ class Monitor:
     def __init__(self, store, api=None):
         self.store, self.api = store, api or Binance()
         self.lock = threading.RLock()
+        self.history_lock = threading.RLock()
         self.stop = threading.Event()
 
     def add(self, pid):
@@ -460,6 +470,8 @@ class Monitor:
                     baseline = db.execute('SELECT stamp FROM baseline_watermarks WHERE target=? AND kind=?', (pid,kind)).fetchone()
                     for row in sorted(rows, key=lambda r: int(r[time_key])):
                         key, stamp = identity(kind, row), int(row[time_key])
+                        if kind == 'order':
+                            db.execute('INSERT OR REPLACE INTO leader_history VALUES(?,?,?,?)', (pid,key,stamp,dumps(row)))
                         previous = db.execute('SELECT body FROM records WHERE target=? AND kind=? AND key=?', (pid, kind, key)).fetchone()
                         if previous and json.loads(previous[0]) == row:
                             continue
@@ -602,7 +614,20 @@ class Monitor:
                         if total > Fraction(close_position(positions,row['symbol'],row['positionSide'])):
                             raise ValueError('跟单持仓记录超过账户实际持仓，请先核对')
                     quote=client.quote(row['symbol'])
-                    params=plan(row,task['action'],task['before_qty'],old['quantity'] if old else '0',task['lead_balance'],balances,positions,mode,quote,rules,mark_price=mark_price,leverage=leverage)
+                    plan_action, before_qty, owned_qty = task['action'], task['before_qty'], old['quantity'] if old else '0'
+                    if plan_action in ('close','unmatched_close'):
+                        with self.store.db() as db:
+                            sync = db.execute('SELECT complete FROM leader_history_sync WHERE target=?',(task['target_id'],)).fetchone()
+                            earlier = [json.loads(x['body']) for x in db.execute('SELECT body FROM leader_history WHERE target=? AND stamp<? ORDER BY stamp,key',(task['target_id'],int(row['orderTime'])))] if sync and sync['complete'] else []
+                            same_time = db.execute('SELECT COUNT(*) FROM leader_history WHERE target=? AND stamp=?',(task['target_id'],int(row['orderTime']))).fetchone()[0]
+                        prior = next((p for p in replay(earlier) if p['symbol']==row['symbol'] and p['side']==row['positionSide']),None) if earlier and same_time==1 else None
+                        if prior and not prior['uncertain'] and number(prior['quantity'])>=number(row['executedQty']):
+                            from market_guard import close_position
+                            unmatched = plan_action == 'unmatched_close'
+                            plan_action, before_qty = 'close', prior['quantity']
+                            if unmatched:
+                                owned_qty = str(close_position(positions,row['symbol'],row['positionSide']))
+                    params=plan(row,plan_action,before_qty,owned_qty,task['lead_balance'],balances,positions,mode,quote,rules,mark_price=mark_price,leverage=leverage)
                     price=quote['askPrice'] if row['side']=='BUY' else quote['bidPrice']
                 except (ValueError,ExchangeError,KeyError,InvalidOperation) as exc:
                     LOG.warning('跟单预检查失败 account=%s symbol=%s: %s', task['account_id'], row.get('symbol',''), str(exc)[:200])
@@ -738,6 +763,44 @@ class Monitor:
                         errors[account['id']] = reason
             self.stop.wait(30)
 
+    def sync_history(self, pid):
+        with self.history_lock:
+            self._sync_history(pid)
+
+    def _sync_history(self, pid):
+        with self.store.db() as db:
+            db.execute('INSERT OR IGNORE INTO leader_history_sync(target) VALUES(?)',(pid,))
+            sync = db.execute('SELECT * FROM leader_history_sync WHERE target=?',(pid,)).fetchone()
+        if sync['next_check'] > time.time(): return
+        page = sync['page']
+        try:
+            data = self.api.history(pid,'order',page,20)
+            rows, total = data['list'], int(data['total'])
+            if total < 0: raise ValueError('历史总数无效')
+            with self.store.db() as db:
+                for row in rows:
+                    db.execute('INSERT OR REPLACE INTO leader_history VALUES(?,?,?,?)', (pid,identity('order',row),int(row['orderTime']),dumps(row)))
+                complete = not rows or page*20 >= total
+                db.execute('UPDATE leader_history_sync SET page=?,complete=?,total=?,next_check=?,error=?,updated=? WHERE target=?',
+                           (1 if complete else page+1,int(complete),total,time.time()+(3600 if complete else 1),'',time.time(),pid))
+        except Exception as exc:
+            reason = str(exc)[:200] if isinstance(exc,(UpstreamError,ValueError)) else '历史同步失败'
+            with self.store.db() as db:
+                db.execute('UPDATE leader_history_sync SET error=?,next_check=? WHERE target=?',(reason,time.time()+60,pid))
+            LOG.warning('portfolio %s history sync: %s',pid,reason)
+
+    def history_worker(self):
+        while not self.stop.is_set():
+            with self.store.db() as db:
+                ids = [r[0] for r in db.execute('SELECT id FROM targets WHERE enabled=1')]
+            for pid in ids:
+                if self.stop.is_set(): return
+                try:
+                    self.sync_history(pid)
+                except Exception:
+                    LOG.exception('portfolio %s history worker failed',pid)
+            self.stop.wait(1)
+
     def run(self):
         def copies():
             while not self.stop.is_set():
@@ -757,6 +820,7 @@ class Monitor:
 
         threading.Thread(target=copies, daemon=True).start()
         threading.Thread(target=notifications, daemon=True).start()
+        threading.Thread(target=self.history_worker, daemon=True).start()
         while not self.stop.is_set():
             with self.store.db() as db:
                 ids = [r[0] for r in db.execute('SELECT id FROM targets WHERE enabled=1 AND next_check<=? ORDER BY next_check', (time.time(),))]
@@ -905,6 +969,14 @@ def handler_factory(store, monitor, token):
                             leverage = {}
                     positions = [{**p, 'leverage': leverage.get(p.get('symbol'))} for p in positions]
                     return self.reply({'balances': balances, 'positions': positions, 'queried_at': int(time.time() * 1000)})
+                if parsed.path == '/api/leader-positions':
+                    pid = query.get('target', [''])[0]
+                    with store.db() as db:
+                        if not db.execute('SELECT 1 FROM targets WHERE id=?',(pid,)).fetchone():
+                            raise ValueError('带单员不存在')
+                        rows = [json.loads(r['body']) for r in db.execute('SELECT body FROM leader_history WHERE target=? ORDER BY stamp,key',(pid,))]
+                        sync = db.execute('SELECT complete,total,error,updated FROM leader_history_sync WHERE target=?',(pid,)).fetchone()
+                    return self.reply({'positions':replay(rows), 'count':len(rows), 'sync':dict(sync) if sync else None})
                 if parsed.path == '/api/copy-tasks':
                     account_id=int(query.get('account_id', ['0'])[0])
                     page=max(1,min(100000,int(query.get('page',['1'])[0])))
@@ -975,6 +1047,12 @@ def handler_factory(store, monitor, token):
                     store.reorder(data.get('kind'), data.get('id'), data.get('relative_id'), data.get('side'))
                 elif self.path == '/api/targets':
                     monitor.add(data.get('id'))
+                elif self.path == '/api/leader-history-refresh':
+                    pid = str(data.get('target',''))
+                    with monitor.history_lock, store.db() as db:
+                        if not db.execute('SELECT 1 FROM targets WHERE id=? AND enabled=1',(pid,)).fetchone():
+                            raise ValueError('请先开启该带单员的监听')
+                        db.execute("INSERT INTO leader_history_sync(target,page,complete,total,next_check,error) VALUES(?,1,0,0,0,'') ON CONFLICT(target) DO UPDATE SET page=1,complete=0,total=0,next_check=0,error=''",(pid,))
                 elif self.path == '/api/toggle':
                     monitor.toggle(str(data.get('id')), data.get('enabled'))
                 elif self.path == '/api/futures-account':

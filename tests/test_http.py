@@ -155,6 +155,19 @@ class HTTPTests(unittest.TestCase):
 
     def test_auth_required(self):
         self.assertEqual(self.request('/api/state', authenticated=False)[0], 401)
+
+    def test_leader_position_and_refresh_require_auth_and_reset_sync(self):
+        with self.store.db() as db:
+            db.execute("INSERT OR IGNORE INTO targets(id,name,enabled) VALUES('history-test','test',1)")
+            db.execute("INSERT OR REPLACE INTO leader_history_sync(target,page,complete,total,next_check) VALUES('history-test',8,1,100,9999999999)")
+        self.assertEqual(self.request('/api/leader-positions?target=history-test',authenticated=False)[0],401)
+        self.assertEqual(self.request('/api/leader-history-refresh',{'target':'history-test'},authenticated=False)[0],401)
+        self.assertEqual(self.request('/api/leader-history-refresh',{'target':'history-test'})[0],200)
+        status,result=self.request('/api/leader-positions?target=history-test')
+        self.assertEqual(status,200)
+        self.assertEqual(result['sync']['complete'],0)
+        with self.store.db() as db:
+            self.assertEqual(db.execute("SELECT page FROM leader_history_sync WHERE target='history-test'").fetchone()[0],1)
         self.assertEqual(self.request('/api/targets', {'id': '123'}, authenticated=False)[0], 401)
 
     def test_settings_never_return_secrets(self):

@@ -215,7 +215,7 @@ class CopyExecutionTests(unittest.TestCase):
         self.assertEqual(FakeExchange.calls,[])
 
     def test_unmatched_close_uses_actual_position_and_balance_ratio(self):
-        row=order(101,'1');row['avgPrice']='100';row['side']='SELL';self.api.orders.insert(0,row);self.monitor.poll(PID)
+        row=order(101,'1');row['avgPrice']='100';row['side']='SELL';self.api.orders=[row];self.monitor.poll(PID)
         positions=[{'symbol':'BTCUSDT','positionSide':'BOTH','positionAmt':'2'}]
         with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'positions',return_value=positions), patch.object(FakeExchange,'result',{'status':'FILLED','executedQty':'1.001','orderId':1}):
             self.monitor.execute_copy()
@@ -229,6 +229,20 @@ class CopyExecutionTests(unittest.TestCase):
         result=plan(row,'unmatched_close','0','0','100',BALANCES,positions,{'dualSidePosition':False},QUOTE,RULES)
         self.assertEqual(result['quantity'],'2.000')
         self.assertEqual(result['reduceOnly'],'true')
+
+    def test_unmatched_close_uses_replayed_leader_reduction_ratio(self):
+        import json
+        from app import identity
+        leader_open=order(99,'4');leader_open['avgPrice']='100'
+        with self.store.db() as db:
+            db.execute('DELETE FROM leader_history WHERE target=?',(PID,))
+            db.execute('INSERT INTO leader_history VALUES(?,?,?,?)',(PID,identity('order',leader_open),99,json.dumps(leader_open)))
+            db.execute('INSERT INTO leader_history_sync(target,complete) VALUES(?,1)',(PID,))
+        row=order(101,'1');row['avgPrice']='100';row['side']='SELL';self.api.orders=[row];self.monitor.poll(PID)
+        positions=[{'symbol':'BTCUSDT','positionSide':'BOTH','positionAmt':'2'}]
+        with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'positions',return_value=positions), patch.object(FakeExchange,'result',{'status':'FILLED','executedQty':'0.5','orderId':1}):
+            self.monitor.execute_copy()
+        self.assertEqual(FakeExchange.calls[0][1]['quantity'],'0.500')
 
     def test_unmatched_close_without_position_is_skipped(self):
         row=order(101,'1');row['avgPrice']='100';row['side']='SELL';self.api.orders.insert(0,row);self.monitor.poll(PID)
