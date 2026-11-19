@@ -967,6 +967,31 @@ class Monitor:
                 with self.store.db() as db:
                     db.execute("UPDATE outbox SET status='cancelled' WHERE id=?", (task['task_id'],))
                 continue
+            body=json.loads(task['body'])
+            if task['kind']=='copy' and body.get('margin_lookup') and 'margin_checked' not in body:
+                margin=None
+                try:
+                    with self.store.db() as db:
+                        account=db.execute('SELECT a.api_key,a.api_secret,c.body,c.result,c.client_id FROM copy_tasks c JOIN futures_accounts a ON a.id=c.account_id WHERE c.id=?',(body['copy_task_id'],)).fetchone()
+                    if account:
+                        source=json.loads(account['body']); result=json.loads(account['result']); client=FuturesClient(account['api_key'],account['api_secret'])
+                        notional=result.get('cumQuote')
+                        if notional is None:
+                            queried=client.order(source['symbol'], account['client_id'])
+                            if (str(queried.get('orderId'))==str(result.get('orderId')) and number(queried.get('executedQty','0'))==number(result['executedQty'])):
+                                notional=actual_copy_notional(queried,number(result['executedQty']))
+                        configs=client.symbol_config(source['symbol'])
+                        config=next((x for x in configs if x.get('symbol')==source['symbol']),None)
+                        leverage=number(config['leverage']) if config else Decimal(0)
+                        if notional is not None and leverage>0:
+                            margin=decimal_string(Fraction(number(notional))/Fraction(leverage))
+                except (ExchangeError,ValueError,TypeError,KeyError,InvalidOperation,OverflowError):
+                    LOG.warning('copy margin lookup failed task=%s',body['copy_task_id'])
+                body['margin_checked']=True
+                body['message'] += '\n%s：%s USDT' % ('本笔预估保证金' if body.get('margin_action')=='open' else '本笔平仓对应保证金（估算）',notification_number(margin))
+                with self.store.db() as db:
+                    db.execute('UPDATE events SET body=? WHERE id=?',(dumps(body),task['id']))
+                task=dict(task);task['body']=dumps(body)
             title, message = self.message(task)
             try:
                 with timing_context(event=task['id'], task=json.loads(task['body']).get('copy_task_id','unknown'), channel=channel, attempt=task['attempts']+1):
@@ -983,9 +1008,9 @@ class Monitor:
                     db.execute('UPDATE outbox SET attempts=?,next_try=?,error=? WHERE id=?',
                                (attempts, time.time() + min(3600, 10 * 2 ** min(attempts, 8)), reason, task['task_id']))
 
-    def copy_notice(self, db, task, message):
+    def copy_notice(self, db, task, message, extra=None):
         name = db.execute('SELECT name FROM targets WHERE id=?', (task['target_id'],)).fetchone()
-        self.store.event(db, task['target_id'], name['name'] if name else task['target_id'], 'copy', {'message':message, 'copy_task_id':task['id'] if 'id' in task.keys() else None}, int(time.time()*1000), False, self.store.settings(db))
+        self.store.event(db, task['target_id'], name['name'] if name else task['target_id'], 'copy', {'message':message, 'copy_task_id':task['id'] if 'id' in task.keys() else None, **(extra or {})}, int(time.time()*1000), False, self.store.settings(db))
 
     def execute_copy(self):
         pickup_started=time.monotonic()
@@ -1167,7 +1192,7 @@ class Monitor:
                     actual_notional = actual_copy_notional(result, executed)
                     db.execute("UPDATE copy_tasks SET state=?,result=?,error='' WHERE id=?",('filled' if status=='FILLED' else 'finished',dumps({'status':status,'executedQty':str(executed),'orderId':result.get('orderId'), 'cumQuote':actual_notional}),task['id']))
                     LOG.info('copy result task=%s account=%s symbol=%s status=%s executed_qty=%s',task['id'],task['account_id'],row['symbol'],status,executed)
-                    self.copy_notice(db,task,'%s %s，状态 %s\n实际成交数量：%s %s\n跟单金额：%s %s' % (row['symbol'],direction(row),status,notification_number(executed),row.get('baseAsset',''),notification_number(actual_notional),row.get('quoteAsset','USDT')))
+                    self.copy_notice(db,task,'%s %s，状态 %s\n实际成交数量：%s %s' % (row['symbol'],direction(row),status,notification_number(executed),row.get('baseAsset','')), {'margin_lookup':True,'margin_action':task['action']})
 
     def check_margin(self, account):
         client = FuturesAccount(account['api_key'], account['api_secret'])

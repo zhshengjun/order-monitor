@@ -211,7 +211,13 @@ class CopyExecutionTests(unittest.TestCase):
             self.assertEqual(result['cumQuote'], '99.925')
             notice=json.loads(self.rows("SELECT body FROM events WHERE kind='copy'")[0]['body'])['message']
             self.assertIn('实际成交数量：0.999 BTC',notice)
-            self.assertIn('跟单金额：99.925 USDT',notice)
+            self.store.save_settings({'bark_enabled':True,'bark_key':'key'})
+            with self.store.db() as db:
+                event=db.execute("SELECT id FROM events WHERE kind='copy'").fetchone()['id']
+                db.execute("INSERT INTO outbox(event,channel) VALUES(?,'bark')",(event,))
+            with patch('app.FuturesClient',FakeExchange), patch('app.send_notification') as send:
+                self.monitor.deliver()
+            self.assertIn('本笔预估保证金：9.9925 USDT',send.call_args.args[3])
         finally:
             FakeExchange.result={'status':'FILLED','executedQty':'0.999','orderId':1}
 
