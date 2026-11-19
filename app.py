@@ -310,13 +310,27 @@ class Binance:
 
 class FuturesAccount:
     """Read-only USD-M futures account queries using HMAC API keys."""
+    time_offset_ms = 0
+    time_lock = threading.Lock()
+
     def __init__(self, api_key, api_secret):
         self.api_key, self.api_secret = api_key, api_secret
+
+    @classmethod
+    def sync_time(cls):
+        with cls.time_lock:
+            start = time.time() * 1000
+            with urllib.request.urlopen('https://fapi.binance.com/fapi/v1/time', timeout=5) as response:
+                server_time = json.loads(response.read(65536))['serverTime']
+            end = time.time() * 1000
+            if isinstance(server_time, bool) or not isinstance(server_time, int) or server_time <= 0:
+                raise ValueError('无效的服务器时间')
+            cls.time_offset_ms = int(server_time - (start + end) / 2)
 
     def get(self, path):
         if path not in ('/fapi/v3/balance', '/fapi/v3/positionRisk', '/fapi/v2/account', '/fapi/v1/symbolConfig'):
             raise ValueError('不支持的查询')
-        query = urllib.parse.urlencode({'timestamp': int(time.time() * 1000), 'recvWindow': 5000})
+        query = urllib.parse.urlencode({'timestamp': int(time.time() * 1000) + FuturesAccount.time_offset_ms, 'recvWindow': 5000})
         signature = hmac.new(self.api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
         request = urllib.request.Request('https://fapi.binance.com' + path + '?' + query + '&signature=' + signature,
             headers={'X-MBX-APIKEY': self.api_key})
@@ -329,6 +343,11 @@ class FuturesAccount:
                 if not isinstance(code, int): code = 'unknown'
             except Exception:
                 code = 'unknown'
+            if code == -1021:
+                try:
+                    self.sync_time()
+                except Exception:
+                    LOG.warning('Binance 服务器时间同步失败')
             raise UpstreamError('Binance 合约查询失败：HTTP %s，错误码 %s' % (exc.code, code)) from None
         except Exception:
             raise UpstreamError('Binance 合约查询连接失败，请检查网络、代理和系统时间') from None
@@ -1253,7 +1272,12 @@ class Monitor:
                 if self.stop.is_set():
                     return
                 try:
-                    self.check_margin(account)
+                    try:
+                        self.check_margin(account)
+                    except Exception:
+                        if self.stop.wait(3):
+                            return
+                        self.check_margin(account)
                     errors.pop(account['id'], None)
                 except Exception as exc:
                     LOG.warning('账户 %s 保证金风险检查失败：%s', account['id'], str(exc)[:200])

@@ -63,10 +63,28 @@ class MarginAlertTests(unittest.TestCase):
     def test_monitor_notifies_when_risk_check_fails(self):
         with self.store.db() as db:
             db.execute('INSERT INTO futures_accounts VALUES(?,?,?,?)', (1,'测试账户','key','secret'))
-        with patch.object(self.monitor, 'check_margin', side_effect=ValueError('暂不支持多资产模式')), \
-             patch.object(self.monitor.stop, 'wait', side_effect=lambda _: self.monitor.stop.set()):
+        def wait(seconds):
+            if seconds == 30: self.monitor.stop.set()
+            return False
+        with patch.object(self.monitor, 'check_margin', side_effect=ValueError('暂不支持多资产模式')) as check, \
+             patch.object(self.monitor.stop, 'wait', side_effect=wait) as wait_mock:
             self.monitor.margin_monitor()
+        self.assertEqual(check.call_count, 2)
+        self.assertEqual(wait_mock.call_args_list[0].args, (3,))
         events = self.rows("SELECT * FROM events WHERE kind='margin'")
         self.assertEqual(len(events), 1)
         self.assertIn('保证金风险检查失败', events[0]['body'])
         self.assertEqual(len(self.rows('SELECT * FROM outbox')), 2)
+
+    def test_monitor_does_not_notify_if_retry_succeeds(self):
+        with self.store.db() as db:
+            db.execute('INSERT INTO futures_accounts VALUES(?,?,?,?)', (1,'测试账户','key','secret'))
+        def wait(seconds):
+            if seconds == 30: self.monitor.stop.set()
+            return False
+        with patch.object(self.monitor, 'check_margin', side_effect=[ValueError('查询失败'), None]) as check, \
+             patch.object(self.monitor.stop, 'wait', side_effect=wait) as wait_mock:
+            self.monitor.margin_monitor()
+        self.assertEqual(check.call_count, 2)
+        self.assertEqual(wait_mock.call_args_list[0].args, (3,))
+        self.assertEqual(self.rows('SELECT * FROM events'), [])
