@@ -265,14 +265,30 @@ class CopyExecutionTests(unittest.TestCase):
         self.assertEqual(FakeExchange.calls,[])
         self.assertIn('3%',self.rows('SELECT error FROM copy_tasks')[0]['error'])
 
-    def test_attributed_position_exceeding_actual_is_not_closed(self):
-        row=order(101,'1'); row['avgPrice']='100'; self.api.orders.insert(0,row); self.monitor.poll(PID)
+    def test_attributed_position_exceeding_actual_closes_up_to_actual(self):
+        row=order(101,'2'); row.update(avgPrice='100',side='SELL'); self.api.orders.insert(0,row); self.monitor.poll(PID)
         with self.store.db() as db:
             db.execute('INSERT INTO copied_positions VALUES(?,?,?,?,?)',(1,PID,'BTCUSDT','LONG','2'))
             db.execute("UPDATE copy_tasks SET action='close',before_qty='2'")
-        with patch('app.FuturesClient',FakeExchange): self.monitor.execute_copy()
-        self.assertEqual(FakeExchange.calls,[])
-        self.assertIn('超过账户实际持仓',self.rows('SELECT error FROM copy_tasks')[0]['error'])
+        with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'result',{'status':'FILLED','executedQty':'1','orderId':1}):
+            self.monitor.execute_copy()
+        self.assertEqual(len(FakeExchange.calls),1)
+        params=FakeExchange.calls[0][1]
+        self.assertEqual(params['quantity'],'1.000')
+        self.assertEqual(params['side'],'SELL')
+        self.assertEqual(params['reduceOnly'],'true')
+        self.assertEqual(self.rows('SELECT state FROM copy_tasks')[0]['state'],'filled')
+        self.assertEqual(self.rows('SELECT quantity FROM copied_positions')[0]['quantity'],'1')
+
+    def test_close_caps_planned_reduction_after_proportion(self):
+        for side,position_side,amount,hedged in (('SELL','LONG','0.6',False),('BUY','SHORT','-0.6',False),('SELL','LONG','0.6',True),('BUY','SHORT','-0.6',True)):
+            with self.subTest(side=side,hedged=hedged):
+                row=order(101,'1');row.update(avgPrice='100',side=side,positionSide=position_side)
+                positions=[{'symbol':'BTCUSDT','positionSide':position_side if hedged else 'BOTH','positionAmt':amount}]
+                params=plan(row,'close','2','2','100',BALANCES,positions,{'dualSidePosition':hedged},QUOTE,RULES)
+                self.assertEqual(params['quantity'],'0.600')
+                self.assertEqual(params['positionSide'],position_side if hedged else 'BOTH')
+                self.assertEqual(params.get('reduceOnly'),None if hedged else 'true')
 
     def test_late_same_symbol_signal_is_not_applied_out_of_order(self):
         newer=order(102,'1'); newer['avgPrice']='100'; self.api.orders.insert(0,newer); self.monitor.poll(PID)

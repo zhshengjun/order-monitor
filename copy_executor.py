@@ -121,8 +121,9 @@ def plan(row, action, before, attributed, lead_balance, balances, positions, mod
         else:
             owned=Decimal(str(attributed))
             if owned<=0: raise ValueError('该跟单关联没有已成交持仓，跳过平仓')
-            qty=closing_quantity(before,row['executedQty'],min(actual,owned),lot['stepSize'])
+            qty=closing_quantity(before,row['executedQty'],owned,lot['stepSize'])
             limit=min(actual,owned)
+            qty=steps_quantity(min(Fraction(qty),Fraction(limit)),step)
         if Fraction(qty)<Fraction(step)*min_steps:
             qty=steps_quantity(Fraction(step)*min_steps,step)
             if qty>limit: raise ValueError('可平仓数量低于交易对最小数量')

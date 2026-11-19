@@ -1059,7 +1059,7 @@ class Monitor:
                                     amounts = db.execute('SELECT quantity FROM copied_positions WHERE account_id=? AND symbol=? AND position_side=?', (task['account_id'],row['symbol'],row['positionSide'])).fetchall()
                                 total = sum((Fraction(number(x['quantity'])) for x in amounts), Fraction(0))
                                 if total > Fraction(close_position(positions,row['symbol'],row['positionSide'])):
-                                    raise ValueError('跟单持仓记录超过账户实际持仓，请先核对')
+                                    LOG.warning('copy position mismatch task=%s account=%s symbol=%s recorded=%s actual=%s action=cap_close',task['id'],task['account_id'],row['symbol'],decimal_string(total),close_position(positions,row['symbol'],row['positionSide']))
                             quote=client.quote(row['symbol'])
                             plan_action, before_qty, owned_qty = task['action'], task['before_qty'], old['quantity'] if old else '0'
                             if plan_action in ('close','unmatched_close') and not row.get('incremental'):
