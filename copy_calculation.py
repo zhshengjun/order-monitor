@@ -38,4 +38,7 @@ def closing_quantity(lead_before, lead_reduction, own_position, step):
     reduction = positive(lead_reduction, 'lead reduction')
     if reduction > before:
         raise ValueError('lead reduction exceeds tracked position')
-    return steps_quantity(Fraction(positive(own_position, 'own position')) * Fraction(reduction) / Fraction(before), step)
+    increment = Fraction(positive(step, 'step'))
+    target = Fraction(positive(own_position, 'own position')) * Fraction(reduction) / Fraction(before)
+    units = -(-target // increment)
+    return steps_quantity(units * increment, step)

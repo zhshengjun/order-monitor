@@ -1189,9 +1189,7 @@ class Monitor:
                                     LOG.warning('copy position mismatch task=%s account=%s symbol=%s recorded=%s actual=%s action=cap_close',task['id'],task['account_id'],row['symbol'],decimal_string(total),close_position(positions,row['symbol'],row['positionSide']))
                             quote=client.quote(row['symbol'])
                             plan_action, before_qty, owned_qty = task['action'], task['before_qty'], old['quantity'] if old else '0'
-                            if str(row.get('type','')).upper()=='LIMIT' and plan_action in ('close','unmatched_close'):
-                                plan_action='unmatched_close'
-                            if plan_action in ('close','unmatched_close') and str(row.get('type','')).upper()!='LIMIT' and not row.get('incremental'):
+                            if plan_action in ('close','unmatched_close') and not row.get('incremental'):
                                 # Incremental tasks carry the tracked pre-fill quantity, so replaying
                                 # the leader's earlier history would size the close against the whole
                                 # order instead of the part reported in this poll.

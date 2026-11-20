@@ -114,17 +114,12 @@ def plan(row, action, before, attributed, lead_balance, balances, positions, mod
         actual=close_position(positions,symbol,ps)
         if actual<=0: raise ValueError('没有对应方向持仓，跳过平仓')
         if action=='unmatched_close':
-            usdt=next((x for x in balances if x.get('asset')=='USDT'),None)
-            if not usdt or 'balance' not in usdt: raise ValueError('未获取到 USDT 账户余额')
-            qty=opening_quantity(row['executedQty'],row['avgPrice'],lead_balance,usdt['balance'],px,lot['stepSize'])
-            qty=steps_quantity(min(Fraction(qty),Fraction(actual)),step)
-            limit=actual
-        else:
-            owned=Decimal(str(attributed))
-            if owned<=0: raise ValueError('该跟单关联没有已成交持仓，跳过平仓')
-            qty=closing_quantity(before,row['executedQty'],owned,lot['stepSize'])
-            limit=min(actual,owned)
-            qty=steps_quantity(min(Fraction(qty),Fraction(limit)),step)
+            raise ValueError('无法确定带单员平仓前持仓，无法计算平仓比例，请核对')
+        owned=Decimal(str(attributed))
+        if owned<=0: raise ValueError('该跟单关联没有已成交持仓，跳过平仓')
+        limit=min(actual,owned)
+        qty=closing_quantity(before,row['executedQty'],limit,lot['stepSize'])
+        qty=min(qty,steps_quantity(Fraction(limit),step))
         if Fraction(qty)<Fraction(step)*min_steps:
             qty=steps_quantity(Fraction(step)*min_steps,step)
             if qty>limit: raise ValueError('可平仓数量低于交易对最小数量')
