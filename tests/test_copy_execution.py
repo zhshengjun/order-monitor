@@ -36,6 +36,96 @@ class CopyExecutionTests(unittest.TestCase):
     def tearDown(self): self.tmp.cleanup()
     def rows(self,sql):
         with self.store.db() as db: return [dict(r) for r in db.execute(sql)]
+    def test_order_placed_before_enabling_but_updated_after_is_followed_once(self):
+        self.monitor.now_ms=lambda:300000
+        with self.store.db() as db:
+            db.execute('UPDATE copy_live SET started_at=150000')
+            db.execute('UPDATE virtual_sessions SET started_at=150000')
+        row=order(1000,'1');row.update(type='LIMIT',avgPrice='100',orderUpdateTime=200000)
+        self.api.orders.insert(0,row);self.monitor.poll(PID);self.monitor.poll(PID)
+        self.assertEqual(len(self.rows('SELECT * FROM copy_tasks')),1)
+        with patch('app.FuturesClient',FakeExchange): self.monitor.execute_copy()
+        self.assertEqual(self.rows('SELECT state FROM copy_tasks')[0]['state'],'filled')
+        self.assertEqual(len(FakeExchange.calls),1)
+        self.assertEqual(FakeExchange.calls[0][1]['type'],'MARKET')
+
+    def test_order_updated_before_enabling_is_not_followed(self):
+        self.monitor.now_ms=lambda:300000
+        with self.store.db() as db:
+            db.execute('UPDATE copy_live SET started_at=210000')
+            db.execute('UPDATE virtual_sessions SET started_at=210000')
+        row=order(1000,'1');row.update(type='LIMIT',avgPrice='100',orderUpdateTime=200000)
+        self.api.orders.insert(0,row);self.monitor.poll(PID)
+        self.assertEqual(len(self.rows('SELECT * FROM copy_tasks')),0)
+
+    def test_market_fill_uses_update_time_for_freshness(self):
+        self.monitor.now_ms=lambda:300000
+        with self.store.db() as db:
+            db.execute('UPDATE copy_live SET started_at=1')
+            db.execute('UPDATE virtual_sessions SET started_at=1')
+        row=order(1000,'1');row.update(avgPrice='100',orderUpdateTime=200000)
+        self.api.orders.insert(0,row);self.monitor.poll(PID)
+        self.assertEqual(len(self.rows('SELECT * FROM copy_tasks')),1)
+        with patch('app.FuturesClient',FakeExchange): self.monitor.execute_copy()
+        self.assertEqual(self.rows('SELECT state FROM copy_tasks')[0]['state'],'filled')
+
+    def test_market_missing_update_time_is_not_traded(self):
+        row=order(101,'1');row.update(avgPrice='100',orderUpdateTime=None)
+        self.api.orders.insert(0,row);self.monitor.poll(PID)
+        self.assertEqual(self.rows('SELECT * FROM copy_tasks'),[])
+
+    def test_limit_fill_uses_update_time_and_funds_ratio(self):
+        self.monitor.now_ms=lambda:300000
+        with self.store.db() as db:
+            db.execute('UPDATE copy_live SET started_at=1')
+            db.execute('UPDATE virtual_sessions SET started_at=1')
+            db.execute("INSERT INTO copied_positions VALUES(?,?,?,?,?)",(1,PID,'BTCUSDT','LONG','0.8'))
+            db.execute("INSERT INTO virtual_positions VALUES(?,?,?,?,?)",(1,PID,'BTCUSDT','LONG','10'))
+        row=order(1000,'2'); row.update(type='LIMIT',side='SELL',avgPrice='100',orderUpdateTime=200000)
+        self.api.orders.insert(0,row); self.monitor.poll(PID)
+        self.assertEqual(len(self.rows('SELECT * FROM copy_tasks')),1)
+        with patch('app.FuturesClient',FakeExchange),patch.object(FakeExchange,'result',{'status':'FILLED','executedQty':'1','orderId':1}):
+            self.monitor.execute_copy()
+        params=FakeExchange.calls[0][1]
+        self.assertEqual(params['quantity'],'1.000')
+        self.assertEqual(params['type'],'MARKET')
+        self.assertEqual(params['reduceOnly'],'true')
+
+    def test_limit_without_valid_update_time_does_not_create_trade(self):
+        self.monitor.now_ms=lambda:300000
+        row=order(101,'1');row.update(type='LIMIT',avgPrice='100',orderUpdateTime=None)
+        self.api.orders.insert(0,row);self.monitor.poll(PID)
+        self.assertEqual(self.rows('SELECT * FROM copy_tasks'),[])
+
+    def test_limit_new_fill_after_stale_first_fill_only_copies_increment(self):
+        self.monitor.now_ms=lambda:400000
+        with self.store.db() as db:
+            db.execute('UPDATE copy_live SET started_at=1')
+            db.execute('UPDATE virtual_sessions SET started_at=1')
+        first=order(1000,'1');first.update(type='LIMIT',avgPrice='100',orderUpdateTime=1000)
+        self.api.orders.insert(0,first);self.monitor.poll(PID)
+        self.assertEqual(self.rows('SELECT * FROM copy_tasks'),[])
+        later=order(1000,'2');later.update(type='LIMIT',avgPrice='100',orderUpdateTime=399000)
+        self.api.orders[0]=later;self.monitor.poll(PID);self.monitor.poll(PID)
+        import json
+        tasks=self.rows('SELECT body FROM copy_tasks')
+        self.assertEqual(len(tasks),1)
+        self.assertEqual(json.loads(tasks[0]['body'])['executedQty'],'1')
+        with patch('app.FuturesClient',FakeExchange): self.monitor.execute_copy()
+        self.assertEqual(FakeExchange.calls[0][1]['quantity'],'0.999')
+
+    def test_stale_limit_alerts_without_submitting(self):
+        self.monitor.now_ms=lambda:400000
+        with self.store.db() as db:
+            db.execute('UPDATE copy_live SET started_at=1')
+            db.execute('UPDATE virtual_sessions SET started_at=1')
+        row=order(1000,'1');row.update(type='LIMIT',avgPrice='100',orderUpdateTime=1000)
+        self.api.orders.insert(0,row);self.monitor.poll(PID);self.monitor.poll(PID)
+        self.assertEqual(self.rows('SELECT * FROM copy_tasks'),[])
+        notices=self.rows("SELECT body FROM events WHERE kind='copy'")
+        self.assertEqual(len(notices),1)
+        self.assertIn('跟单跳过',notices[0]['body'])
+
     def test_new_signal_persisted_and_filled_once(self):
         row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row)
         self.monitor.poll(PID);self.monitor.poll(PID)

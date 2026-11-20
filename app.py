@@ -145,6 +145,17 @@ def history_identity(row):
                                   int(row['orderTime']),decimal_key(row['executedQty']),amount]).encode()).hexdigest()
 
 
+def signal_time(row):
+    """Use order update time for freshness, preserving orderTime as identity."""
+    try:
+        value = row['orderUpdateTime']
+        if isinstance(value,bool) or value is None: return None
+        value = int(value)
+        return value if value >= int(row['orderTime']) and value > 0 else None
+    except (KeyError,TypeError,ValueError,OverflowError):
+        return None
+
+
 def clean_history(row):
     row = dict(row)
     for field in ('symbol','side','positionSide'):
@@ -178,7 +189,7 @@ def merge_order_fills(rows):
             ctx.prec = 40
             average = cost/qty
             avg = format(Decimal(average.numerator)/Decimal(average.denominator),'f')
-        merged.append({**fills[0], 'executedQty':decimal_string(qty), 'avgPrice':avg, 'notional':decimal_string(cost), 'totalPnl':decimal_string(pnl)})
+        merged.append({**fills[0], 'orderUpdateTime':max((int(r['orderUpdateTime']) for r in fills if str(r.get('orderUpdateTime','')).isdigit()),default=0), 'executedQty':decimal_string(qty), 'avgPrice':avg, 'notional':decimal_string(cost), 'totalPnl':decimal_string(pnl)})
     return sorted(merged,key=lambda r:(r['orderTime'],r['symbol'],r['side'],r['positionSide']))
 
 
@@ -712,8 +723,12 @@ class Monitor:
         raise UpstreamError('新增记录超过 %s 条，未推进同步位置；可增加每页数量后重试' % (50 * page_size))
 
     def virtual_apply(self, db, pid, key, row, lead_balance):
-        if self.now_ms()-int(row['orderTime']) > MAX_ORDER_AGE_MS:
+        signal_stamp=signal_time(row)
+        if signal_stamp is None or signal_stamp>int(time.time()*1000)+5000 or self.now_ms()-signal_stamp > MAX_ORDER_AGE_MS:
             LOG.info('copy decision target=%s symbol=%s order_time=%s result=stale',pid,row['symbol'],row['orderTime'])
+            live=db.execute('SELECT 1 FROM copy_live WHERE target_id=? AND enabled=1 AND started_at<? LIMIT 1',(pid,signal_stamp if signal_stamp is not None else int(row['orderTime']))).fetchone()
+            if live:
+                self.copy_notice(db,{'target_id':pid},'%s %s 跟单增量跳过：成交更新时间无效或超过三分钟，请核对仓位' % (row['symbol'],direction(row)))
             return
         states = db.execute('SELECT b.account_id,COALESCE(l.enabled,0) AS enabled,l.started_at AS live_start,v.active,v.started_at AS session_start FROM copy_bindings b LEFT JOIN copy_live l ON l.account_id=b.account_id AND l.target_id=b.target_id LEFT JOIN virtual_sessions v ON v.account_id=b.account_id AND v.target_id=b.target_id WHERE b.target_id=?',(pid,)).fetchall()
         for state in states:
@@ -729,14 +744,14 @@ class Monitor:
         sessions = db.execute('SELECT account_id,started_at FROM virtual_sessions WHERE target_id=? AND active=1', (pid,)).fetchall()
         for session in sessions:
             aid, started = session['account_id'], session['started_at']
-            if int(row['orderTime']) <= started:
+            if signal_stamp <= started:
                 LOG.info('copy decision target=%s account=%s symbol=%s order_time=%s result=before_start',pid,aid,row['symbol'],row['orderTime'])
                 continue
             if db.execute('SELECT 1 FROM virtual_events WHERE account_id=? AND target_id=? AND order_key=?', (aid, pid, key)).fetchone():
                 continue
             symbol, side = row['symbol'], row['positionSide']
             latest = db.execute('SELECT MAX(stamp) FROM virtual_events WHERE account_id=? AND target_id=? AND symbol=? AND position_side=?', (aid,pid,symbol,side)).fetchone()[0]
-            if latest is not None and int(row['orderTime']) < latest:
+            if latest is not None and signal_stamp < latest:
                 db.execute('UPDATE copy_live SET enabled=0 WHERE account_id=? AND target_id=?', (aid,pid))
                 db.execute('UPDATE virtual_sessions SET active=0 WHERE account_id=? AND target_id=?', (aid,pid))
                 db.execute("UPDATE copy_tasks SET state='cancelled',error='交易记录乱序' WHERE account_id=? AND target_id=? AND state='pending'", (aid,pid))
@@ -744,9 +759,9 @@ class Monitor:
                 continue
             position = db.execute('SELECT quantity FROM virtual_positions WHERE account_id=? AND target_id=? AND symbol=? AND position_side=?', (aid, pid, symbol, side)).fetchone()
             change = transition(position['quantity'] if position else '0', row['side'], side, row['executedQty'])
-            db.execute('INSERT INTO virtual_events VALUES(?,?,?,?,?,?,?,?,?,?)', (aid, pid, key, symbol, side, int(row['orderTime']), change['action'], str(row['executedQty']), change['before'], change['after']))
+            db.execute('INSERT INTO virtual_events VALUES(?,?,?,?,?,?,?,?,?,?)', (aid, pid, key, symbol, side, signal_stamp, change['action'], str(row['executedQty']), change['before'], change['after']))
             live=db.execute('SELECT enabled,started_at FROM copy_live WHERE account_id=? AND target_id=?', (aid,pid)).fetchone()
-            if not live or not live['enabled'] or int(row['orderTime']) <= live['started_at']:
+            if not live or not live['enabled'] or signal_stamp <= live['started_at']:
                 LOG.info('copy decision target=%s account=%s symbol=%s order_time=%s result=copy_disabled_or_before_start',pid,aid,row['symbol'],row['orderTime'])
                 if change['action'] != 'unmatched_close':
                     db.execute('INSERT OR REPLACE INTO virtual_positions VALUES(?,?,?,?,?)',(aid,pid,symbol,side,change['after']))
@@ -772,11 +787,10 @@ class Monitor:
 
     def apply_increment(self, db, pid, key, old, row, lead_balance, new_qty):
         """Copy only the part of an order reported after the previous poll."""
-        if not db.execute('SELECT 1 FROM virtual_events WHERE target_id=? AND order_key=?', (pid,key)).fetchone():
-            LOG.info('copy fill update target=%s symbol=%s order_time=%s cumulative=%s result=not_followed',pid,row['symbol'],row['orderTime'],decimal_string(new_qty))
-            return
+        followed=db.execute('SELECT 1 FROM virtual_events WHERE target_id=? AND order_key=?', (pid,key)).fetchone()
         try:
             delta = incremental_fill(old, row)
+            if not followed: delta['incremental_standalone']=True
         except ValueError as exc:
             self.stop_copy(db, pid, '%s 订单 %s 的成交明细无法合并：%s；已关闭跟单，请核对记录' % (row['symbol'],row['orderTime'],exc))
             return
@@ -828,7 +842,7 @@ class Monitor:
                             if active:
                                 db.execute('INSERT OR REPLACE INTO leader_history_stage VALUES(?,?,?,?)', (pid,history_identity(cleaned),stamp,dumps(cleaned)))
                         rows = merge_order_fills(rows)
-                    for row in sorted(rows, key=lambda r: int(r[time_key])):
+                    for row in sorted(rows, key=lambda r: (signal_time(r) if kind=='order' and signal_time(r) is not None else int(r[time_key]))):
                         key, stamp = identity(kind, row), int(row[time_key])
                         previous = db.execute('SELECT body FROM records WHERE target=? AND kind=? AND key=?', (pid, kind, key)).fetchone()
                         if kind == 'order':
@@ -867,18 +881,21 @@ class Monitor:
                                 if identity(kind, json.loads(event['body'])) == identity(kind,row):
                                     db.execute('UPDATE events SET body=? WHERE id=?', (dumps(body), event['id']))
                             continue
-                        live_started = db.execute('SELECT 1 FROM copy_live WHERE target_id=? AND enabled=1 AND started_at<? LIMIT 1',(pid,stamp)).fetchone() if kind == 'order' else None
+                        signal_stamp=signal_time(row) if kind == 'order' else stamp
+                        live_started = db.execute('SELECT 1 FROM copy_live WHERE target_id=? AND enabled=1 AND started_at<? LIMIT 1',(pid,signal_stamp)).fetchone() if kind == 'order' and signal_stamp is not None else None
                         monitor_started = db.execute('SELECT started_at FROM monitor_start WHERE target=?',(pid,)).fetchone() if kind == 'order' else None
-                        after_start = bool(live_started or (monitor_started and stamp > monitor_started['started_at']))
+                        after_start = bool(live_started or (monitor_started and signal_stamp is not None and signal_stamp > monitor_started['started_at']))
                         historical = ((first_kind or (baseline is not None and stamp <= baseline['stamp'])) and not after_start)
-                        if kind == 'order' and self.now_ms()-stamp > MAX_ORDER_AGE_MS:
+                        if kind == 'order' and (signal_stamp is None or signal_stamp>int(time.time()*1000)+5000 or self.now_ms()-signal_stamp > MAX_ORDER_AGE_MS):
+                            if live_started:
+                                self.copy_notice(db, {'target_id':pid}, '%s %s 跟单跳过：成交更新时间无效或超过三分钟，请核对仓位' % (row['symbol'],direction(row)))
                             historical = True
                             LOG.info('poll order target=%s symbol=%s order_time=%s result=stale_saved',pid,row['symbol'],stamp)
                         if kind == 'order':
                             discovered_ms, page = observations[identity('order',row)]
                             if not historical:
-                                db.execute('INSERT OR IGNORE INTO order_discovery VALUES(?,?,?,?)',(pid,identity('order',row),discovered_ms,discovered_ms-stamp))
-                            timing_event('order_discovered', order_key=identity('order',row), symbol=row['symbol'], source_time_field='orderTime', source_order_time_ms=stamp, discovered_at_ms=discovered_ms, discovery_delay_ms=discovered_ms-stamp, page=page, historical=historical)
+                                db.execute('INSERT OR IGNORE INTO order_discovery VALUES(?,?,?,?)',(pid,identity('order',row),discovered_ms,discovered_ms-signal_stamp))
+                            timing_event('order_discovered', order_key=identity('order',row), symbol=row['symbol'], source_time_field='orderUpdateTime', source_order_time_ms=signal_stamp, discovered_at_ms=discovered_ms, discovery_delay_ms=discovered_ms-signal_stamp if signal_stamp is not None else 'unknown', page=page, historical=historical)
                         inserted += 1
                         historical_count += int(historical)
                         self.store.event(db, pid, detail['nickname'], kind, body, stamp, historical, settings)
@@ -977,7 +994,8 @@ class Monitor:
             tasks = db.execute("SELECT o.id AS task_id,o.channel,o.attempts,e.* FROM outbox o JOIN events e ON e.id=o.event WHERE o.status='pending' AND e.kind != 'balance' AND o.next_try<=? ORDER BY o.id LIMIT 10", (time.time(),)).fetchall()
         for task in tasks:
             channel = task['channel']
-            if task['kind']=='order' and self.now_ms()-task['stamp'] > MAX_ORDER_AGE_MS:
+            freshness=signal_time(json.loads(task['body'])) if task['kind']=='order' else None
+            if task['kind']=='order' and (freshness is None or self.now_ms()-freshness > MAX_ORDER_AGE_MS):
                 with self.store.db() as db:
                     db.execute("UPDATE outbox SET status='cancelled',error='订单通知已过期' WHERE id=? AND status='pending'",(task['task_id'],))
                 LOG.info('notification expired event=%s channel=%s order_time=%s',task['id'],channel,task['stamp'])
@@ -1074,7 +1092,7 @@ class Monitor:
                 client=FuturesClient(task['api_key'],task['api_secret']); row=json.loads(task['body'])
                 LOG.info('copy task id=%s account=%s target=%s symbol=%s action=%s state=%s retries=%s',task['id'],task['account_id'],task['target_id'],row.get('symbol'),task['action'],task['state'],task['retry_count'])
                 if task['state']=='pending':
-                    if self.now_ms()-int(row['orderTime']) > MAX_ORDER_AGE_MS:
+                    if signal_time(row) is None or signal_time(row)>int(time.time()*1000)+5000 or self.now_ms()-signal_time(row) > MAX_ORDER_AGE_MS:
                         reason='带单员交易操作超过 3 分钟，取消跟单'
                         with self.store.db() as db:
                             db.execute("UPDATE copy_tasks SET state='skipped',error=? WHERE id=? AND state='pending'",(reason,task['id']))
@@ -1083,12 +1101,12 @@ class Monitor:
                         return
                     if task['action']=='open' and task['retry_count']:
                         with self.store.db() as db:
-                            if int(time.time()*1000) - int(row['orderTime']) > 180000:
+                            if int(time.time()*1000) - signal_time(row) > 180000:
                                 reason='带单员开仓操作超过 3 分钟，取消重试'
                                 db.execute("UPDATE copy_tasks SET state='skipped',error=? WHERE id=? AND state='pending'",(reason,task['id']))
                                 self.copy_notice(db,task,'%s 跟单跳过：%s' % (row['symbol'],reason))
                                 return
-                            closed = db.execute("SELECT 1 FROM virtual_events WHERE account_id=? AND target_id=? AND symbol=? AND position_side=? AND stamp>=? AND action IN ('close','unmatched_close') AND order_key!=? LIMIT 1", (task['account_id'],task['target_id'],row['symbol'],row['positionSide'],int(row['orderTime']),task['order_key'])).fetchone()
+                            closed = db.execute("SELECT 1 FROM virtual_events WHERE account_id=? AND target_id=? AND symbol=? AND position_side=? AND stamp>=? AND action IN ('close','unmatched_close') AND order_key!=? LIMIT 1", (task['account_id'],task['target_id'],row['symbol'],row['positionSide'],signal_time(row),task['order_key'])).fetchone()
                             if closed:
                                 reason='带单员后续已平仓或减仓，取消重试开仓'
                                 db.execute("UPDATE copy_tasks SET state='skipped',error=? WHERE id=? AND state='pending'",(reason,task['id']))
@@ -1136,7 +1154,9 @@ class Monitor:
                                     LOG.warning('copy position mismatch task=%s account=%s symbol=%s recorded=%s actual=%s action=cap_close',task['id'],task['account_id'],row['symbol'],decimal_string(total),close_position(positions,row['symbol'],row['positionSide']))
                             quote=client.quote(row['symbol'])
                             plan_action, before_qty, owned_qty = task['action'], task['before_qty'], old['quantity'] if old else '0'
-                            if plan_action in ('close','unmatched_close') and not row.get('incremental'):
+                            if str(row.get('type','')).upper()=='LIMIT' and plan_action in ('close','unmatched_close'):
+                                plan_action='unmatched_close'
+                            if plan_action in ('close','unmatched_close') and str(row.get('type','')).upper()!='LIMIT' and not row.get('incremental'):
                                 # Incremental tasks carry the tracked pre-fill quantity, so replaying
                                 # the leader's earlier history would size the close against the whole
                                 # order instead of the part reported in this poll.
@@ -1154,7 +1174,7 @@ class Monitor:
                                         owned_qty = str(close_position(positions,row['symbol'],row['positionSide']))
                             cumulative_row=None
                             already_filled='0'
-                            if plan_action=='open' and row.get('incremental'):
+                            if plan_action=='open' and row.get('incremental') and not row.get('incremental_standalone'):
                                 base_key=task['order_key'].split(':',1)[0]
                                 with self.store.db() as db:
                                     original=db.execute("SELECT body FROM records WHERE target=? AND kind='order' AND key=?",(task['target_id'],base_key)).fetchone()
