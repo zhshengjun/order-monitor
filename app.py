@@ -1011,7 +1011,35 @@ class Monitor:
                 with self.store.db() as db:
                     db.execute('UPDATE events SET body=? WHERE id=?',(dumps(body),task['id']))
                 task=dict(task);task['body']=dumps(body)
+            merged_order=None
+            if task['kind']=='order':
+                key=identity('order',body)
+                with self.store.db() as db:
+                    copies=db.execute('SELECT state,created FROM copy_tasks WHERE target_id=? AND order_key=?',(task['target'],key)).fetchall()
+                # Allow a bounded wait for the matching result. Existing orders and
+                # disabled copy bindings retain their normal notification behavior.
+                if copies and any(c['state'] in ('pending','submitted') for c in copies) and time.time()*1000-min(c['created'] for c in copies)<30000:
+                    with self.store.db() as db:
+                        db.execute('UPDATE outbox SET next_try=? WHERE id=?',(time.time()+1,task['task_id']))
+                    continue
+                if copies and time.time()*1000-min(c['created'] for c in copies)<30000:
+                    with self.store.db() as db:
+                        notices=db.execute("SELECT e.body FROM events e JOIN outbox o ON o.event=e.id WHERE e.target=? AND e.kind='copy' AND e.stamp>=? AND o.channel=? AND o.status='pending' ORDER BY e.id DESC",(task['target'],int(min(c['created'] for c in copies)),channel)).fetchall()
+                        ids={r['id'] for r in db.execute('SELECT id FROM copy_tasks WHERE target_id=? AND order_key=?',(task['target'],key))}
+                    if any(json.loads(n['body']).get('copy_task_id') in ids for n in notices):
+                        with self.store.db() as db:
+                            db.execute('UPDATE outbox SET next_try=? WHERE id=?',(time.time()+1,task['task_id']))
+                        continue
+            elif task['kind']=='copy' and body.get('copy_task_id'):
+                with self.store.db() as db:
+                    source=db.execute('SELECT order_key FROM copy_tasks WHERE id=?',(body['copy_task_id'],)).fetchone()
+                    candidates=db.execute("SELECT e.*,o.id AS outbox_id FROM events e JOIN outbox o ON o.event=e.id WHERE e.target=? AND e.kind='order' AND o.channel=? AND o.status='pending' ORDER BY e.id DESC",(task['target'],channel)).fetchall() if source else []
+                merged_order=next((r for r in candidates if identity('order',json.loads(r['body']))==source['order_key']),None)
             title, message = self.message(task)
+            if merged_order:
+                leader_title,leader_message=self.message(merged_order)
+                title=leader_title.replace('交易操作','交易与跟单')
+                message=leader_message+'\n\n跟单结果：\n'+message
             try:
                 with timing_context(event=task['id'], task=json.loads(task['body']).get('copy_task_id','unknown'), channel=channel, attempt=task['attempts']+1):
                     timing_event('notification_start', event_age_ms=int(time.time()*1000)-task['stamp'])
@@ -1019,6 +1047,8 @@ class Monitor:
                         send_notification(channel, settings, title, message)
                 with self.store.db() as db:
                     db.execute("UPDATE outbox SET status='sent',error='' WHERE id=?", (task['task_id'],))
+                    if merged_order:
+                        db.execute("UPDATE outbox SET status='sent',error='' WHERE id=? AND status='pending'",(merged_order['outbox_id'],))
             except Exception as exc:
                 attempts = task['attempts'] + 1
                 reason = notification_error(exc)

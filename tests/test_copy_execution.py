@@ -69,6 +69,26 @@ class CopyExecutionTests(unittest.TestCase):
         self.assertNotIn('private-device-key',output)
         self.assertEqual([call[0] for call in FakeExchange.calls],['place'])
 
+    def test_leader_and_copy_are_sent_together(self):
+        self.store.save_settings({'bark_enabled':True,'bark_key':'key'})
+        row=order(101,'1'); row['avgPrice']='100'; self.api.orders.insert(0,row)
+        self.monitor.poll(PID)
+        with patch('app.send_notification') as send:
+            self.monitor.deliver()
+        send.assert_not_called()
+        with patch('app.FuturesClient',FakeExchange): self.monitor.execute_copy()
+        with self.store.db() as db: db.execute("UPDATE outbox SET next_try=0")
+        with patch('app.FuturesClient',FakeExchange), patch('app.send_notification') as send:
+            self.monitor.deliver()
+        self.assertEqual(send.call_count,1)
+        title,message=send.call_args.args[2:4]
+        self.assertIn('交易与跟单',title)
+        self.assertIn('成交金额',message)
+        self.assertIn('跟单结果',message)
+        self.assertIn('实际成交数量',message)
+        with self.store.db() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM outbox WHERE status='pending'").fetchone()[0],0)
+
     def test_first_execution_skips_stale_open_without_placing_order(self):
         row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
         self.monitor.now_ms=lambda:180102
