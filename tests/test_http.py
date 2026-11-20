@@ -46,6 +46,43 @@ class HTTPTests(unittest.TestCase):
         with response:
             return response.status, json.loads(response.read())
 
+    def test_copy_multiplier_is_per_binding_and_validated(self):
+        with self.store.db() as db:
+            account=db.execute("INSERT INTO futures_accounts(name,api_key,api_secret) VALUES('multiplier-test','key','secret')").lastrowid
+        self.assertEqual(self.request('/api/targets',{'id':'12345678'})[0],200)
+        self.assertEqual(self.request('/api/copy-binding',{'account_id':account,'target_id':'12345678','selected':True})[0],200)
+        status,state=self.request('/api/state')
+        binding=next(b for b in state['copy_bindings'] if b['account_id']==account)
+        self.assertEqual(binding['multiplier'],'1')
+        for invalid in ('0','-1','NaN','1001','abc'):
+            self.assertNotEqual(self.request('/api/copy-multiplier',{'account_id':account,'target_id':'12345678','multiplier':invalid})[0],200)
+        self.assertEqual(self.request('/api/copy-multiplier',{'account_id':account,'target_id':'12345678','multiplier':'20'})[0],200)
+        status,state=self.request('/api/state')
+        self.assertEqual(next(b for b in state['copy_bindings'] if b['account_id']==account)['multiplier'],'20')
+        self.assertEqual(self.request('/api/copy-binding',{'account_id':account,'target_id':'12345678','selected':False})[0],200)
+        with self.store.db() as db:
+            self.assertIsNone(db.execute('SELECT 1 FROM copy_multipliers WHERE account_id=?',(account,)).fetchone())
+
+    def test_multiplier_updates_do_not_cross_accounts_or_leaders(self):
+        with self.store.db() as db:
+            first=db.execute("INSERT INTO futures_accounts(name,api_key,api_secret) VALUES('multiplier-isolation-a','key','secret')").lastrowid
+            second=db.execute("INSERT INTO futures_accounts(name,api_key,api_secret) VALUES('multiplier-isolation-b','key','secret')").lastrowid
+        for target in ('555551','555552'):
+            self.assertEqual(self.request('/api/targets',{'id':target})[0],200)
+        for account,target in ((first,'555551'),(first,'555552'),(second,'555551')):
+            self.assertEqual(self.request('/api/copy-binding',{'account_id':account,'target_id':target,'selected':True})[0],200)
+        for account,target,multiplier in ((first,'555551','20'),(first,'555552','3'),(second,'555551','7')):
+            self.assertEqual(self.request('/api/copy-multiplier',{'account_id':account,'target_id':target,'multiplier':multiplier})[0],200)
+        _,state=self.request('/api/state')
+        values={(b['account_id'],b['target_id']):b['multiplier'] for b in state['copy_bindings']}
+        self.assertEqual(values[(first,'555551')],'20')
+        self.assertEqual(values[(first,'555552')],'3')
+        self.assertEqual(values[(second,'555551')],'7')
+        self.assertEqual(self.request('/api/copy-multiplier',{'account_id':first,'target_id':'555551','multiplier':'12'})[0],200)
+        _,state=self.request('/api/state')
+        values={(b['account_id'],b['target_id']):b['multiplier'] for b in state['copy_bindings']}
+        self.assertEqual((values[(first,'555551')],values[(first,'555552')],values[(second,'555551')]),('12','3','7'))
+
     def test_copy_switch_is_explicit_and_starts_zero_baseline(self):
         from app import FuturesClient
         with self.store.db() as db:

@@ -64,3 +64,5 @@ dialog{width:min(560px,calc(100vw - 32px));max-width:calc(100vw - 32px);max-heig
 .leader-circle .leader-actions{transform:translateY(-4px)}
 
 .selected-funds{grid-template-columns:repeat(4,minmax(0,1fr))}@media(max-width:700px){.selected-funds{grid-template-columns:repeat(2,minmax(0,1fr))}}
+
+.config-line{flex-wrap:wrap}.config-line [data-multiplier-input]{width:78px;min-width:0}.config-line label:has([data-multiplier-input]){display:flex;align-items:center;gap:6px;white-space:nowrap;margin:0}
