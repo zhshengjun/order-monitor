@@ -1685,8 +1685,31 @@ def handler_factory(store, monitor, token):
                         table='targets' if is_target else 'futures_accounts'
                         if not db.execute('SELECT 1 FROM '+table+' WHERE id=?',(item,)).fetchone(): raise ValueError('对象不存在')
                         if db.execute("SELECT 1 FROM copy_tasks WHERE "+column+"=? AND state IN ('pending','submitted') LIMIT 1",(item,)).fetchone(): raise ValueError('存在待执行或待确认订单，无法删除')
-                        positions=db.execute('SELECT quantity FROM copied_positions WHERE '+column+'=?',(item,)).fetchall()
-                        if any(number(row['quantity'])!=0 for row in positions): raise ValueError('存在跟单持仓，请先核对并处理后再删除')
+                        positions=db.execute('SELECT account_id,symbol,position_side,quantity FROM copied_positions WHERE '+column+'=?',(item,)).fetchall()
+                        outstanding=[p for p in positions if number(p['quantity'])!=0]
+                        if outstanding and is_target:
+                            from market_guard import close_position
+                            snapshots={}
+                            for position in outstanding:
+                                aid=position['account_id']
+                                if aid not in snapshots:
+                                    account=db.execute('SELECT api_key,api_secret FROM futures_accounts WHERE id=?',(aid,)).fetchone()
+                                    if not account: raise ValueError('跟单持仓关联账户不存在，无法核对，请先处理')
+                                    try:
+                                        snapshot=FuturesClient(account['api_key'],account['api_secret']).positions()
+                                        if not isinstance(snapshot,list): raise ValueError('持仓响应无效')
+                                        for entry in snapshot:
+                                            if not isinstance(entry,dict) or not isinstance(entry.get('symbol'),str) or entry.get('positionSide') not in ('BOTH','LONG','SHORT'):
+                                                raise ValueError('持仓响应无效')
+                                            number(entry['positionAmt'])
+                                        snapshots[aid]=snapshot
+                                    except (ExchangeError,ValueError,KeyError,TypeError,InvalidOperation):
+                                        raise ValueError('无法核对交易所实际持仓，请检查账户连接后重试') from None
+                                if close_position(snapshots[aid],position['symbol'],position['position_side'])>0:
+                                    raise ValueError('账户存在 %s %s 实际持仓，请先核对并处理后再删除' % (position['symbol'],position['position_side']))
+                            LOG.info('delete target stale copy positions confirmed flat target=%s count=%s',item,len(outstanding))
+                        elif outstanding:
+                            raise ValueError('存在跟单持仓，请先核对并处理后再删除')
                         db.execute('DELETE FROM copy_task_audit WHERE task_id IN (SELECT id FROM copy_tasks WHERE '+column+'=?)',(item,))
                         for name in ('copy_tasks','copied_positions','copy_bindings','copy_live','virtual_sessions','virtual_positions','virtual_events'):
                             db.execute('DELETE FROM '+name+' WHERE '+column+'=?',(item,))

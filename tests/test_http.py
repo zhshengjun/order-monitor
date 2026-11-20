@@ -233,6 +233,34 @@ class HTTPTests(unittest.TestCase):
             db.execute('INSERT INTO copied_positions VALUES(?,?,?,?,?)',(account,'leader','BTCUSDT','LONG','1'))
         self.assertEqual(self.request('/api/futures-account',{'account_id':account,'name':'edited','api_key':'other','api_secret':'other-secret'})[0],400)
 
+    def test_delete_paused_target_with_stale_copy_position(self):
+        with self.store.db() as db:
+            account=db.execute("INSERT INTO futures_accounts(name,api_key,api_secret) VALUES('stale-delete','key','secret')").lastrowid
+            db.execute("INSERT INTO targets(id,name,enabled) VALUES('87654','stale-target',0)")
+            db.execute('INSERT INTO copied_positions VALUES(?,?,?,?,?)',(account,'87654','BTCUSDT','LONG','1'))
+        with patch('app.FuturesClient.positions',return_value=[]):
+            status,_=self.request('/api/delete-target',{'id':'87654'})
+        self.assertEqual(status,200)
+        with self.store.db() as db:
+            self.assertIsNone(db.execute("SELECT id FROM targets WHERE id='87654'").fetchone())
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM copied_positions WHERE target_id=?',('87654',)).fetchone()[0],0)
+
+    def test_delete_target_keeps_records_when_position_exists_or_cannot_be_verified(self):
+        from copy_executor import ExchangeError
+        with self.store.db() as db:
+            account=db.execute("INSERT INTO futures_accounts(name,api_key,api_secret) VALUES('verify-delete','key','secret')").lastrowid
+            db.execute("INSERT INTO targets(id,name,enabled) VALUES('87655','verify-target',0)")
+            db.execute('INSERT INTO copied_positions VALUES(?,?,?,?,?)',(account,'87655','BTCUSDT','LONG','1'))
+        cases=([{'symbol':'BTCUSDT','positionSide':'BOTH','positionAmt':'0.1'}],
+               [{'symbol':'BTCUSDT','positionAmt':'0'}], ExchangeError('timeout'))
+        for value in cases:
+            with self.subTest(value=value):
+                with patch('app.FuturesClient.positions',side_effect=value if isinstance(value,Exception) else None,return_value=value):
+                    self.assertEqual(self.request('/api/delete-target',{'id':'87655'})[0],400)
+                with self.store.db() as db:
+                    self.assertIsNotNone(db.execute("SELECT id FROM targets WHERE id='87655'").fetchone())
+                    self.assertEqual(db.execute("SELECT quantity FROM copied_positions WHERE target_id='87655'").fetchone()[0],'1')
+
     def test_delete_objects_checks_positions_and_removes_bindings(self):
         with self.store.db() as db:
             account=db.execute("INSERT INTO futures_accounts(name,api_key,api_secret) VALUES('delete-test','key','secret')").lastrowid
@@ -240,7 +268,8 @@ class HTTPTests(unittest.TestCase):
             db.execute('INSERT INTO copy_bindings VALUES(?,?)',(account,'98765'))
             db.execute('INSERT INTO copied_positions VALUES(?,?,?,?,?)',(account,'98765','BTCUSDT','LONG','1'))
         self.assertEqual(self.request('/api/delete-account',{'id':account})[0],400)
-        self.assertEqual(self.request('/api/delete-target',{'id':'98765'})[0],400)
+        with patch('app.FuturesClient.positions',return_value=[{'symbol':'BTCUSDT','positionSide':'LONG','positionAmt':'1'}]):
+            self.assertEqual(self.request('/api/delete-target',{'id':'98765'})[0],400)
         with self.store.db() as db: db.execute('DELETE FROM copied_positions WHERE account_id=?',(account,))
         self.assertEqual(self.request('/api/delete-target',{'id':'98765'})[0],200)
         with self.store.db() as db: self.assertIsNone(db.execute('SELECT 1 FROM copy_bindings WHERE account_id=?',(account,)).fetchone())
