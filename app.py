@@ -1008,6 +1008,23 @@ class Monitor:
         text += '\n时间（UTC+8）：' + time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(event['stamp'] / 1000 + 8 * 3600))
         return title, text
 
+    @staticmethod
+    def combined_message(leader, copy):
+        leader_title, leader_text = Monitor.message(leader)
+        _, copy_text = Monitor.message(copy)
+        leader_lines = leader_text.split('\n')
+        copy_lines = copy_text.split('\n')
+        header = leader_lines[0]
+        leader_lines[-1] = leader_lines[-1].replace('时间（UTC+8）：', '订单时间（UTC+8）：', 1)
+        copy_lines[-1] = copy_lines[-1].replace('时间（UTC+8）：', '结果时间（UTC+8）：', 1)
+        prefix = header + '，状态 '
+        if copy_lines[0].startswith(prefix):
+            status = copy_lines[0][len(prefix):]
+            copy_lines[0] = '状态：' + ('已成交（FILLED）' if status == 'FILLED' else status)
+        return (leader_title.replace('交易操作','交易与跟单'),
+                header + '\n\n【带单交易】\n' + '\n'.join(leader_lines[1:]) +
+                '\n\n【我的跟单】\n' + '\n'.join(copy_lines))
+
     def deliver(self):
         settings = self.store.settings()
         with self.store.db() as db:
@@ -1075,9 +1092,7 @@ class Monitor:
                 merged_order=next((r for r in candidates if identity('order',json.loads(r['body']))==source['order_key']),None)
             title, message = self.message(task)
             if merged_order:
-                leader_title,leader_message=self.message(merged_order)
-                title=leader_title.replace('交易操作','交易与跟单')
-                message=leader_message+'\n\n跟单结果：\n'+message
+                title, message = self.combined_message(merged_order,task)
             try:
                 with timing_context(event=task['id'], task=json.loads(task['body']).get('copy_task_id','unknown'), channel=channel, attempt=task['attempts']+1):
                     timing_event('notification_start', event_age_ms=int(time.time()*1000)-task['stamp'])

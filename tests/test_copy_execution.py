@@ -175,7 +175,11 @@ class CopyExecutionTests(unittest.TestCase):
         title,message=send.call_args.args[2:4]
         self.assertIn('交易与跟单',title)
         self.assertIn('成交金额',message)
-        self.assertIn('跟单结果',message)
+        self.assertIn('【带单交易】',message)
+        self.assertIn('【我的跟单】',message)
+        self.assertIn('订单时间（UTC+8）',message)
+        self.assertIn('结果时间（UTC+8）',message)
+        self.assertIn('状态：已成交（FILLED）',message)
         self.assertIn('实际成交数量',message)
         with self.store.db() as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM outbox WHERE status='pending'").fetchone()[0],0)

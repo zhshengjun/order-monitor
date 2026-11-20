@@ -52,6 +52,18 @@ class NotificationFormattingTests(unittest.TestCase):
         for expected in ('数量：596.18 BTC','均价：160.6404 USDT','成交金额：95770.5984 USDT','已实现盈亏：0 USDT','时间（UTC+8）：1970-01-01 08:00:00'):
             self.assertIn(expected,text)
 
+    def test_combined_message_preserves_skipped_reason_and_separate_times(self):
+        import json
+        leader={'name':'带单员','kind':'order','stamp':0,'body':json.dumps({'symbol':'BTCUSDT','side':'BUY','positionSide':'LONG','executedQty':'1','baseAsset':'BTC','avgPrice':'100','quoteAsset':'USDT','notional':'100','totalPnl':'0'})}
+        result={'name':'带单员','kind':'copy','stamp':1000,'body':json.dumps({'message':'BTCUSDT 跟单跳过：价格偏离超过 3%'})}
+        title,text=Monitor.combined_message(leader,result)
+        self.assertEqual(title,'带单员 · 交易与跟单')
+        self.assertIn('【带单交易】',text)
+        self.assertIn('【我的跟单】',text)
+        self.assertIn('BTCUSDT 跟单跳过：价格偏离超过 3%',text)
+        self.assertIn('订单时间（UTC+8）：1970-01-01 08:00:00',text)
+        self.assertIn('结果时间（UTC+8）：1970-01-01 08:00:01',text)
+
     def test_actual_notional_uses_only_exchange_fills(self):
         from decimal import Decimal
         from app import actual_copy_notional, notification_number
