@@ -10,6 +10,7 @@ import urllib.request
 from decimal import Decimal
 from fractions import Fraction
 from timing import timed
+from pooled_http import open_url as pooled_open
 from copy_calculation import opening_quantity, closing_quantity, steps_quantity
 from market_guard import check_price, close_position
 
@@ -48,7 +49,7 @@ class FuturesClient:
         if signed: headers['X-MBX-APIKEY']=self.key
         req = urllib.request.Request(BASE+path+('?' + query if query else ''),headers=headers,method=method)
         try:
-            with urllib.request.urlopen(req,timeout=15) as response:
+            with pooled_open(req,timeout=15) as response:
                 return json.loads(response.read(4000000),parse_float=str)
         except urllib.error.HTTPError as e:
             try:

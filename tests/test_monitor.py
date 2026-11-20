@@ -117,12 +117,25 @@ class MonitorTests(unittest.TestCase):
             for thread in threads: thread.join()
         self.assertEqual(peak,1)
 
-    def test_upgrade_sets_poll_page_size_to_five(self):
+    def test_upgrade_sets_poll_page_size_to_twenty_once(self):
         with self.store.db() as db:
-            settings=self.store.settings(db);settings['page_size']=100
+            settings=self.store.settings(db);settings['page_size']=5
             db.execute('UPDATE settings SET value=? WHERE id=1',(json.dumps(settings),))
-            db.execute("DELETE FROM app_migrations WHERE name='poll_page_size_5'")
-        self.assertEqual(Store(self.store.path).settings()['page_size'],5)
+            db.execute("DELETE FROM app_migrations WHERE name='poll_page_size_20_v2'")
+        upgraded=Store(self.store.path)
+        self.assertEqual(upgraded.settings()['page_size'],20)
+        upgraded.save_settings({'page_size':7})
+        self.assertEqual(Store(self.store.path).settings()['page_size'],7)
+
+    def test_twenty_per_page_keeps_last_known_early_stop(self):
+        self.store.save_settings({'page_size':20})
+        self.api.orders=[order(i) for i in range(120,99,-1)]
+        self.monitor.poll(PID)
+        updated=order(100,'2');updated['orderUpdateTime']=9000
+        self.api.orders[-1]=updated;self.api.calls=[]
+        rows=self.monitor.collect(PID,'order',True)
+        self.assertEqual([page for kind,page in self.api.calls if kind=='order'],[1])
+        self.assertFalse(any(row['orderTime']==100 for row in rows))
 
     def test_baseline_silent_and_decimal_exact(self):
         self.baseline()

@@ -26,7 +26,7 @@ class TimingTests(unittest.TestCase):
             (FuturesClient('private-key', 'private-secret'), lambda c: c.place({'symbol':'BTCUSDT'}), ExchangeError),
         ):
             with self.subTest(client=type(client).__name__):
-                with patch('urllib.request.urlopen', side_effect=TimeoutError('private-secret')):
+                with patch('app.pooled_open', side_effect=TimeoutError('private-secret')), patch('copy_executor.pooled_open', side_effect=TimeoutError('private-secret')):
                     with self.assertLogs('monitor', level='INFO') as logs, self.assertRaises(error):
                         with timing_context(task=42): operation(client)
                 output='\n'.join(logs.output)
@@ -41,7 +41,7 @@ class TimingTests(unittest.TestCase):
             def __enter__(self): return self
             def __exit__(self, *args): pass
             def read(self, size): return b'{"status":"FILLED","updateTime":123}'
-        with patch('urllib.request.urlopen', return_value=Response()):
+        with patch('copy_executor.pooled_open', return_value=Response()):
             with self.assertLogs('monitor', level='INFO') as logs:
                 result=FuturesClient('key','secret').place({'symbol':'BTCUSDT'})
         self.assertEqual(result, {'status':'FILLED','updateTime':123})

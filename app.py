@@ -25,10 +25,11 @@ from leader_replay import replay
 from copy_executor import FuturesClient, ExchangeError, plan
 from fractions import Fraction
 from timing import timed, timing_context, timing_event
+from pooled_http import open_url as pooled_open
 
 ROOT = Path(__file__).parent
 API_PATH = '/bapi/futures/v1/friendly/future/copy-trade/'
-DEFAULTS = {'interval': 60, 'page_size': 5, 'balance_threshold': '0', 'telegram_enabled': False,
+DEFAULTS = {'interval': 60, 'page_size': 20, 'balance_threshold': '0', 'telegram_enabled': False,
             'telegram_token': '', 'telegram_chat': '', 'bark_enabled': False,
             'bark_url': 'https://api.day.app', 'bark_key': ''}
 SECRETS = ('telegram_token', 'bark_key')
@@ -239,7 +240,7 @@ class Binance:
         request = urllib.request.Request(url, data=dumps(body).encode() if body is not None else None,
                                          headers=headers)
         try:
-            with urllib.request.urlopen(request, timeout=20) as response:
+            with pooled_open(request, timeout=20) as response:
                 result = json.loads(response.read(8_000_000), parse_float=str)
         except urllib.error.HTTPError as exc:
             message = '上游 HTTP %s' % exc.code
@@ -331,7 +332,7 @@ class FuturesAccount:
     def sync_time(cls):
         with cls.time_lock:
             start = time.time() * 1000
-            with urllib.request.urlopen('https://fapi.binance.com/fapi/v1/time', timeout=5) as response:
+            with pooled_open('https://fapi.binance.com/fapi/v1/time', timeout=5) as response:
                 server_time = json.loads(response.read(65536))['serverTime']
             end = time.time() * 1000
             if isinstance(server_time, bool) or not isinstance(server_time, int) or server_time <= 0:
@@ -346,7 +347,7 @@ class FuturesAccount:
         request = urllib.request.Request('https://fapi.binance.com' + path + '?' + query + '&signature=' + signature,
             headers={'X-MBX-APIKEY': self.api_key})
         try:
-            with urllib.request.urlopen(request, timeout=5 if path == '/fapi/v1/symbolConfig' else 20) as response:
+            with pooled_open(request, timeout=5 if path == '/fapi/v1/symbolConfig' else 20) as response:
                 result = json.loads(response.read(4000000), parse_float=str)
         except urllib.error.HTTPError as exc:
             try:
@@ -443,6 +444,12 @@ class Store:
               account_id INTEGER NOT NULL, target_id TEXT NOT NULL, symbol TEXT NOT NULL,
               position_side TEXT NOT NULL, quantity TEXT NOT NULL,
               PRIMARY KEY(account_id,target_id,symbol,position_side));
+            CREATE TABLE IF NOT EXISTS close_watch (
+              id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER NOT NULL, target_id TEXT NOT NULL,
+              symbol TEXT NOT NULL, position_side TEXT NOT NULL, order_key TEXT NOT NULL,
+              task_id INTEGER, state TEXT NOT NULL DEFAULT 'pending', next_check REAL NOT NULL DEFAULT 0,
+              error_notified INTEGER NOT NULL DEFAULT 0,
+              UNIQUE(account_id,target_id,order_key));
             CREATE TABLE IF NOT EXISTS margin_alert_state (
               account_id INTEGER NOT NULL, risk_key TEXT NOT NULL, active INTEGER NOT NULL,
               PRIMARY KEY(account_id, risk_key));
@@ -511,6 +518,11 @@ class Store:
                 current['page_size'] = 5
                 db.execute('UPDATE settings SET value=? WHERE id=1',(dumps(current),))
                 db.execute("INSERT INTO app_migrations VALUES('poll_page_size_5')")
+            if not db.execute("SELECT 1 FROM app_migrations WHERE name='poll_page_size_20_v2'").fetchone():
+                current = json.loads(db.execute('SELECT value FROM settings WHERE id=1').fetchone()[0])
+                current['page_size'] = 20
+                db.execute('UPDATE settings SET value=? WHERE id=1',(dumps(current),))
+                db.execute("INSERT INTO app_migrations VALUES('poll_page_size_20_v2')")
             if not db.execute("SELECT 1 FROM app_migrations WHERE name='history_identity_v5'").fetchone():
                 db.execute('CREATE TABLE IF NOT EXISTS leader_history_before_v5 AS SELECT * FROM leader_history')
                 saved=db.execute('SELECT target,body FROM leader_history').fetchall()
@@ -770,6 +782,8 @@ class Monitor:
             created = db.execute('INSERT OR IGNORE INTO copy_tasks(account_id,target_id,order_key,body,action,before_qty,lead_balance,client_id,created) VALUES(?,?,?,?,?,?,?,?,?)',
                        (aid,pid,key,dumps(row),change['action'],change['before'],'' if lead_balance is None else str(lead_balance),client_id,int(time.time()*1000)))
             LOG.info('copy decision target=%s account=%s symbol=%s order_time=%s action=%s result=%s',pid,aid,symbol,row['orderTime'],change['action'],'queued' if created.rowcount else 'existing_task')
+            if created.rowcount and change['action'] in ('close','unmatched_close') and number(change['before'])>0 and number(row['executedQty'])>=number(change['before']):
+                db.execute('INSERT OR IGNORE INTO close_watch(account_id,target_id,symbol,position_side,order_key,task_id) VALUES(?,?,?,?,?,?)',(aid,pid,symbol,side,key,created.lastrowid))
             if created.rowcount:
                 timing_event('copy_enqueued', task=created.lastrowid, order_key=identity('order',row), target=pid, account=aid, order_time_ms=row['orderTime'], source_to_enqueue_ms=int(time.time()*1000)-int(row['orderTime']))
             if change['action'] != 'unmatched_close':
@@ -887,8 +901,14 @@ class Monitor:
                         after_start = bool(live_started or (monitor_started and signal_stamp is not None and signal_stamp > monitor_started['started_at']))
                         historical = ((first_kind or (baseline is not None and stamp <= baseline['stamp'])) and not after_start)
                         if kind == 'order' and (signal_stamp is None or signal_stamp>int(time.time()*1000)+5000 or self.now_ms()-signal_stamp > MAX_ORDER_AGE_MS):
-                            if live_started:
-                                self.copy_notice(db, {'target_id':pid}, '%s %s 跟单跳过：成交更新时间无效或超过三分钟，请核对仓位' % (row['symbol'],direction(row)))
+                            active_copy=db.execute('SELECT 1 FROM copy_live WHERE target_id=? AND enabled=1 LIMIT 1',(pid,)).fetchone()
+                            if live_started or (signal_stamp is None and active_copy and not first_kind):
+                                self.copy_notice(db, {'target_id':pid}, '%s %s 跟单跳过：订单更新时间缺失、无效或超过三分钟，请核对仓位' % (row['symbol'],direction(row)))
+                                if direction(row) in ('平多','平空'):
+                                    positions=db.execute('SELECT v.account_id,v.quantity FROM virtual_positions v JOIN copy_live l ON l.account_id=v.account_id AND l.target_id=v.target_id WHERE v.target_id=? AND v.symbol=? AND v.position_side=? AND l.enabled=1',(pid,row['symbol'],row['positionSide'])).fetchall()
+                                    for position in positions:
+                                        if number(position['quantity'])>0 and number(row['executedQty'])>=number(position['quantity']):
+                                            db.execute('INSERT OR IGNORE INTO close_watch(account_id,target_id,symbol,position_side,order_key) VALUES(?,?,?,?,?)',(position['account_id'],pid,row['symbol'],row['positionSide'],key))
                             historical = True
                             LOG.info('poll order target=%s symbol=%s order_time=%s result=stale_saved',pid,row['symbol'],stamp)
                         if kind == 'order':
@@ -1263,6 +1283,44 @@ class Monitor:
                     LOG.info('copy result task=%s account=%s symbol=%s status=%s executed_qty=%s',task['id'],task['account_id'],row['symbol'],status,executed)
                     self.copy_notice(db,task,'%s %s，状态 %s\n实际成交数量：%s %s' % (row['symbol'],direction(row),status,notification_number(executed),row.get('baseAsset','')), {'margin_lookup':True,'margin_action':task['action']})
 
+    def check_close_watch(self):
+        from market_guard import close_position
+        with self.store.db() as db:
+            watch=db.execute("SELECT w.*,a.name AS account_name,a.api_key,a.api_secret,t.name AS target_name,c.state AS task_state,c.created AS task_created FROM close_watch w JOIN futures_accounts a ON a.id=w.account_id JOIN targets t ON t.id=w.target_id LEFT JOIN copy_tasks c ON c.id=w.task_id WHERE w.state='pending' AND w.next_check<=? ORDER BY w.id LIMIT 1",(time.time(),)).fetchone()
+        if not watch: return
+        if watch['task_id'] is not None and watch['task_state'] in ('pending','submitted') and time.time()*1000-int(watch['task_created'])<30000:
+            with self.store.db() as db: db.execute('UPDATE close_watch SET next_check=? WHERE id=?',(time.time()+5,watch['id']))
+            return
+        if watch['task_id'] is not None and watch['task_state'] is None:
+            return
+        try:
+            positions=FuturesClient(watch['api_key'],watch['api_secret']).positions()
+            if not isinstance(positions,list): raise ValueError('持仓响应无效')
+            for item in positions:
+                if not isinstance(item,dict) or not isinstance(item.get('symbol'),str) or item.get('positionSide') not in ('BOTH','LONG','SHORT'):
+                    raise ValueError('持仓响应无效')
+                number(item['positionAmt'])
+            actual=close_position(positions,watch['symbol'],watch['position_side'])
+        except (ExchangeError, ValueError, KeyError, TypeError, InvalidOperation):
+            with self.store.db() as db:
+                current=db.execute("SELECT error_notified FROM close_watch WHERE id=? AND state='pending'",(watch['id'],)).fetchone()
+                if current:
+                    db.execute('UPDATE close_watch SET next_check=?,error_notified=1 WHERE id=?',(time.time()+30,watch['id']))
+                    if not current['error_notified']:
+                        self.copy_notice(db,{'target_id':watch['target_id']},'%s %s 疑似已清仓，但无法查询账户 %s 的实际持仓，请核对' % (watch['symbol'],watch['position_side'],watch['account_name']))
+            return
+        with self.store.db() as db:
+            changed=db.execute("UPDATE close_watch SET state='checked' WHERE id=? AND state='pending'",(watch['id'],)).rowcount
+            if changed and actual>0:
+                self.copy_notice(db,{'target_id':watch['target_id']},'%s %s 带单员疑似已清仓；核对时账户 %s 仍有 %s 持仓%s，请检查（可能包含其他来源的仓位）' % (watch['symbol'],watch['position_side'],watch['account_name'],decimal_string(Fraction(actual)),'，跟单任务仍待执行或确认' if watch['task_state'] in ('pending','submitted') else ''))
+                LOG.warning('close watch residual target=%s account=%s symbol=%s side=%s',watch['target_id'],watch['account_id'],watch['symbol'],watch['position_side'])
+
+    def close_watch_worker(self):
+        while not self.stop.is_set():
+            try: self.check_close_watch()
+            except Exception: LOG.exception('疑似清仓持仓核对异常')
+            self.stop.wait(1)
+
     def check_margin(self, account):
         client = FuturesAccount(account['api_key'], account['api_secret'])
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -1427,7 +1485,7 @@ class Monitor:
                 self.stop.wait(1)
 
         self.transfer_background = True
-        workers = [threading.Thread(target=target, daemon=True) for target in (copies, notifications, self.history_worker,self.transfer_worker)]
+        workers = [threading.Thread(target=target, daemon=True) for target in (copies, notifications, self.history_worker,self.transfer_worker,self.close_watch_worker)]
         for worker in workers: worker.start()
         with self.store.db() as db:
             db.execute('UPDATE targets SET next_check=0 WHERE failures=0')
@@ -1731,7 +1789,7 @@ def handler_factory(store, monitor, token):
                         elif outstanding:
                             raise ValueError('存在跟单持仓，请先核对并处理后再删除')
                         db.execute('DELETE FROM copy_task_audit WHERE task_id IN (SELECT id FROM copy_tasks WHERE '+column+'=?)',(item,))
-                        for name in ('copy_tasks','copied_positions','copy_bindings','copy_live','virtual_sessions','virtual_positions','virtual_events'):
+                        for name in ('close_watch','copy_tasks','copied_positions','copy_bindings','copy_live','virtual_sessions','virtual_positions','virtual_events'):
                             db.execute('DELETE FROM '+name+' WHERE '+column+'=?',(item,))
                         if is_target:
                             db.execute('DELETE FROM outbox WHERE event IN (SELECT id FROM events WHERE target=?)',(item,))

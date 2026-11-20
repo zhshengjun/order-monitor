@@ -73,6 +73,7 @@ class CopyExecutionTests(unittest.TestCase):
         row=order(101,'1');row.update(avgPrice='100',orderUpdateTime=None)
         self.api.orders.insert(0,row);self.monitor.poll(PID)
         self.assertEqual(self.rows('SELECT * FROM copy_tasks'),[])
+        self.assertIn('更新时间缺失',self.rows("SELECT body FROM events WHERE kind='copy'")[0]['body'])
 
     def test_limit_fill_uses_update_time_and_funds_ratio(self):
         self.monitor.now_ms=lambda:300000
@@ -711,7 +712,7 @@ class FuturesTransportTests(unittest.TestCase):
         import io, urllib.error
         from copy_executor import FuturesClient
         error=urllib.error.HTTPError('https://example.invalid/secret',451,'denied',{},io.BytesIO(b'{"code":0,"msg":"private-secret"}'))
-        with patch('copy_executor.urllib.request.urlopen',side_effect=error):
+        with patch('copy_executor.pooled_open',side_effect=error):
             with self.assertRaises(ExchangeError) as caught:
                 FuturesClient('key','secret').balance()
         self.assertIn('HTTP 451',str(caught.exception))
@@ -726,7 +727,7 @@ class FuturesTransportTests(unittest.TestCase):
             def __enter__(self): return self
             def __exit__(self,*args): pass
             def read(self,n): return b'{"status":"FILLED","executedQty":"0.001"}'
-        with patch('copy_executor.urllib.request.urlopen',return_value=Response()) as call, patch('copy_executor.time.time',return_value=1234):
+        with patch('copy_executor.pooled_open',return_value=Response()) as call, patch('copy_executor.time.time',return_value=1234):
             result=FuturesClient('key','secret').place({'symbol':'BTCUSDT','side':'BUY','type':'MARKET','quantity':'0.001','newClientOrderId':'cp_test'})
         request=call.call_args.args[0]; parts=urllib.parse.urlsplit(request.full_url);unsigned,sig=parts.query.rsplit('&signature=',1)
         self.assertEqual(request.get_method(),'POST')

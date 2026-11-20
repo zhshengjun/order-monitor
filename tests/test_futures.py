@@ -19,7 +19,7 @@ class FuturesTests(unittest.TestCase):
         self.addCleanup(self.offset_patch.stop)
 
     def test_signature_and_read_only(self):
-        with patch('app.urllib.request.urlopen', return_value=Response()) as call, patch('app.time.time', return_value=1234):
+        with patch('app.pooled_open', return_value=Response()) as call, patch('app.time.time', return_value=1234):
             result = FuturesAccount('test-key','test-secret').get('/fapi/v3/balance')
         request = call.call_args.args[0]
         query = urllib.parse.urlsplit(request.full_url).query
@@ -32,7 +32,7 @@ class FuturesTests(unittest.TestCase):
 
     def test_error_does_not_expose_body(self):
         error=urllib.error.HTTPError('https://example.invalid',401,'',{},io.BytesIO(b'{"code":-2015,"msg":"secret-credential"}'))
-        with patch('app.urllib.request.urlopen',side_effect=error):
+        with patch('app.pooled_open',side_effect=error):
             with self.assertRaises(UpstreamError) as caught: FuturesAccount('key','secret').get('/fapi/v3/positionRisk')
         self.assertIn('-2015',str(caught.exception))
         self.assertNotIn('secret',str(caught.exception))
@@ -41,7 +41,7 @@ class FuturesTests(unittest.TestCase):
         error = urllib.error.HTTPError('https://example.invalid', 400, '', {}, io.BytesIO(b'{"code":-1021}'))
         class TimeResponse(Response):
             def read(self, limit): return b'{"serverTime":1244000}'
-        with patch('app.urllib.request.urlopen', side_effect=[error, TimeResponse(), Response()]) as call, \
+        with patch('app.pooled_open', side_effect=[error, TimeResponse(), Response()]) as call, \
              patch('app.time.time', return_value=1234):
             with self.assertRaises(UpstreamError): FuturesAccount('key','secret').get('/fapi/v3/balance')
             FuturesAccount('key','secret').get('/fapi/v3/balance')
