@@ -79,6 +79,7 @@ class FuturesClient:
     def symbol_config(self,symbol): return self.request('/fapi/v1/symbolConfig',{'symbol':symbol},signed=True)
     def place(self,params): return self.request('/fapi/v1/order',params,method='POST',signed=True)
     def order(self,symbol,client_id): return self.request('/fapi/v1/order',{'symbol':symbol,'origClientOrderId':client_id},signed=True)
+    def trades(self,symbol,order_id): return self.request('/fapi/v1/userTrades',{'symbol':symbol,'orderId':order_id,'limit':1000},signed=True)
 
 
 def market_rule(exchange, symbol):

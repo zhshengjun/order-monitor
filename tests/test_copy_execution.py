@@ -424,6 +424,21 @@ class CopyExecutionTests(unittest.TestCase):
         finally:
             FakeExchange.result={'status':'FILLED','executedQty':'0.999','orderId':1}
 
+    def test_close_notification_includes_only_own_order_realized_pnl(self):
+        self.store.save_settings({'bark_enabled':True,'bark_key':'key'})
+        row=order(101,'1');row.update(avgPrice='100',side='SELL');self.api.orders.insert(0,row);self.monitor.poll(PID)
+        with self.store.db() as db:
+            db.execute('INSERT INTO copied_positions VALUES(?,?,?,?,?)',(1,PID,'BTCUSDT','LONG','1'))
+            db.execute("UPDATE copy_tasks SET action='close',before_qty='1'")
+        result={'status':'FILLED','executedQty':'1','orderId':42,'cumQuote':'100'}
+        trades=[{'id':11,'symbol':'BTCUSDT','orderId':42,'qty':'0.4','realizedPnl':'2.2'},
+                {'id':12,'symbol':'BTCUSDT','orderId':42,'qty':'0.6','realizedPnl':'-0.1'}]
+        with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'result',result): self.monitor.execute_copy()
+        with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'trades',return_value=trades,create=True) as lookup, patch('app.send_notification') as send:
+            self.monitor.deliver()
+        lookup.assert_called_once_with('BTCUSDT',42)
+        self.assertTrue(any('本笔已实现盈亏（不含手续费）：2.1 USDT' in call.args[3] for call in send.call_args_list))
+
     def test_open_then_proportional_close_uses_actual_position(self):
         row=order(101,'2');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
         with patch('app.FuturesClient',FakeExchange):

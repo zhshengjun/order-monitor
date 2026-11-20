@@ -123,6 +123,28 @@ def actual_copy_notional(result, executed):
     return None
 
 
+def actual_copy_realized_pnl(trades, symbol, order_id, executed, asset):
+    """Sum only complete, uniquely identified fills belonging to this order."""
+    if not isinstance(trades, list) or not trades or order_id is None or executed <= 0:
+        return None
+    seen=set(); quantity=Fraction(0); pnl=Fraction(0)
+    try:
+        for trade in trades:
+            if not isinstance(trade,dict) or trade.get('id') is None or trade['id'] in seen:
+                return None
+            if trade.get('symbol') != symbol or str(trade.get('orderId')) != str(order_id):
+                return None
+            if trade.get('marginAsset') and trade['marginAsset'] != asset:
+                return None
+            qty=number(trade['qty']); realized=number(trade['realizedPnl'])
+            if qty <= 0: return None
+            seen.add(trade['id']); quantity+=Fraction(qty); pnl+=Fraction(realized)
+        if quantity != Fraction(executed): return None
+        return decimal_string(pnl)
+    except (KeyError, ValueError, TypeError, InvalidOperation, OverflowError, ZeroDivisionError):
+        return None
+
+
 def direction(row):
     return {('BUY', 'LONG'): '开多', ('SELL', 'LONG'): '平多',
             ('SELL', 'SHORT'): '开空', ('BUY', 'SHORT'): '平空'}.get(
@@ -1066,6 +1088,26 @@ class Monitor:
                     LOG.warning('copy margin lookup failed task=%s',body['copy_task_id'])
                 body['margin_checked']=True
                 body['message'] += '\n%s：%s USDT' % ('本笔预估保证金' if body.get('margin_action')=='open' else '本笔平仓对应保证金（估算）',notification_number(margin))
+                with self.store.db() as db:
+                    db.execute('UPDATE events SET body=? WHERE id=?',(dumps(body),task['id']))
+                task=dict(task);task['body']=dumps(body)
+            if (task['kind']=='copy' and body.get('margin_lookup')
+                    and body.get('margin_action') in ('close','unmatched_close') and 'pnl_checked' not in body):
+                pnl=None; asset='USDT'
+                try:
+                    with self.store.db() as db:
+                        account=db.execute('SELECT a.api_key,a.api_secret,c.body,c.result FROM copy_tasks c JOIN futures_accounts a ON a.id=c.account_id WHERE c.id=?',(body['copy_task_id'],)).fetchone()
+                    if account:
+                        source=json.loads(account['body']); result=json.loads(account['result'])
+                        asset=source.get('quoteAsset') or 'USDT'
+                        executed=number(result['executedQty']); order_id=result.get('orderId')
+                        if executed>0 and order_id is not None:
+                            trades=FuturesClient(account['api_key'],account['api_secret']).trades(source['symbol'],order_id)
+                            pnl=actual_copy_realized_pnl(trades,source['symbol'],order_id,executed,asset)
+                except (ExchangeError,ValueError,TypeError,KeyError,InvalidOperation,OverflowError):
+                    LOG.warning('copy realized pnl lookup failed task=%s',body['copy_task_id'])
+                body['pnl_checked']=True
+                body['message'] += '\n本笔已实现盈亏（不含手续费）：%s %s' % (notification_number(pnl),asset)
                 with self.store.db() as db:
                     db.execute('UPDATE events SET body=? WHERE id=?',(dumps(body),task['id']))
                 task=dict(task);task['body']=dumps(body)

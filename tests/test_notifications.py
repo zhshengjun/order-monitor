@@ -64,6 +64,19 @@ class NotificationFormattingTests(unittest.TestCase):
         self.assertIn('订单时间（UTC+8）：1970-01-01 08:00:00',text)
         self.assertIn('结果时间（UTC+8）：1970-01-01 08:00:01',text)
 
+    def test_realized_pnl_requires_complete_matching_fills(self):
+        from decimal import Decimal
+        from app import actual_copy_realized_pnl
+        trades=[{'id':1,'symbol':'BTCUSDT','orderId':42,'qty':'0.01','realizedPnl':'1.235','marginAsset':'USDT'},
+                {'id':2,'symbol':'BTCUSDT','orderId':42,'qty':'0.011','realizedPnl':'-0.035','marginAsset':'USDT'}]
+        calc=lambda rows: actual_copy_realized_pnl(rows,'BTCUSDT',42,Decimal('0.021'),'USDT')
+        self.assertEqual(calc(trades),'1.2')
+        self.assertIsNone(calc(trades[:1]))
+        self.assertIsNone(calc(trades+[trades[0]]))
+        self.assertIsNone(calc([dict(trades[0],orderId=43),trades[1]]))
+        self.assertIsNone(calc([dict(trades[0],realizedPnl='NaN'),trades[1]]))
+        self.assertEqual(calc([dict(trades[0],realizedPnl='0'),dict(trades[1],realizedPnl='0')]),'0')
+
     def test_actual_notional_uses_only_exchange_fills(self):
         from decimal import Decimal
         from app import actual_copy_notional, notification_number
