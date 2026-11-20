@@ -147,7 +147,7 @@ class CopyExecutionTests(unittest.TestCase):
         self.assertEqual(params['positionSide'],'SHORT')
         self.assertEqual(params['type'],'MARKET')
         self.assertNotIn('reduceOnly',params)
-        self.assertEqual(self.rows('SELECT quantity FROM copied_positions')[0]['quantity'],'0.06')
+        self.assertEqual(self.rows('SELECT quantity FROM copied_positions')[0]['quantity'],'0')
 
     def test_limit_full_close_does_not_take_extra_account_position(self):
         self.api.balance='10000'
@@ -487,17 +487,52 @@ class CopyExecutionTests(unittest.TestCase):
         self.assertEqual(params['side'],'SELL')
         self.assertEqual(params['reduceOnly'],'true')
         self.assertEqual(self.rows('SELECT state FROM copy_tasks')[0]['state'],'filled')
-        self.assertEqual(self.rows('SELECT quantity FROM copied_positions')[0]['quantity'],'1')
+        self.assertEqual(self.rows('SELECT quantity FROM copied_positions')[0]['quantity'],'0')
 
-    def test_close_ratio_uses_smaller_of_actual_and_attributed_position(self):
+    def test_close_ratio_uses_recorded_position_capped_at_actual(self):
         for side,position_side,amount,hedged in (('SELL','LONG','0.6',False),('BUY','SHORT','-0.6',False),('SELL','LONG','0.6',True),('BUY','SHORT','-0.6',True)):
             with self.subTest(side=side,hedged=hedged):
                 row=order(101,'1');row.update(avgPrice='100',side=side,positionSide=position_side)
                 positions=[{'symbol':'BTCUSDT','positionSide':position_side if hedged else 'BOTH','positionAmt':amount}]
                 params=plan(row,'close','2','2','100',BALANCES,positions,{'dualSidePosition':hedged},QUOTE,RULES)
-                self.assertEqual(params['quantity'],'0.300')
+                self.assertEqual(params['quantity'],'0.600')
                 self.assertEqual(params['positionSide'],position_side if hedged else 'BOTH')
                 self.assertEqual(params.get('reduceOnly'),None if hedged else 'true')
+
+    def test_partial_close_uses_recorded_quantity_when_actual_is_lower(self):
+        row=order(101,'1');row.update(avgPrice='100',side='SELL')
+        positions=[{'symbol':'BTCUSDT','positionSide':'BOTH','positionAmt':'0.08'}]
+        params=plan(row,'close','4','0.12','100',BALANCES,positions,{'dualSidePosition':False},QUOTE,RULES)
+        self.assertEqual(params['quantity'],'0.030')
+        row['executedQty']='3'
+        params=plan(row,'close','4','0.12','100',BALANCES,positions,{'dualSidePosition':False},QUOTE,RULES)
+        self.assertEqual(params['quantity'],'0.080')
+
+    def test_full_close_partial_fill_reconciles_shortage_only_after_fill(self):
+        row=order(101,'2'); row.update(avgPrice='100',side='SELL'); self.api.orders.insert(0,row); self.monitor.poll(PID)
+        with self.store.db() as db:
+            db.execute('INSERT INTO copied_positions VALUES(?,?,?,?,?)',(1,PID,'BTCUSDT','LONG','2'))
+            db.execute("UPDATE copy_tasks SET action='close',before_qty='2'")
+        with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'result',{'status':'EXPIRED','executedQty':'0.3','orderId':1}):
+            self.monitor.execute_copy()
+        self.assertEqual(FakeExchange.calls[0][1]['quantity'],'1.000')
+        self.assertEqual(self.rows('SELECT quantity FROM copied_positions')[0]['quantity'],'0.7')
+        snapshot=self.rows('SELECT * FROM copy_close_snapshots')[0]
+        self.assertEqual((snapshot['tracked_quantity'],snapshot['actual_quantity'],snapshot['leader_full_close']),('2','1',1))
+        self.assertEqual(self.rows('SELECT state FROM copy_tasks')[0]['state'],'finished')
+
+    def test_replayed_close_without_copied_position_does_not_use_manual_position(self):
+        import json
+        from app import identity
+        leader_open=order(99,'4');leader_open['avgPrice']='100'
+        with self.store.db() as db:
+            db.execute('DELETE FROM leader_history WHERE target=?',(PID,))
+            db.execute('INSERT INTO leader_history VALUES(?,?,?,?)',(PID,identity('order',leader_open),99,json.dumps(leader_open)))
+            db.execute('INSERT INTO leader_history_sync(target,complete) VALUES(?,1)',(PID,))
+        row=order(101,'1');row.update(avgPrice='100',side='SELL');self.api.orders=[row];self.monitor.poll(PID)
+        with patch('app.FuturesClient',FakeExchange): self.monitor.execute_copy()
+        self.assertEqual(FakeExchange.calls,[])
+        self.assertIn('没有已成交持仓',self.rows('SELECT error FROM copy_tasks')[0]['error'])
 
     def test_late_same_symbol_signal_is_not_applied_out_of_order(self):
         newer=order(102,'1'); newer['avgPrice']='100'; self.api.orders.insert(0,newer); self.monitor.poll(PID)
@@ -612,6 +647,8 @@ class CopyExecutionTests(unittest.TestCase):
             db.execute('INSERT INTO leader_history VALUES(?,?,?,?)',(PID,identity('order',leader_open),99,json.dumps(leader_open)))
             db.execute('INSERT INTO leader_history_sync(target,complete) VALUES(?,1)',(PID,))
         row=order(101,'1');row['avgPrice']='100';row['side']='SELL';self.api.orders=[row];self.monitor.poll(PID)
+        with self.store.db() as db:
+            db.execute('INSERT INTO copied_positions VALUES(?,?,?,?,?)',(1,PID,'BTCUSDT','LONG','2'))
         positions=[{'symbol':'BTCUSDT','positionSide':'BOTH','positionAmt':'2'}]
         with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'positions',return_value=positions), patch.object(FakeExchange,'result',{'status':'FILLED','executedQty':'0.5','orderId':1}):
             self.monitor.execute_copy()

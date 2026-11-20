@@ -444,6 +444,9 @@ class Store:
               account_id INTEGER NOT NULL, target_id TEXT NOT NULL, symbol TEXT NOT NULL,
               position_side TEXT NOT NULL, quantity TEXT NOT NULL,
               PRIMARY KEY(account_id,target_id,symbol,position_side));
+            CREATE TABLE IF NOT EXISTS copy_close_snapshots (
+              task_id INTEGER PRIMARY KEY, tracked_quantity TEXT NOT NULL, actual_quantity TEXT NOT NULL,
+              leader_full_close INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS close_watch (
               id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER NOT NULL, target_id TEXT NOT NULL,
               symbol TEXT NOT NULL, position_side TEXT NOT NULL, order_key TEXT NOT NULL,
@@ -1201,10 +1204,7 @@ class Monitor:
                                 prior = next((p for p in replay(earlier) if p['symbol']==row['symbol'] and p['side']==row['positionSide']),None) if earlier and not ambiguous else None
                                 if prior and not prior['uncertain'] and number(prior['quantity'])>=number(row['executedQty']):
                                     from market_guard import close_position
-                                    unmatched = plan_action == 'unmatched_close'
                                     plan_action, before_qty = 'close', prior['quantity']
-                                    if unmatched:
-                                        owned_qty = str(close_position(positions,row['symbol'],row['positionSide']))
                             cumulative_row=None
                             already_filled='0'
                             if plan_action=='open' and row.get('incremental') and not row.get('incremental_standalone'):
@@ -1239,6 +1239,11 @@ class Monitor:
                     with self.store.db() as db:
                         db.execute('INSERT OR REPLACE INTO copy_task_audit(task_id,balance_time,asset,wallet_balance,available_balance,lead_balance,reference_price,planned_quantity) VALUES(?,?,?,?,?,?,?,?)', (task['id'],balance_time,'USDT',str(usdt['balance']) if usdt and 'balance' in usdt else None,str(usdt['availableBalance']) if usdt and 'availableBalance' in usdt else None,lead_balance,str(price),params['quantity']))
                         changed = db.execute("UPDATE copy_tasks SET state='submitted',quantity=? WHERE id=? AND state='pending' AND EXISTS (SELECT 1 FROM copy_live l JOIN copy_bindings b ON b.account_id=l.account_id AND b.target_id=l.target_id JOIN targets t ON t.id=l.target_id WHERE l.account_id=copy_tasks.account_id AND l.target_id=copy_tasks.target_id AND l.enabled=1 AND t.enabled=1)",(params['quantity'],task['id'])).rowcount
+                        if changed and plan_action == 'close':
+                            actual_qty = close_position(positions,row['symbol'],row['positionSide'])
+                            full_close = number(row['executedQty']) == number(before_qty)
+                            db.execute('INSERT OR REPLACE INTO copy_close_snapshots VALUES(?,?,?,?)',
+                                       (task['id'],str(owned_qty),str(actual_qty),int(full_close)))
                         if not changed:
                             still_pending = db.execute("SELECT 1 FROM copy_tasks WHERE id=? AND state='pending'",(task['id'],)).fetchone()
                             if still_pending:
@@ -1290,6 +1295,12 @@ class Monitor:
                     pos=db.execute('SELECT quantity FROM copied_positions WHERE account_id=? AND target_id=? AND symbol=? AND position_side=?',(task['account_id'],task['target_id'],row['symbol'],row['positionSide'])).fetchone()
                     before=Fraction(number(pos['quantity'] if pos else '0')); filled=Fraction(executed)
                     after=before+filled if task['action']=='open' else max(Fraction(0),before-filled)
+                    snapshot=db.execute('SELECT * FROM copy_close_snapshots WHERE task_id=?',(task['id'],)).fetchone()
+                    if (snapshot and snapshot['leader_full_close'] and filled>0
+                            and before==Fraction(number(snapshot['tracked_quantity']))
+                            and Fraction(number(snapshot['actual_quantity']))<before):
+                        # Reconcile the pre-existing shortage only after a confirmed fill.
+                        after=max(Fraction(0),Fraction(number(snapshot['actual_quantity']))-filled)
                     db.execute('INSERT OR REPLACE INTO copied_positions VALUES(?,?,?,?,?)',(task['account_id'],task['target_id'],row['symbol'],row['positionSide'],decimal_string(after)))
                     actual_notional = actual_copy_notional(result, executed)
                     db.execute("UPDATE copy_tasks SET state=?,result=?,error='' WHERE id=?",('filled' if status=='FILLED' else 'finished',dumps({'status':status,'executedQty':str(executed),'orderId':result.get('orderId'), 'cumQuote':actual_notional}),task['id']))
