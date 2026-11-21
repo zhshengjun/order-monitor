@@ -1208,9 +1208,6 @@ class Monitor:
                                     db.execute('UPDATE copy_tasks SET lead_balance=? WHERE id=? AND state=\'pending\'',(lead_balance,task['id']))
                             with self.store.db() as db:
                                 old=db.execute('SELECT quantity FROM copied_positions WHERE account_id=? AND target_id=? AND symbol=? AND position_side=?',(task['account_id'],task['target_id'],row['symbol'],row['positionSide'])).fetchone()
-                            with self.store.db() as db:
-                                setting=db.execute('SELECT multiplier FROM copy_multipliers WHERE account_id=? AND target_id=?',(task['account_id'],task['target_id'])).fetchone()
-                            multiplier=setting['multiplier'] if setting else '1'
                             positions = None
                             if task['action'] in ('close','unmatched_close'):
                                 from market_guard import close_position
@@ -1261,14 +1258,13 @@ class Monitor:
                                 base_key=task['order_key'].split(':',1)[0]
                                 with self.store.db() as db:
                                     original=db.execute("SELECT body FROM records WHERE target=? AND kind='order' AND key=?",(task['target_id'],base_key)).fetchone()
-                                    prior=db.execute("SELECT c.result,COALESCE(m.multiplier,'1') AS multiplier FROM copy_tasks c LEFT JOIN copy_task_multipliers m ON m.task_id=c.id WHERE c.account_id=? AND c.target_id=? AND c.id<? AND (c.order_key=? OR c.order_key LIKE ?) AND c.state IN ('filled','finished') ORDER BY c.id",(task['account_id'],task['target_id'],task['id'],base_key,base_key+':%')).fetchall()
+                                    prior=db.execute("SELECT c.result FROM copy_tasks c WHERE c.account_id=? AND c.target_id=? AND c.id<? AND (c.order_key=? OR c.order_key LIKE ?) AND c.state IN ('filled','finished') ORDER BY c.id",(task['account_id'],task['target_id'],task['id'],base_key,base_key+':%')).fetchall()
                                 if not original: raise ValueError('缺少累计成交记录，无法计算增量')
                                 cumulative_row=json.loads(original['body'])
                                 if identity('order',cumulative_row)!=identity('order',row): raise ValueError('累计成交记录不匹配')
-                                if prior: multiplier=prior[0]['multiplier']
                                 filled=sum((Fraction(number(json.loads(item['result'])['executedQty'])) for item in prior),Fraction(0))
                                 already_filled=decimal_string(filled)
-                            params=plan(row,plan_action,before_qty,owned_qty,lead_balance,balances,positions,mode,quote,rules,mark_price=mark_price,leverage=leverage,cumulative_row=cumulative_row,already_filled=already_filled,multiplier=multiplier)
+                            params=plan(row,plan_action,before_qty,owned_qty,lead_balance,balances,positions,mode,quote,rules,mark_price=mark_price,leverage=leverage,cumulative_row=cumulative_row,already_filled=already_filled)
                             price=quote['askPrice'] if row['side']=='BUY' else quote['bidPrice']
                     except (ValueError,ExchangeError,UpstreamError,KeyError,InvalidOperation) as exc:
                         LOG.warning('跟单预检查失败 account=%s symbol=%s: %s', task['account_id'], row.get('symbol',''), str(exc)[:200])
@@ -1290,8 +1286,6 @@ class Monitor:
                     with self.store.db() as db:
                         db.execute('INSERT OR REPLACE INTO copy_task_audit(task_id,balance_time,asset,wallet_balance,available_balance,lead_balance,reference_price,planned_quantity) VALUES(?,?,?,?,?,?,?,?)', (task['id'],balance_time,'USDT',str(usdt['balance']) if usdt and 'balance' in usdt else None,str(usdt['availableBalance']) if usdt and 'availableBalance' in usdt else None,lead_balance,str(price),params['quantity']))
                         changed = db.execute("UPDATE copy_tasks SET state='submitted',quantity=? WHERE id=? AND state='pending' AND EXISTS (SELECT 1 FROM copy_live l JOIN copy_bindings b ON b.account_id=l.account_id AND b.target_id=l.target_id JOIN targets t ON t.id=l.target_id WHERE l.account_id=copy_tasks.account_id AND l.target_id=copy_tasks.target_id AND l.enabled=1 AND t.enabled=1)",(params['quantity'],task['id'])).rowcount
-                        if changed and plan_action == 'open':
-                            db.execute('INSERT OR REPLACE INTO copy_task_multipliers VALUES(?,?)',(task['id'],multiplier))
                         if changed and plan_action == 'close':
                             actual_qty = close_position(positions,row['symbol'],row['positionSide'])
                             full_close = number(row['executedQty']) == number(before_qty)
@@ -1676,7 +1670,7 @@ def handler_factory(store, monitor, token):
                         for row in targets:
                             row['detail'] = json.loads(row['detail'])
                         accounts = [dict(row) for row in store.ordered_rows(db, 'accounts')]
-                        bindings = [dict(r) for r in db.execute("SELECT b.account_id,b.target_id,COALESCE(m.multiplier,'1') AS multiplier FROM copy_bindings b LEFT JOIN copy_multipliers m ON m.account_id=b.account_id AND m.target_id=b.target_id")]
+                        bindings = [dict(r) for r in db.execute("SELECT account_id,target_id FROM copy_bindings")]
                         virtual_sessions = [dict(r) for r in db.execute('SELECT account_id,target_id,active,started_at FROM virtual_sessions')]
                         virtual_positions = [dict(r) for r in db.execute("SELECT account_id,target_id,symbol,position_side,quantity FROM virtual_positions WHERE quantity != '0'")]
                         copy_live = [dict(r) for r in db.execute('SELECT account_id,target_id,enabled FROM copy_live')]
@@ -1919,19 +1913,6 @@ def handler_factory(store, monitor, token):
                             db.execute('DELETE FROM copy_multipliers WHERE account_id=? AND target_id=?', (account_id, target_id))
                             db.execute('DELETE FROM copy_bindings WHERE account_id=? AND target_id=?', (account_id, target_id))
                         LOG.info('copy binding account=%s target=%s selected=%s',account_id,target_id,selected)
-                elif self.path == '/api/copy-multiplier':
-                    account_id,target_id=data.get('account_id'),str(data.get('target_id',''))
-                    try:
-                        multiplier=number(data.get('multiplier'))
-                        if multiplier<=0 or multiplier>1000: raise ValueError('跟单倍数须大于 0 且不超过 1000')
-                    except (TypeError,ValueError,InvalidOperation,OverflowError):
-                        raise ValueError('跟单倍数须大于 0 且不超过 1000') from None
-                    if type(account_id) is not int: raise ValueError('关联参数错误')
-                    with monitor.lock, store.db() as db:
-                        if not db.execute('SELECT 1 FROM copy_bindings WHERE account_id=? AND target_id=?',(account_id,target_id)).fetchone():
-                            raise ValueError('请先关联带单员')
-                        db.execute('INSERT OR REPLACE INTO copy_multipliers VALUES(?,?,?)',(account_id,target_id,format(multiplier,'f')))
-                        LOG.info('copy multiplier account=%s target=%s multiplier=%s',account_id,target_id,multiplier)
                 elif self.path == '/api/virtual-session':
                     account_id, target_id, active = data.get('account_id'), str(data.get('target_id', '')), data.get('active')
                     if not isinstance(account_id, int) or not isinstance(active, bool):

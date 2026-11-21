@@ -37,12 +37,11 @@ class CopyExecutionTests(unittest.TestCase):
     def tearDown(self): self.tmp.cleanup()
     def rows(self,sql):
         with self.store.db() as db: return [dict(r) for r in db.execute(sql)]
-    def test_configured_multiplier_applies_to_open_and_is_recorded(self):
+    def test_saved_multiplier_does_not_increase_open_quantity(self):
         row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
-        with self.store.db() as db: db.execute('INSERT INTO copy_multipliers VALUES(?,?,?)',(1,PID,'2'))
-        with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'result',{'status':'FILLED','executedQty':'1.998','orderId':1}): self.monitor.execute_copy()
-        self.assertEqual(FakeExchange.calls[0][1]['quantity'],'1.998')
-        self.assertEqual(self.rows('SELECT multiplier FROM copy_task_multipliers')[0]['multiplier'],'2')
+        with self.store.db() as db: db.execute('INSERT INTO copy_multipliers VALUES(?,?,?)',(1,PID,'20'))
+        with patch('app.FuturesClient',FakeExchange): self.monitor.execute_copy()
+        self.assertEqual(FakeExchange.calls[0][1]['quantity'],'0.999')
 
     def test_order_placed_before_enabling_but_updated_after_is_followed_once(self):
         self.monitor.now_ms=lambda:300000

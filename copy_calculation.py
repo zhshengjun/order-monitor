@@ -26,10 +26,10 @@ def floor_quantity(quantity, step):
     return steps_quantity(Fraction(positive(quantity, 'quantity')), step)
 
 
-def opening_quantity(lead_qty, lead_price, lead_balance, own_balance, execution_price, step, multiplier='1'):
+def opening_quantity(lead_qty, lead_price, lead_balance, own_balance, execution_price, step):
     ratio = (Fraction(positive(lead_qty, 'lead quantity')) * Fraction(positive(lead_price, 'lead price'))
              * Fraction(positive(own_balance, 'own balance')) / Fraction(positive(lead_balance, 'lead balance'))
-             / Fraction(positive(execution_price, 'execution price')) * Fraction(positive(multiplier, 'copy multiplier')))
+             / Fraction(positive(execution_price, 'execution price')))
     return steps_quantity(ratio, step)
 
 

@@ -5,11 +5,6 @@ from copy_calculation import opening_quantity, closing_quantity, floor_quantity
 class CopyCalculationTests(unittest.TestCase):
     def test_opening_scales_notional_and_floors(self):
         self.assertEqual(opening_quantity('2', '50000', '10000', '100', '51000', '0.00001'), Decimal('0.01960'))
-    def test_opening_multiplier_applies_before_step_rounding(self):
-        self.assertEqual(opening_quantity('2','50000','10000','100','51000','0.00001','20'),Decimal('0.39215'))
-        self.assertEqual(opening_quantity('2','50000','10000','100','51000','0.00001','0.5'),Decimal('0.00980'))
-        with self.assertRaises(ValueError): opening_quantity('2','50000','10000','100','51000','0.1','0')
-
     def test_closing_uses_leader_fraction(self):
         self.assertEqual(closing_quantity('3', '1', '0.01', '0.001'), Decimal('0.004'))
         self.assertEqual(closing_quantity('2', '1', '0.012', '0.001'), Decimal('0.006'))
