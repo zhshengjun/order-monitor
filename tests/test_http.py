@@ -121,10 +121,13 @@ class HTTPTests(unittest.TestCase):
             db.execute('INSERT INTO events(target,name,kind,body,stamp,historical) VALUES(?,?,?,?,?,0)',(pid,'leader','order',json.dumps(b),101))
             db.execute('INSERT INTO events(target,name,kind,body,stamp,historical) VALUES(?,?,?,?,?,0)',(pid,'leader','transfer','{}',102))
         status,data=self.request('/api/events?target=history-visible&kind=leader&limit=10')
-        self.assertEqual(status,200);self.assertEqual(data['total'],3)
-        self.assertEqual([x['stamp'] for x in data['list']],[102,101,100])
-        self.assertEqual(data['list'][1]['body']['executedQty'],'3')
-        self.assertEqual(data['list'][1]['body']['notional'],'0.3')
+        self.assertEqual(status,200);self.assertEqual(data['total'],4)
+        self.assertEqual([x['stamp'] for x in data['list']],[102,101,101,100])
+        self.assertEqual(sorted(x['body']['executedQty'] for x in data['list'] if x['stamp']==101),['1','2'])
+        _,orders=self.request('/api/events?target=history-visible&kind=order&limit=10')
+        self.assertEqual(orders['total'],3)
+        _,transfers=self.request('/api/events?target=history-visible&kind=transfer&limit=10')
+        self.assertEqual(transfers['total'],1)
 
     def test_snapshot_shows_exchange_leverage_and_keeps_positions_on_config_error(self):
         from app import UpstreamError

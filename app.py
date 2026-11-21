@@ -1750,7 +1750,7 @@ def handler_factory(store, monitor, token):
                                 rows = []
                                 if kind in ('leader','order'):
                                     raw = [json.loads(r['body']) for r in db.execute('SELECT body FROM leader_history WHERE target=? ORDER BY stamp,key',(target,))]
-                                    for body in merge_order_fills(raw):
+                                    for body in raw:
                                         body['direction']=direction(body)
                                         body['notional']=body.get('notional',decimal_text(number(body['executedQty'])*number(body['avgPrice'])))
                                         rows.append({'target':target,'name':exists['name'],'kind':'order','body':body,'stamp':int(body['orderTime']),'historical':0})
