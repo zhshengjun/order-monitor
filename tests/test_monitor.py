@@ -117,6 +117,23 @@ class MonitorTests(unittest.TestCase):
             for thread in threads: thread.join()
         self.assertEqual(peak,1)
 
+    def test_order_history_waits_two_seconds_after_success_and_failure(self):
+        from app import Binance
+        client=Binance(); clock=[10.0]; starts=[]; waits=[]
+        def call(endpoint,body):
+            starts.append((body['portfolioId'],body['pageNumber'],clock[0]))
+            clock[0]+=0.25
+            if len(starts)==2: raise UpstreamError('failed')
+            return {'list':[],'total':0}
+        def sleep(delay):
+            waits.append(delay); clock[0]+=delay
+        with patch.object(client,'call',side_effect=call), patch('app.time.monotonic',side_effect=lambda:clock[0]), patch('app.time.sleep',side_effect=sleep):
+            client.history('1','order',1)
+            with self.assertRaises(UpstreamError): client.history('1','order',2)
+            client.history('2','order',1)
+        self.assertEqual(waits,[2.0,2.0])
+        self.assertEqual([item[2] for item in starts],[10.0,12.25,14.5])
+
     def test_upgrade_sets_poll_page_size_to_twenty_once(self):
         with self.store.db() as db:
             settings=self.store.settings(db);settings['page_size']=5

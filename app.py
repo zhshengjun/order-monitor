@@ -330,7 +330,7 @@ class Binance:
                 try:
                     data=self.call('lead-portfolio/'+name,body)
                 finally:
-                    self.order_history_next=time.monotonic()+1.5
+                    self.order_history_next=time.monotonic()+2.0
         else:
             data=self.call('lead-portfolio/'+name,body)
         if not isinstance(data, dict) or not isinstance(data.get('list'), list) or 'total' not in data:
