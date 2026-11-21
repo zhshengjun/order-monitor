@@ -156,9 +156,8 @@ def plan(row, action, before, attributed, lead_balance, balances, positions, mod
             if remaining<=0: raise ValueError('累计跟单数量已达到目标，跳过增量')
             qty=steps_quantity(remaining,step)
             if qty<minimum_qty: raise ValueError('增量不足最小下单量，暂不加仓')
-        # Reserve at least the margin required at 10x, or more if the actual
-        # exchange leverage is lower; this does not change Binance leverage.
-        estimated_margin=Fraction(qty)*max(Fraction(mark),Fraction(Decimal(px)))/min(Fraction(actual_leverage),Fraction(10))
+        # Use the verified exchange leverage for the margin check.
+        estimated_margin=Fraction(qty)*max(Fraction(mark),Fraction(Decimal(px)))/Fraction(actual_leverage)
         if estimated_margin>Fraction(available): raise ValueError('跟单所需保证金超过可用余额')
     else: raise ValueError('无效跟单操作')
     if qty<=0 or qty<min_qty: raise ValueError('跟单数量低于最小数量')

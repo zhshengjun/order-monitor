@@ -39,10 +39,8 @@ class CopyExecutionTests(unittest.TestCase):
         with self.store.db() as db: return [dict(r) for r in db.execute(sql)]
     def test_configured_multiplier_applies_to_open_and_is_recorded(self):
         row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
-        with self.store.db() as db:
-            db.execute('INSERT INTO copy_multipliers VALUES(?,?,?)',(1,PID,'2'))
-        with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'result',{'status':'FILLED','executedQty':'1.998','orderId':1}):
-            self.monitor.execute_copy()
+        with self.store.db() as db: db.execute('INSERT INTO copy_multipliers VALUES(?,?,?)',(1,PID,'2'))
+        with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'result',{'status':'FILLED','executedQty':'1.998','orderId':1}): self.monitor.execute_copy()
         self.assertEqual(FakeExchange.calls[0][1]['quantity'],'1.998')
         self.assertEqual(self.rows('SELECT multiplier FROM copy_task_multipliers')[0]['multiplier'],'2')
 
@@ -716,11 +714,10 @@ class CopyExecutionTests(unittest.TestCase):
         task=self.rows('SELECT state,error FROM copy_tasks')[0]
         self.assertEqual(task['state'],'skipped');self.assertIn('可用余额',task['error'])
 
-    def test_margin_check_uses_ten_or_actual_lower_leverage(self):
+    def test_margin_check_uses_verified_actual_leverage(self):
         row=order(101,'1');row['avgPrice']='100'
         balances=[{'asset':'USDT','balance':'100','availableBalance':'7'}]
-        with self.assertRaisesRegex(ValueError,'可用余额'):
-            plan(row,'open','0','0','100',balances,[],{'dualSidePosition':False},QUOTE,RULES,mark_price='100',leverage='20')
+        self.assertEqual(plan(row,'open','0','0','100',balances,[],{'dualSidePosition':False},QUOTE,RULES,mark_price='100',leverage='20')['quantity'],'0.999')
         balances[0]['availableBalance']='12'
         self.assertEqual(plan(row,'open','0','0','100',balances,[],{'dualSidePosition':False},QUOTE,RULES,mark_price='100',leverage='20')['quantity'],'0.999')
         with self.assertRaisesRegex(ValueError,'可用余额'):
