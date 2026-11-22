@@ -152,9 +152,13 @@ def direction(row):
 
 
 def identity(kind, row):
-    fields = ('symbol', 'side', 'positionSide', 'orderTime') if kind == 'order' else (
-        'time', 'coin', 'amount', 'from', 'to', 'transType')
-    return hashlib.sha256(dumps([row.get(k) for k in fields]).encode()).hexdigest()
+    if kind == 'order':
+        stamp=signal_time(row)
+        parts=[str(row.get(k, '')).strip().upper() for k in ('symbol','side','positionSide')]
+        parts.append(stamp if stamp is not None else ('invalid',row.get('orderTime')))
+    else:
+        parts=[row.get(k) for k in ('time','coin','amount','from','to','transType')]
+    return hashlib.sha256(dumps(parts).encode()).hexdigest()
 
 
 def history_identity(row):
@@ -192,12 +196,17 @@ def clean_history(row):
 
 
 def merge_order_fills(rows):
-    """Merge executions from the same symbol, side and order timestamp."""
+    """Group by update time and direction, deduplicating equal quantities."""
     groups = {}
     for row in rows:
         row = clean_history(row)
-        key = (row['symbol'],row['side'],row['positionSide'],row['orderTime'])
-        groups.setdefault(key, {})[history_identity(row)] = row
+        key = (row['symbol'],row['side'],row['positionSide'],signal_time(row))
+        if key[-1] is None:
+            key += (row['orderTime'],)
+        quantity=decimal_string(Fraction(number(row['executedQty'])))
+        entries=groups.setdefault(key,{})
+        if quantity not in entries or history_identity(row)<history_identity(entries[quantity]):
+            entries[quantity]=row
     merged = []
     for entries in groups.values():
         fills = sorted(entries.values(), key=lambda r:(str(r.get('type','')),history_identity(r)))
@@ -207,7 +216,6 @@ def merge_order_fills(rows):
         if qty <= 0: raise ValueError('合并成交数量无效')
         cost = sum((Fraction(number(r['executedQty']))*Fraction(number(r['avgPrice'])) for r in fills),Fraction(0))
         pnl = sum((Fraction(number(r.get('totalPnl') or '0')) for r in fills),Fraction(0))
-        from virtual_position import decimal_string
         with localcontext() as ctx:
             ctx.prec = 40
             average = cost/qty
@@ -890,7 +898,7 @@ class Monitor:
                         key, stamp = identity(kind, row), int(row[time_key])
                         previous = db.execute('SELECT body FROM records WHERE target=? AND kind=? AND key=?', (pid, kind, key)).fetchone()
                         if kind == 'order':
-                            candidates = db.execute("SELECT key,body FROM records WHERE target=? AND kind='order' AND stamp=?",(pid,stamp)).fetchall()
+                            candidates = db.execute("SELECT key,body FROM records WHERE target=? AND kind='order'",(pid,)).fetchall()
                             matching = [x for x in candidates if identity('order',json.loads(x['body']))==key]
                             if len(matching)>1:
                                 self.stop_copy(db,pid,'%s 同一成交存在多个旧记录，已关闭跟单，请核对记录' % row['symbol'])

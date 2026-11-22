@@ -24,13 +24,17 @@ class LeaderHistoryTests(unittest.TestCase):
             restarted.history_worker()
             self.assertEqual(api.calls,[('order',1)])
 
-    def test_merge_distinct_fills_and_ignore_duplicate(self):
-        a=order(1,'1');a['avgPrice']='100'
-        b=order(1,'1');b['avgPrice']='130'
-        merged=merge_order_fills([a,b,dict(a)])
-        self.assertEqual(len(merged),1)
-        self.assertEqual((merged[0]['executedQty'],merged[0]['notional'],merged[0]['avgPrice']),('2','230','115'))
-        self.assertEqual(replay(merged)[0]['quantity'],'2')
+    def test_merge_by_update_time_and_deduplicate_quantity(self):
+        a=order(1,'1');a.update(avgPrice='100',orderUpdateTime=7)
+        duplicate=dict(a,executedQty='1.000',avgPrice='100')
+        b=order(2,'2');b.update(avgPrice='130',orderUpdateTime=7)
+        other=order(3,'3');other.update(avgPrice='100',orderUpdateTime=8)
+        merged=merge_order_fills([a,b,duplicate,other])
+        self.assertEqual(len(merged),2)
+        combined=next(item for item in merged if item['orderUpdateTime']==7)
+        self.assertEqual((combined['executedQty'],combined['notional'],combined['avgPrice']),('3','360','120'))
+        self.assertEqual(identity('order',a),identity('order',b))
+        self.assertNotEqual(identity('order',a),identity('order',other))
 
     def test_replay_weighted_average_and_partial_close(self):
         a=order(1,'2'); a['avgPrice']='100'
