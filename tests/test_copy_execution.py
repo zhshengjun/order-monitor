@@ -439,6 +439,16 @@ class CopyExecutionTests(unittest.TestCase):
         notice=json.loads(self.rows("SELECT body FROM events WHERE kind='copy'")[0]['body'])['message']
         self.assertIn('实际成交均价：— USDT',notice)
 
+    def test_notification_uses_queried_order_price_when_initial_result_lacks_it(self):
+        self.store.save_settings({'bark_enabled':True,'bark_key':'key'})
+        row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
+        initial={'status':'FILLED','executedQty':'0.999','orderId':1}
+        queried={**initial,'cumQuote':'99.925'}
+        with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'result',initial): self.monitor.execute_copy()
+        with patch('app.FuturesClient',FakeExchange), patch.object(FakeExchange,'result',queried), patch('app.send_notification') as send:
+            self.monitor.deliver()
+        self.assertTrue(any('实际成交均价：100.025 USDT' in call.args[3] for call in send.call_args_list))
+
     def test_close_notification_includes_only_own_order_realized_pnl(self):
         self.store.save_settings({'bark_enabled':True,'bark_key':'key'})
         row=order(101,'1');row.update(avgPrice='100',side='SELL');self.api.orders.insert(0,row);self.monitor.poll(PID)

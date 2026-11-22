@@ -1084,6 +1084,10 @@ class Monitor:
                             queried=client.order(source['symbol'], account['client_id'])
                             if (str(queried.get('orderId'))==str(result.get('orderId')) and number(queried.get('executedQty','0'))==number(result['executedQty'])):
                                 notional=actual_copy_notional(queried,number(result['executedQty']))
+                        executed=number(result['executedQty'])
+                        if notional is not None and executed>0:
+                            unit=source.get('quoteAsset','')
+                            body['message']=body['message'].replace('实际成交均价：— '+unit,'实际成交均价：'+notification_number(number(notional)/executed)+' '+unit,1)
                         configs=client.symbol_config(source['symbol'])
                         config=next((x for x in configs if x.get('symbol')==source['symbol']),None)
                         leverage=number(config['leverage']) if config else Decimal(0)
