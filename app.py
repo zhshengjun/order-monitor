@@ -1350,9 +1350,10 @@ class Monitor:
                         after=max(Fraction(0),Fraction(number(snapshot['actual_quantity']))-filled)
                     db.execute('INSERT OR REPLACE INTO copied_positions VALUES(?,?,?,?,?)',(task['account_id'],task['target_id'],row['symbol'],row['positionSide'],decimal_string(after)))
                     actual_notional = actual_copy_notional(result, executed)
+                    fill_price = number(actual_notional) / executed if actual_notional is not None and executed > 0 else None
                     db.execute("UPDATE copy_tasks SET state=?,result=?,error='' WHERE id=?",('filled' if status=='FILLED' else 'finished',dumps({'status':status,'executedQty':str(executed),'orderId':result.get('orderId'), 'cumQuote':actual_notional}),task['id']))
                     LOG.info('copy result task=%s account=%s symbol=%s status=%s executed_qty=%s',task['id'],task['account_id'],row['symbol'],status,executed)
-                    self.copy_notice(db,task,'%s %s，状态 %s\n实际成交数量：%s %s' % (row['symbol'],direction(row),status,notification_number(executed),row.get('baseAsset','')), {'margin_lookup':True,'margin_action':task['action']})
+                    self.copy_notice(db,task,'%s %s，状态 %s\n实际成交数量：%s %s\n实际成交均价：%s %s' % (row['symbol'],direction(row),status,notification_number(executed),row.get('baseAsset',''),notification_number(fill_price),row.get('quoteAsset','')), {'margin_lookup':True,'margin_action':task['action']})
 
     def check_close_watch(self):
         from market_guard import close_position
