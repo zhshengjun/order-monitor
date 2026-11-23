@@ -1250,8 +1250,6 @@ class Monitor:
                                 from market_guard import close_position
                                 positions = client.positions()
                                 if not isinstance(positions, list): raise ValueError('账户持仓响应格式错误')
-                                if close_position(positions,row['symbol'],row['positionSide']) <= 0:
-                                    raise ValueError('没有对应方向持仓，跳过平仓')
                             balances=client.balance()
                             balance_time=int(time.time()*1000)
                             if not isinstance(balances,list): raise ValueError('账户余额响应格式错误')
@@ -1269,6 +1267,8 @@ class Monitor:
                             mode, rules = client.mode(), client.rules()
                             quote=client.quote(row['symbol'])
                             plan_action, before_qty, owned_qty = task['action'], task['before_qty'], old['quantity'] if old else '0'
+                            close_snapshot_actual = None
+                            close_snapshot_tracked = owned_qty
                             if plan_action in ('close','unmatched_close') and not row.get('incremental'):
                                 # Incremental tasks carry the tracked pre-fill quantity, so replaying
                                 # the leader's earlier history would size the close against the whole
@@ -1310,8 +1310,30 @@ class Monitor:
                                         owned_qty=decimal_string(owner-reserved)
                                         if number(owned_qty)<=0:
                                             raise ValueError('该带单员的跟单持仓已由待确认平仓预留，请核对')
-                                if total > Fraction(close_position(positions,row['symbol'],row['positionSide'])):
-                                    raise ValueError('各带单员跟单持仓合计超过账户实际持仓，已跳过平仓，请核对')
+                                from manual_close import position_quantity
+                                actual = Fraction(position_quantity(row['symbol'],row['positionSide'],positions,mode,allow_empty=True))
+                                if total > actual:
+                                    full_close = number(before_qty)>0 and number(row['executedQty']) == number(before_qty)
+                                    if not full_close:
+                                        raise ValueError('各带单员跟单持仓合计超过账户实际持仓，已跳过平仓，请核对')
+                                    if reserved_by_target.get(task['target_id'],Fraction(0)):
+                                        raise ValueError('该带单员有待确认平仓，请核对后处理全平')
+                                    owner = Fraction(number(owned_qty))
+                                    available = max(Fraction(0),actual-(total-owner))
+                                    available = min(owner,available)
+                                    close_snapshot_actual = decimal_string(available)
+                                    close_snapshot_tracked = owned_qty
+                                    if owner>0 and available==0:
+                                        with self.store.db() as db:
+                                            reason='带单员已全平，扣除其他带单员后无可平数量，已清除该带单员的跟单持仓记录'
+                                            changed=db.execute("UPDATE copy_tasks SET state='skipped',error=? WHERE id=? AND state='pending' AND EXISTS (SELECT 1 FROM copy_live l JOIN copy_bindings b ON b.account_id=l.account_id AND b.target_id=l.target_id JOIN targets t ON t.id=l.target_id WHERE l.account_id=copy_tasks.account_id AND l.target_id=copy_tasks.target_id AND l.enabled=1 AND t.enabled=1)",(reason,task['id'])).rowcount
+                                            if changed:
+                                                db.execute('UPDATE copied_positions SET quantity=? WHERE account_id=? AND target_id=? AND symbol=? AND position_side=?',('0',task['account_id'],task['target_id'],row['symbol'],row['positionSide']))
+                                                self.copy_notice(db,task,'%s %s' % (row['symbol'],reason))
+                                            else:
+                                                db.execute("UPDATE copy_tasks SET state='skipped',error='跟单关联或开关状态不一致，未调整持仓记录' WHERE id=? AND state='pending'",(task['id'],))
+                                        return
+                                    owned_qty=decimal_string(available)
                             cumulative_row=None
                             already_filled='0'
                             if plan_action=='open' and row.get('incremental') and not row.get('incremental_standalone'):
@@ -1350,10 +1372,10 @@ class Monitor:
                         db.execute('INSERT OR REPLACE INTO copy_task_audit(task_id,balance_time,asset,wallet_balance,available_balance,lead_balance,reference_price,planned_quantity) VALUES(?,?,?,?,?,?,?,?)', (task['id'],balance_time,'USDT',str(usdt['balance']) if usdt and 'balance' in usdt else None,str(usdt['availableBalance']) if usdt and 'availableBalance' in usdt else None,lead_balance,str(price),params['quantity']))
                         changed = db.execute("UPDATE copy_tasks SET state='submitted',quantity=? WHERE id=? AND state='pending' AND EXISTS (SELECT 1 FROM copy_live l JOIN copy_bindings b ON b.account_id=l.account_id AND b.target_id=l.target_id JOIN targets t ON t.id=l.target_id WHERE l.account_id=copy_tasks.account_id AND l.target_id=copy_tasks.target_id AND l.enabled=1 AND t.enabled=1)",(params['quantity'],task['id'])).rowcount
                         if changed and plan_action == 'close':
-                            actual_qty = close_position(positions,row['symbol'],row['positionSide'])
+                            actual_qty = close_snapshot_actual if close_snapshot_actual is not None else close_position(positions,row['symbol'],row['positionSide'])
                             full_close = number(row['executedQty']) == number(before_qty)
                             db.execute('INSERT OR REPLACE INTO copy_close_snapshots VALUES(?,?,?,?)',
-                                       (task['id'],str(owned_qty),str(actual_qty),int(full_close)))
+                                       (task['id'],str(close_snapshot_tracked),str(actual_qty),int(full_close)))
                         if not changed:
                             still_pending = db.execute("SELECT 1 FROM copy_tasks WHERE id=? AND state='pending'",(task['id'],)).fetchone()
                             if still_pending:
