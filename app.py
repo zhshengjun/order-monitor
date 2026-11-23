@@ -1772,11 +1772,12 @@ def handler_factory(store, monitor, token):
                 if parsed.path == '/api/copy-tasks':
                     account_id=int(query.get('account_id', ['0'])[0])
                     page=max(1,min(100000,int(query.get('page',['1'])[0])))
+                    limit=max(1,min(50,int(query.get('limit',['50'])[0])))
                     with store.db() as db:
                         if not db.execute('SELECT 1 FROM futures_accounts WHERE id=?',(account_id,)).fetchone():
                             raise ValueError('账号不存在')
                         total=db.execute('SELECT COUNT(*) FROM copy_tasks WHERE account_id=?',(account_id,)).fetchone()[0]
-                        rows=[dict(r) for r in db.execute("SELECT c.id,c.target_id,c.action,c.state,c.error,c.created,c.result,c.body,a.asset,a.wallet_balance,a.available_balance,a.lead_balance,a.planned_quantity,t.name AS target_name FROM copy_tasks c LEFT JOIN copy_task_audit a ON a.task_id=c.id LEFT JOIN targets t ON t.id=c.target_id WHERE c.account_id=? ORDER BY c.id DESC LIMIT 50 OFFSET ?",(account_id,(page-1)*50))]
+                        rows=[dict(r) for r in db.execute("SELECT c.id,c.target_id,c.action,c.state,c.error,c.created,c.result,c.body,a.asset,a.wallet_balance,a.available_balance,a.lead_balance,a.planned_quantity,t.name AS target_name FROM copy_tasks c LEFT JOIN copy_task_audit a ON a.task_id=c.id LEFT JOIN targets t ON t.id=c.target_id WHERE c.account_id=? ORDER BY c.id DESC LIMIT ? OFFSET ?",(account_id,limit,(page-1)*limit))]
                     for row in rows:
                         row['body']=json.loads(row['body'])
                         row['result']=json.loads(row['result']) if row['result'] else None
