@@ -488,6 +488,15 @@ class Store:
             CREATE TABLE IF NOT EXISTS copy_close_snapshots (
               task_id INTEGER PRIMARY KEY, tracked_quantity TEXT NOT NULL, actual_quantity TEXT NOT NULL,
               leader_full_close INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS manual_closes (
+              id TEXT PRIMARY KEY, account_id INTEGER NOT NULL, target_id TEXT NOT NULL,
+              symbol TEXT NOT NULL, side TEXT NOT NULL, percent INTEGER NOT NULL,
+              preview TEXT NOT NULL, client_id TEXT NOT NULL UNIQUE,
+              state TEXT NOT NULL, result TEXT, error TEXT NOT NULL DEFAULT '',
+              created REAL NOT NULL, updated REAL NOT NULL, next_check REAL NOT NULL DEFAULT 0,
+              unknown_notified INTEGER NOT NULL DEFAULT 0);
+            CREATE UNIQUE INDEX IF NOT EXISTS manual_close_one_active_account
+              ON manual_closes(account_id) WHERE state IN ('submitted','needs_review');
             CREATE TABLE IF NOT EXISTS close_watch (
               id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER NOT NULL, target_id TEXT NOT NULL,
               symbol TEXT NOT NULL, position_side TEXT NOT NULL, order_key TEXT NOT NULL,
@@ -505,6 +514,9 @@ class Store:
             columns = {row['name'] for row in db.execute('PRAGMA table_info(copy_tasks)')}
             if 'retry_count' not in columns:
                 db.execute('ALTER TABLE copy_tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0')
+            manual_columns = {row['name'] for row in db.execute('PRAGMA table_info(manual_closes)')}
+            if 'unknown_notified' not in manual_columns:
+                db.execute('ALTER TABLE manual_closes ADD COLUMN unknown_notified INTEGER NOT NULL DEFAULT 0')
             db.execute('INSERT OR IGNORE INTO settings VALUES(1,?)', (dumps(DEFAULTS),))
             sync_columns = {row['name'] for row in db.execute('PRAGMA table_info(leader_history_sync)')}
             if 'last_batch' not in sync_columns:
@@ -700,6 +712,8 @@ class Monitor:
     def __init__(self, store, api=None):
         self.store, self.api = store, api or Binance()
         self.lock = threading.RLock()
+        from manual_close import ManualCloseService
+        self.manual_close = ManualCloseService(store, self.lock, lambda key, secret: FuturesClient(key, secret))
         self.history_lock = threading.RLock()
         self.history_active = set()
         self.stop = threading.Event()
@@ -1192,7 +1206,7 @@ class Monitor:
         # Serial worker: a submitted order with unknown outcome is reconciled, never re-sent.
         with self.lock:
             with self.store.db() as db:
-                task=db.execute("SELECT c.*,a.api_key,a.api_secret FROM copy_tasks c JOIN futures_accounts a ON a.id=c.account_id JOIN virtual_sessions s ON s.account_id=c.account_id AND s.target_id=c.target_id JOIN targets t ON t.id=c.target_id WHERE (c.state='submitted' AND c.next_check<=strftime('%s','now')) OR (c.state='pending' AND c.next_check<=strftime('%s','now') AND s.active=1 AND t.enabled=1 AND NOT EXISTS (SELECT 1 FROM copy_tasks u WHERE u.account_id=c.account_id AND (u.state='submitted' OR (u.state='pending' AND u.id<c.id)))) ORDER BY CASE WHEN c.state='submitted' THEN 0 ELSE 1 END,c.id LIMIT 1").fetchone()
+                task=db.execute("SELECT c.*,a.api_key,a.api_secret FROM copy_tasks c JOIN futures_accounts a ON a.id=c.account_id JOIN virtual_sessions s ON s.account_id=c.account_id AND s.target_id=c.target_id JOIN targets t ON t.id=c.target_id WHERE (c.state='submitted' AND c.next_check<=strftime('%s','now')) OR (c.state='pending' AND c.next_check<=strftime('%s','now') AND s.active=1 AND t.enabled=1 AND NOT EXISTS (SELECT 1 FROM copy_tasks u WHERE u.account_id=c.account_id AND u.state='pending' AND u.id<c.id)) ORDER BY CASE WHEN c.state='submitted' THEN 0 ELSE 1 END,c.id LIMIT 1").fetchone()
             if not task: return
             with timing_context(task=task['id'], account=task['account_id'], target=task['target_id'], state=task['state'], retries=task['retry_count']), timed('copy_attempt'):
                 timing_event('copy_pickup', duration_ms=round((time.monotonic()-pickup_started)*1000,3))
@@ -1253,13 +1267,6 @@ class Monitor:
                                 mark_price, leverage = mark.get('markPrice'), config.get('leverage')
                             if positions is None: positions = client.positions()
                             mode, rules = client.mode(), client.rules()
-                            if task['action'] == 'close':
-                                from market_guard import close_position
-                                with self.store.db() as db:
-                                    amounts = db.execute('SELECT quantity FROM copied_positions WHERE account_id=? AND symbol=? AND position_side=?', (task['account_id'],row['symbol'],row['positionSide'])).fetchall()
-                                total = sum((Fraction(number(x['quantity'])) for x in amounts), Fraction(0))
-                                if total > Fraction(close_position(positions,row['symbol'],row['positionSide'])):
-                                    LOG.warning('copy position mismatch task=%s account=%s symbol=%s recorded=%s actual=%s action=cap_close',task['id'],task['account_id'],row['symbol'],decimal_string(total),close_position(positions,row['symbol'],row['positionSide']))
                             quote=client.quote(row['symbol'])
                             plan_action, before_qty, owned_qty = task['action'], task['before_qty'], old['quantity'] if old else '0'
                             if plan_action in ('close','unmatched_close') and not row.get('incremental'):
@@ -1275,6 +1282,36 @@ class Monitor:
                                 if prior and not prior['uncertain'] and number(prior['quantity'])>=number(row['executedQty']):
                                     from market_guard import close_position
                                     plan_action, before_qty = 'close', prior['quantity']
+                            if plan_action == 'close':
+                                from market_guard import close_position
+                                with self.store.db() as db:
+                                    amounts = db.execute('SELECT target_id,quantity FROM copied_positions WHERE account_id=? AND symbol=? AND position_side=?', (task['account_id'],row['symbol'],row['positionSide'])).fetchall()
+                                    manual = db.execute("SELECT target_id,preview FROM manual_closes WHERE account_id=? AND symbol=? AND side=? AND state IN ('submitted','needs_review')",(task['account_id'],row['symbol'],row['positionSide'])).fetchone()
+                                    outstanding = db.execute("SELECT target_id,body,quantity FROM copy_tasks WHERE account_id=? AND state='submitted' AND action IN ('close','unmatched_close')",(task['account_id'],)).fetchall()
+                                quantities = [number(x['quantity']) for x in amounts]
+                                if any(q<0 for q in quantities):
+                                    raise ValueError('跟单持仓记录异常，已跳过平仓，请核对')
+                                total = sum((Fraction(q) for q in quantities), Fraction(0))
+                                reserved_by_target={}
+                                if manual and manual['target_id']:
+                                    reserved_by_target[manual['target_id']]=Fraction(number(json.loads(manual['preview'])['plan']['quantity']))
+                                for pending in outstanding:
+                                    pending_row=json.loads(pending['body'])
+                                    if pending_row.get('symbol')==row['symbol'] and pending_row.get('positionSide')==row['positionSide']:
+                                        if not pending['quantity']:
+                                            raise ValueError('待确认平仓数量缺失，请核对')
+                                        target=pending['target_id']
+                                        reserved_by_target[target]=reserved_by_target.get(target,Fraction(0))+Fraction(number(pending['quantity']))
+                                for target,reserved in reserved_by_target.items():
+                                    owner=next((Fraction(number(x['quantity'])) for x in amounts if x['target_id']==target),Fraction(0))
+                                    if reserved<0 or reserved>owner:
+                                        raise ValueError('待确认平仓预留数量超过对应跟单持仓，请核对')
+                                    if target==task['target_id']:
+                                        owned_qty=decimal_string(owner-reserved)
+                                        if number(owned_qty)<=0:
+                                            raise ValueError('该带单员的跟单持仓已由待确认平仓预留，请核对')
+                                if total > Fraction(close_position(positions,row['symbol'],row['positionSide'])):
+                                    raise ValueError('各带单员跟单持仓合计超过账户实际持仓，已跳过平仓，请核对')
                             cumulative_row=None
                             already_filled='0'
                             if plan_action=='open' and row.get('incremental') and not row.get('incremental_standalone'):
@@ -1353,7 +1390,10 @@ class Monitor:
                 status=result.get('status')
                 if status not in ('FILLED','CANCELED','EXPIRED','REJECTED','EXPIRED_IN_MATCH'):
                     LOG.info('copy awaiting confirmation task=%s account=%s symbol=%s status=%s',task['id'],task['account_id'],row['symbol'],status)
-                    with self.store.db() as db: db.execute("UPDATE copy_tasks SET next_check=strftime('%s','now')+15 WHERE id=?", (task['id'],))
+                    with self.store.db() as db:
+                        db.execute("UPDATE copy_tasks SET error=?,next_check=strftime('%s','now')+15 WHERE id=?", ('订单结果待确认',task['id']))
+                        if not task['error']:
+                            self.copy_notice(db,task,'%s 订单结果待确认，系统只查询原订单，其他跟单继续执行' % row['symbol'])
                     return
                 executed=number(result.get('executedQty','0'))
                 with self.store.db() as db:
@@ -1574,6 +1614,14 @@ class Monitor:
                     LOG.exception('跟单任务处理异常，保留当前状态')
                 self.stop.wait(1)
 
+        def manual_closes():
+            while not self.stop.is_set():
+                try:
+                    self.manual_close.check_pending()
+                except Exception:
+                    LOG.exception('手动平仓订单核对异常')
+                self.stop.wait(1)
+
         def notifications():
             while not self.stop.is_set():
                 try:
@@ -1583,7 +1631,7 @@ class Monitor:
                 self.stop.wait(1)
 
         self.transfer_background = True
-        workers = [threading.Thread(target=target, daemon=True) for target in (copies, notifications, self.history_worker,self.transfer_worker,self.close_watch_worker)]
+        workers = [threading.Thread(target=target, daemon=True) for target in (copies, manual_closes, notifications, self.history_worker,self.transfer_worker,self.close_watch_worker)]
         for worker in workers: worker.start()
         with self.store.db() as db:
             db.execute('UPDATE targets SET next_check=0 WHERE failures=0')
@@ -1700,18 +1748,24 @@ def handler_factory(store, monitor, token):
                         bindings = [dict(r) for r in db.execute("SELECT b.account_id,b.target_id,COALESCE(m.multiplier,'1') AS multiplier FROM copy_bindings b LEFT JOIN copy_multiplier_settings_v2 m ON m.account_id=b.account_id AND m.target_id=b.target_id")]
                         virtual_sessions = [dict(r) for r in db.execute('SELECT account_id,target_id,active,started_at FROM virtual_sessions')]
                         virtual_positions = [dict(r) for r in db.execute("SELECT account_id,target_id,symbol,position_side,quantity FROM virtual_positions WHERE quantity != '0'")]
+                        copied_positions = [dict(r) for r in db.execute("SELECT p.account_id,p.target_id,p.symbol,p.position_side,p.quantity,COALESCE(t.name,p.target_id) AS target_name FROM copied_positions p LEFT JOIN targets t ON t.id=p.target_id WHERE p.quantity != '0'")]
                         copy_live = [dict(r) for r in db.execute('SELECT account_id,target_id,enabled FROM copy_live')]
                         copy_tasks = [dict(r) for r in db.execute("SELECT c.id,c.account_id,c.target_id,c.state,c.error,c.created,c.result,c.body,a.balance_time,a.asset,a.wallet_balance,a.available_balance,a.lead_balance,a.reference_price,a.planned_quantity FROM copy_tasks c LEFT JOIN copy_task_audit a ON a.task_id=c.id ORDER BY c.id DESC LIMIT 50")]
                         virtual_events = [dict(r) for r in db.execute("SELECT account_id,target_id,symbol,position_side,stamp,action,quantity FROM virtual_events WHERE action='unmatched_close' ORDER BY stamp DESC LIMIT 20")]
                         counts = dict(db.execute('SELECT status,COUNT(*) FROM outbox GROUP BY status').fetchall())
                         errors = [dict(r) for r in db.execute("SELECT channel,attempts,error FROM outbox WHERE status='pending' AND error!='' ORDER BY id DESC LIMIT 5")]
                         unresolved = [dict(r) for r in db.execute("SELECT c.id,c.body,c.error,a.name AS account_name,t.name AS target_name FROM copy_tasks c JOIN futures_accounts a ON a.id=c.account_id JOIN targets t ON t.id=c.target_id WHERE c.state='submitted' ORDER BY c.id")]
+                        unresolved_manual = [dict(r) for r in db.execute("SELECT m.id,m.account_id,m.symbol,m.side,m.state,m.error,a.name AS account_name FROM manual_closes m JOIN futures_accounts a ON a.id=m.account_id WHERE m.state IN ('submitted','needs_review') ORDER BY m.created")]
                         for item in unresolved:
                             item['symbol'] = json.loads(item.pop('body')).get('symbol','')
                     settings = store.settings()
                     for key in SECRETS:
                         settings[key + '_configured'] = bool(settings.pop(key))
-                    return self.reply({'targets': targets, 'settings': settings, 'notifications': counts, 'notification_errors': errors, 'unresolved_orders': unresolved, 'futures_accounts': accounts, 'copy_bindings': bindings, 'virtual_sessions': virtual_sessions, 'virtual_positions': virtual_positions, 'virtual_events': virtual_events, 'copy_tasks': copy_tasks, 'copy_live': copy_live})
+                    return self.reply({'targets': targets, 'settings': settings, 'notifications': counts, 'notification_errors': errors, 'unresolved_orders': unresolved, 'unresolved_manual_closes': unresolved_manual, 'futures_accounts': accounts, 'copy_bindings': bindings, 'virtual_sessions': virtual_sessions, 'virtual_positions': virtual_positions, 'copied_positions': copied_positions, 'virtual_events': virtual_events, 'copy_tasks': copy_tasks, 'copy_live': copy_live})
+                if parsed.path == '/api/manual-close-candidates':
+                    return self.reply(monitor.manual_close.candidates(int(query.get('account_id',['0'])[0]),query.get('symbol',[''])[0],query.get('side',[''])[0]))
+                if parsed.path == '/api/manual-close-status':
+                    return self.reply(monitor.manual_close.status(int(query.get('account_id',['0'])[0]),query.get('id',[''])[0]))
                 if parsed.path == '/api/futures-network':
                     proxies = urllib.request.getproxies()
                     via_proxy = bool(proxies.get('https')) and not urllib.request.proxy_bypass('fapi.binance.com')
@@ -1843,7 +1897,7 @@ def handler_factory(store, monitor, token):
                         raise ValueError('请输入 1～80 字的昵称')
                     return self.reply(monitor.api.search(nickname, max(1, min(100, int(query.get('page', ['1'])[0])))))
                 self.reply({'error': 'Not found'}, 404)
-            except (ValueError, UpstreamError) as exc:
+            except (ValueError, UpstreamError, ExchangeError) as exc:
                 self.reply({'error': str(exc)}, 400)
             except Exception:
                 self.reply({'error': '服务器处理失败'}, 500)
@@ -1871,6 +1925,10 @@ def handler_factory(store, monitor, token):
                     return self.reply({'error': '请先登录'}, 401)
                 if self.path == '/api/logout':
                     return self.reply({'ok': True}, cookie='om_session=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/')
+                if self.path == '/api/manual-close-preview':
+                    return self.reply(monitor.manual_close.preview(data.get('account_id'),data.get('symbol'),data.get('side'),data.get('percent'),data.get('target_id')))
+                if self.path == '/api/manual-close-execute':
+                    return self.reply(monitor.manual_close.submit(data.get('account_id'),data.get('id')))
                 if self.path == '/api/display-order':
                     store.reorder(data.get('kind'), data.get('id'), data.get('relative_id'), data.get('side'))
                 elif self.path == '/api/targets':
@@ -1897,6 +1955,7 @@ def handler_factory(store, monitor, token):
                     with monitor.history_lock, monitor.lock, store.db() as db:
                         table='targets' if is_target else 'futures_accounts'
                         if not db.execute('SELECT 1 FROM '+table+' WHERE id=?',(item,)).fetchone(): raise ValueError('对象不存在')
+                        if db.execute("SELECT 1 FROM manual_closes WHERE "+column+"=? AND state IN ('submitted','needs_review') LIMIT 1",(item,)).fetchone(): raise ValueError('存在待确认的手动平仓，无法删除')
                         if db.execute("SELECT 1 FROM copy_tasks WHERE "+column+"=? AND state IN ('pending','submitted') LIMIT 1",(item,)).fetchone(): raise ValueError('存在待执行或待确认订单，无法删除')
                         positions=db.execute('SELECT account_id,symbol,position_side,quantity FROM copied_positions WHERE '+column+'=?',(item,)).fetchall()
                         outstanding=[p for p in positions if number(p['quantity'])!=0]
@@ -1926,6 +1985,7 @@ def handler_factory(store, monitor, token):
                         db.execute('DELETE FROM copy_task_audit WHERE task_id IN (SELECT id FROM copy_tasks WHERE '+column+'=?)',(item,))
                         db.execute('DELETE FROM copy_task_multiplier_v2 WHERE task_id IN (SELECT id FROM copy_tasks WHERE '+column+'=?)',(item,))
                         db.execute('DELETE FROM copy_multiplier_settings_v2 WHERE '+column+'=?',(item,))
+                        db.execute('DELETE FROM manual_closes WHERE '+column+'=?',(item,))
                         for name in ('close_watch','copy_tasks','copied_positions','copy_multipliers','copy_bindings','copy_live','virtual_sessions','virtual_positions','virtual_events'):
                             db.execute('DELETE FROM '+name+' WHERE '+column+'=?',(item,))
                         if is_target:
@@ -1954,6 +2014,7 @@ def handler_factory(store, monitor, token):
                             else:
                                 if not db.execute('SELECT 1 FROM futures_accounts WHERE id=?',(account_id,)).fetchone(): raise ValueError('账号不存在')
                                 if key:
+                                    if db.execute("SELECT 1 FROM manual_closes WHERE account_id=? AND state IN ('submitted','needs_review')",(account_id,)).fetchone(): raise ValueError('该账户有待确认的手动平仓，无法更换密钥')
                                     active=db.execute("SELECT 1 FROM copy_live WHERE account_id=? AND enabled=1 UNION ALL SELECT 1 FROM copy_tasks WHERE account_id=? AND state IN ('pending','submitted') LIMIT 1",(account_id,account_id)).fetchone()
                                     positions=db.execute('SELECT quantity FROM copied_positions WHERE account_id=?',(account_id,)).fetchall()
                                     if active or any(number(row['quantity'])!=0 for row in positions):
@@ -2062,7 +2123,7 @@ def handler_factory(store, monitor, token):
                 else:
                     return self.reply({'error': 'Not found'}, 404)
                 self.reply({'ok': True})
-            except (ValueError, UpstreamError, InvalidOperation) as exc:
+            except (ValueError, UpstreamError, ExchangeError, InvalidOperation) as exc:
                 self.reply({'error': str(exc)}, 400)
             except Exception:
                 self.reply({'error': '服务器处理失败'}, 500)

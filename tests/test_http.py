@@ -46,6 +46,27 @@ class HTTPTests(unittest.TestCase):
         with response:
             return response.status, json.loads(response.read())
 
+    def test_manual_close_http_auth_and_idempotency(self):
+        from test_manual_close import FakeManualExchange
+        exchange=FakeManualExchange()
+        with self.store.db() as db:
+            db.execute("INSERT INTO futures_accounts(name,api_key,api_secret) VALUES('manual-http','key','secret')")
+            account=db.execute("SELECT id FROM futures_accounts WHERE name='manual-http'").fetchone()[0]
+            db.execute("INSERT INTO targets(id,name) VALUES('manual-http-target','Alice')")
+            db.execute("INSERT INTO copied_positions VALUES(?,?,?,?,?)",(account,'manual-http-target','BTCUSDT','LONG','0.8'))
+        args={'account_id':account,'symbol':'BTCUSDT','side':'LONG','percent':20,'target_id':'manual-http-target'}
+        self.assertEqual(self.request('/api/manual-close-preview',args,authenticated=False)[0],401)
+        with patch('app.FuturesClient',return_value=exchange):
+            status,options=self.request('/api/manual-close-candidates?account_id=%s&symbol=BTCUSDT&side=LONG'%account)
+            self.assertEqual((status,options['leaders'][0]['quantity']),(200,'0.8'))
+            status,preview=self.request('/api/manual-close-preview',args)
+            self.assertEqual((status,preview['plan']['quantity']),(200,'0.160'))
+            body={'account_id':account,'id':preview['id']}
+            self.assertEqual(self.request('/api/manual-close-execute',body)[1]['state'],'finished')
+            self.assertEqual(self.request('/api/manual-close-execute',body)[1]['state'],'finished')
+            self.assertEqual(len(exchange.requests),1)
+            self.assertNotEqual(self.request('/api/manual-close-status?account_id=%s&id=%s'%(account+1,preview['id']))[0],200)
+
     def test_copy_switch_is_explicit_and_starts_zero_baseline(self):
         from app import FuturesClient
         with self.store.db() as db:

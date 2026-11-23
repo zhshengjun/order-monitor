@@ -4,7 +4,7 @@ WORKDIR /app
 RUN groupadd --gid 10001 monitor && useradd --uid 10001 --gid 10001 --create-home monitor && mkdir /data && chown monitor:monitor /data
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir --require-hashes --only-binary=:all: -r /app/requirements.txt
-COPY --chown=monitor:monitor pooled_http.py app.py virtual_position.py leader_replay.py copy_calculation.py market_guard.py copy_executor.py timing.py /app/
+COPY --chown=monitor:monitor pooled_http.py app.py virtual_position.py leader_replay.py copy_calculation.py market_guard.py copy_executor.py manual_close.py timing.py /app/
 COPY --chown=monitor:monitor static /app/static
 COPY docker-entrypoint.py /app/docker-entrypoint.py
 ENTRYPOINT ["python", "/app/docker-entrypoint.py"]
