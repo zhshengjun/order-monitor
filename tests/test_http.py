@@ -118,6 +118,17 @@ class HTTPTests(unittest.TestCase):
             self.assertNotEqual(self.request('/api/copy-task-pnl?account_id=0&task_id=%s'%task)[0],200)
             self.assertEqual(self.request('/api/copy-task-pnl?account_id=%s&task_id=%s'%(account,task),authenticated=False)[0],401)
 
+    def test_leader_mark_prices_are_public_validated_and_fail_soft(self):
+        from copy_executor import ExchangeError
+        with patch('app.FuturesClient') as client:
+            client.return_value.request.return_value=[{'symbol':'BTCUSDT','markPrice':'100.5'},{'symbol':'ETHUSDT','markPrice':'NaN'}]
+            status,data=self.request('/api/leader-mark-prices')
+            self.assertEqual((status,data['prices']),(200,{'BTCUSDT':'100.5'}))
+            client.return_value.request.assert_called_once_with('/fapi/v1/premiumIndex')
+            client.return_value.request.side_effect=ExchangeError('offline')
+            self.assertEqual(self.request('/api/leader-mark-prices')[1]['prices'],{})
+            self.assertEqual(self.request('/api/leader-mark-prices',authenticated=False)[0],401)
+
     def test_leader_record_pages_use_ten(self):
         with self.store.db() as db:
             for i in range(21):

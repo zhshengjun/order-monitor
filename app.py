@@ -1738,6 +1738,23 @@ def handler_factory(store, monitor, token):
                     with monitor.history_lock:
                         active = pid in monitor.history_active
                     return self.reply({'positions':replay(rows), 'count':len(rows), 'staged':staged, 'sync':dict(sync) if sync else None, 'monitor':dict(target), 'history_active':active})
+                if parsed.path == '/api/leader-mark-prices':
+                    try:
+                        data=FuturesClient('','').request('/fapi/v1/premiumIndex')
+                        if not isinstance(data,list):
+                            raise ValueError('标记价格响应无效')
+                        prices={}
+                        for item in data:
+                            if not isinstance(item,dict) or not isinstance(item.get('symbol'),str):
+                                continue
+                            try:
+                                price=number(item['markPrice'])
+                                if price>0: prices[item['symbol']]=str(price)
+                            except (KeyError,ValueError,TypeError,InvalidOperation):
+                                continue
+                        return self.reply({'prices':prices,'queried_at':int(time.time()*1000)})
+                    except (ExchangeError,ValueError,TypeError):
+                        return self.reply({'prices':{},'queried_at':None})
                 if parsed.path == '/api/copy-tasks':
                     account_id=int(query.get('account_id', ['0'])[0])
                     page=max(1,min(100000,int(query.get('page',['1'])[0])))
