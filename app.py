@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import queue
+import re
 import sqlite3
 import socket
 import ssl
@@ -451,6 +452,11 @@ class Store:
               PRIMARY KEY(account_id,target_id));
             CREATE TABLE IF NOT EXISTS copy_task_multipliers (
               task_id INTEGER PRIMARY KEY, multiplier TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS copy_multiplier_settings_v2 (
+              account_id INTEGER NOT NULL, target_id TEXT NOT NULL, multiplier TEXT NOT NULL,
+              PRIMARY KEY(account_id,target_id));
+            CREATE TABLE IF NOT EXISTS copy_task_multiplier_v2 (
+              task_id INTEGER PRIMARY KEY, multiplier TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS virtual_sessions (
               account_id INTEGER NOT NULL, target_id TEXT NOT NULL, started_at INTEGER NOT NULL,
               active INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(account_id,target_id));
@@ -819,6 +825,11 @@ class Monitor:
             client_id = 'cp_' + hashlib.sha256((str(aid)+':'+pid+':'+key).encode()).hexdigest()[:30]
             created = db.execute('INSERT OR IGNORE INTO copy_tasks(account_id,target_id,order_key,body,action,before_qty,lead_balance,client_id,created) VALUES(?,?,?,?,?,?,?,?,?)',
                        (aid,pid,key,dumps(row),change['action'],change['before'],'' if lead_balance is None else str(lead_balance),client_id,int(time.time()*1000)))
+            if created.rowcount:
+                base_key=key.split(':',1)[0]
+                prior=db.execute("SELECT COALESCE(m.multiplier,'1') AS multiplier FROM copy_tasks c LEFT JOIN copy_task_multiplier_v2 m ON m.task_id=c.id WHERE c.account_id=? AND c.target_id=? AND (c.order_key=? OR c.order_key LIKE ?) AND c.id<? ORDER BY c.id LIMIT 1",(aid,pid,base_key,base_key+':%',created.lastrowid)).fetchone() if row.get('incremental') and not row.get('incremental_standalone') else None
+                setting=db.execute('SELECT multiplier FROM copy_multiplier_settings_v2 WHERE account_id=? AND target_id=?',(aid,pid)).fetchone()
+                db.execute('INSERT INTO copy_task_multiplier_v2 VALUES(?,?)',(created.lastrowid,prior['multiplier'] if prior else setting['multiplier'] if setting else '1'))
             LOG.info('copy decision target=%s account=%s symbol=%s order_time=%s action=%s result=%s',pid,aid,symbol,row['orderTime'],change['action'],'queued' if created.rowcount else 'existing_task')
             if created.rowcount and change['action'] in ('close','unmatched_close') and number(change['before'])>0 and number(row['executedQty'])>=number(change['before']):
                 db.execute('INSERT OR IGNORE INTO close_watch(account_id,target_id,symbol,position_side,order_key,task_id) VALUES(?,?,?,?,?,?)',(aid,pid,symbol,side,key,created.lastrowid))
@@ -1276,7 +1287,10 @@ class Monitor:
                                 if identity('order',cumulative_row)!=identity('order',row): raise ValueError('累计成交记录不匹配')
                                 filled=sum((Fraction(number(json.loads(item['result'])['executedQty'])) for item in prior),Fraction(0))
                                 already_filled=decimal_string(filled)
-                            params=plan(row,plan_action,before_qty,owned_qty,lead_balance,balances,positions,mode,quote,rules,mark_price=mark_price,leverage=leverage,cumulative_row=cumulative_row,already_filled=already_filled)
+                            with self.store.db() as db:
+                                multiplier_row=db.execute('SELECT multiplier FROM copy_task_multiplier_v2 WHERE task_id=?',(task['id'],)).fetchone()
+                            multiplier=multiplier_row['multiplier'] if multiplier_row else '1'
+                            params=plan(row,plan_action,before_qty,owned_qty,lead_balance,balances,positions,mode,quote,rules,mark_price=mark_price,leverage=leverage,cumulative_row=cumulative_row,already_filled=already_filled,multiplier=multiplier)
                             price=quote['askPrice'] if row['side']=='BUY' else quote['bidPrice']
                     except (ValueError,ExchangeError,UpstreamError,KeyError,InvalidOperation) as exc:
                         LOG.warning('跟单预检查失败 account=%s symbol=%s: %s', task['account_id'], row.get('symbol',''), str(exc)[:200])
@@ -1683,7 +1697,7 @@ def handler_factory(store, monitor, token):
                         for row in targets:
                             row['detail'] = json.loads(row['detail'])
                         accounts = [dict(row) for row in store.ordered_rows(db, 'accounts')]
-                        bindings = [dict(r) for r in db.execute("SELECT account_id,target_id FROM copy_bindings")]
+                        bindings = [dict(r) for r in db.execute("SELECT b.account_id,b.target_id,COALESCE(m.multiplier,'1') AS multiplier FROM copy_bindings b LEFT JOIN copy_multiplier_settings_v2 m ON m.account_id=b.account_id AND m.target_id=b.target_id")]
                         virtual_sessions = [dict(r) for r in db.execute('SELECT account_id,target_id,active,started_at FROM virtual_sessions')]
                         virtual_positions = [dict(r) for r in db.execute("SELECT account_id,target_id,symbol,position_side,quantity FROM virtual_positions WHERE quantity != '0'")]
                         copy_live = [dict(r) for r in db.execute('SELECT account_id,target_id,enabled FROM copy_live')]
@@ -1909,6 +1923,8 @@ def handler_factory(store, monitor, token):
                         elif outstanding:
                             raise ValueError('存在跟单持仓，请先核对并处理后再删除')
                         db.execute('DELETE FROM copy_task_audit WHERE task_id IN (SELECT id FROM copy_tasks WHERE '+column+'=?)',(item,))
+                        db.execute('DELETE FROM copy_task_multiplier_v2 WHERE task_id IN (SELECT id FROM copy_tasks WHERE '+column+'=?)',(item,))
+                        db.execute('DELETE FROM copy_multiplier_settings_v2 WHERE '+column+'=?',(item,))
                         for name in ('close_watch','copy_tasks','copied_positions','copy_multipliers','copy_bindings','copy_live','virtual_sessions','virtual_positions','virtual_events'):
                             db.execute('DELETE FROM '+name+' WHERE '+column+'=?',(item,))
                         if is_target:
@@ -1960,8 +1976,21 @@ def handler_factory(store, monitor, token):
                             db.execute('UPDATE virtual_sessions SET active=0 WHERE account_id=? AND target_id=?', (account_id,target_id))
                             db.execute("UPDATE copy_tasks SET state='cancelled',error='跟单已关闭' WHERE account_id=? AND target_id=? AND state='pending'",(account_id,target_id))
                             db.execute('DELETE FROM copy_multipliers WHERE account_id=? AND target_id=?', (account_id, target_id))
+                            db.execute('DELETE FROM copy_multiplier_settings_v2 WHERE account_id=? AND target_id=?', (account_id, target_id))
                             db.execute('DELETE FROM copy_bindings WHERE account_id=? AND target_id=?', (account_id, target_id))
                         LOG.info('copy binding account=%s target=%s selected=%s',account_id,target_id,selected)
+                elif self.path == '/api/copy-multiplier':
+                    account_id,target_id=data.get('account_id'),str(data.get('target_id',''))
+                    raw=data.get('multiplier')
+                    if not isinstance(account_id,int) or isinstance(account_id,bool) or not isinstance(raw,str) or not re.fullmatch(r'(?:\d{1,3})(?:\.\d{1,4})?',raw):
+                        raise ValueError('倍数必须为 0.0001 至 100 的数字，最多四位小数')
+                    value=number(raw)
+                    if value<=0 or value>100:
+                        raise ValueError('倍数必须为 0.0001 至 100 的数字，最多四位小数')
+                    with monitor.lock, store.db() as db:
+                        if not db.execute('SELECT 1 FROM copy_bindings WHERE account_id=? AND target_id=?',(account_id,target_id)).fetchone():
+                            raise ValueError('请先关联带单员')
+                        db.execute('INSERT OR REPLACE INTO copy_multiplier_settings_v2 VALUES(?,?,?)',(account_id,target_id,decimal_text(value)))
                 elif self.path == '/api/virtual-session':
                     account_id, target_id, active = data.get('account_id'), str(data.get('target_id', '')), data.get('active')
                     if not isinstance(account_id, int) or not isinstance(active, bool):

@@ -43,6 +43,14 @@ class CopyExecutionTests(unittest.TestCase):
         with patch('app.FuturesClient',FakeExchange): self.monitor.execute_copy()
         self.assertEqual(FakeExchange.calls[0][1]['quantity'],'0.999')
 
+    def test_multiplier_is_frozen_when_task_is_created(self):
+        with self.store.db() as db: db.execute('INSERT INTO copy_multiplier_settings_v2 VALUES(?,?,?)',(1,PID,'2'))
+        row=order(101,'1');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
+        with self.store.db() as db: db.execute('UPDATE copy_multiplier_settings_v2 SET multiplier=? WHERE account_id=? AND target_id=?',('3',1,PID))
+        with patch('app.FuturesClient',FakeExchange): self.monitor.execute_copy()
+        self.assertEqual(FakeExchange.calls[0][1]['quantity'],'1.998')
+        self.assertEqual(self.rows('SELECT multiplier FROM copy_task_multiplier_v2')[0]['multiplier'],'2')
+
     def test_order_placed_before_enabling_but_updated_after_is_followed_once(self):
         self.monitor.now_ms=lambda:300000
         with self.store.db() as db:
@@ -87,6 +95,7 @@ class CopyExecutionTests(unittest.TestCase):
         positions=[{'symbol':'BTCUSDT','positionSide':'BOTH','positionAmt':'0.0105'}]
         params=plan(row,'close','3','0.0105','100',BALANCES,positions,{'dualSidePosition':False},QUOTE,RULES)
         self.assertEqual(params['quantity'],'0.004')
+        self.assertEqual(plan(row,'close','3','0.0105','100',BALANCES,positions,{'dualSidePosition':False},QUOTE,RULES,multiplier='10')['quantity'],'0.004')
         row['executedQty']='3'
         params=plan(row,'close','3','0.0105','100',BALANCES,positions,{'dualSidePosition':False},QUOTE,RULES)
         self.assertEqual(params['quantity'],'0.010')
@@ -738,6 +747,8 @@ class CopyExecutionTests(unittest.TestCase):
         balances[0]['availableBalance']='12'
         self.assertEqual(plan(row,'open','0','0','100',balances,[],{'dualSidePosition':False},QUOTE,RULES,mark_price='100',leverage='20')['quantity'],'0.999')
         with self.assertRaisesRegex(ValueError,'可用余额'):
+            plan(row,'open','0','0','100',balances,[],{'dualSidePosition':False},QUOTE,RULES,mark_price='100',leverage='20',multiplier='3')
+        with self.assertRaisesRegex(ValueError,'可用余额'):
             plan(row,'open','0','0','100',balances,[],{'dualSidePosition':False},QUOTE,RULES,mark_price='100',leverage='5')
 
     def test_open_fails_when_wallet_balance_missing_or_invalid(self):
@@ -792,12 +803,15 @@ class CopyExecutionTests(unittest.TestCase):
 
     def test_split_fills_across_polls_follow_increment(self):
         import json
+        with self.store.db() as db: db.execute('INSERT INTO copy_multiplier_settings_v2 VALUES(?,?,?)',(1,PID,'2'))
         row=order(101,'0.4');row['avgPrice']='100';self.api.orders.insert(0,row);self.monitor.poll(PID)
         self.assertEqual(self.rows('SELECT enabled FROM copy_live')[0]['enabled'],1)
         self.assertEqual(self.rows('SELECT quantity FROM virtual_positions')[0]['quantity'],'0.4')
+        with self.store.db() as db: db.execute("UPDATE copy_multiplier_settings_v2 SET multiplier='3' WHERE account_id=? AND target_id=?",(1,PID))
         self.api.orders[0]['executedQty']='1';self.monitor.poll(PID)
         self.assertEqual(self.rows('SELECT enabled FROM copy_live')[0]['enabled'],1)
         tasks=self.rows('SELECT * FROM copy_tasks ORDER BY id')
+        self.assertEqual([r['multiplier'] for r in self.rows('SELECT multiplier FROM copy_task_multiplier_v2 ORDER BY task_id')],['2','2'])
         self.assertEqual([json.loads(t['body'])['executedQty'] for t in tasks],['0.4','0.6'])
         self.assertEqual([json.loads(t['body'])['avgPrice'] for t in tasks],['100','100'])
         self.assertEqual(self.rows('SELECT quantity FROM virtual_positions')[0]['quantity'],'1')

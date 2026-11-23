@@ -91,7 +91,7 @@ def market_rule(exchange, symbol):
     return lot, rules.get('MIN_NOTIONAL',{})
 
 
-def plan(row, action, before, attributed, lead_balance, balances, positions, mode, quote, exchange, mark_price=None, leverage=None, cumulative_row=None, already_filled='0'):
+def plan(row, action, before, attributed, lead_balance, balances, positions, mode, quote, exchange, mark_price=None, leverage=None, cumulative_row=None, already_filled='0', multiplier='1'):
     symbol=row['symbol']; side=row['side']; ps=row['positionSide']
     if (side,ps) not in (('BUY','LONG'),('SELL','LONG'),('SELL','SHORT'),('BUY','SHORT')): raise ValueError('订单方向无效')
     bid,ask=quote['bidPrice'],quote['askPrice']
@@ -135,7 +135,7 @@ def plan(row, action, before, attributed, lead_balance, balances, positions, mod
         if not wallet.is_finite() or wallet<=0: raise ValueError('USDT 钱包余额必须大于零')
         if not available.is_finite() or available<0: raise ValueError('USDT 可用余额无效')
         source=cumulative_row if cumulative_row is not None else row
-        qty=opening_quantity(source['executedQty'],source['avgPrice'],lead_balance,wallet,px,lot['stepSize'])
+        qty=opening_quantity(source['executedQty'],source['avgPrice'],lead_balance,wallet,px,lot['stepSize'],multiplier)
         try:
             mark=Decimal(str(mark_price)); actual_leverage=Decimal(str(leverage))
         except (ValueError, ArithmeticError):

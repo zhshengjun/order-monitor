@@ -94,6 +94,22 @@ class HTTPTests(unittest.TestCase):
         self.assertNotIn('private-secret',json.dumps(first))
         self.assertEqual(self.request('/api/copy-tasks?account_id=%s'%a,authenticated=False)[0],401)
 
+    def test_copy_multiplier_requires_binding_and_ignores_legacy_values(self):
+        with self.store.db() as db:
+            db.execute("INSERT INTO futures_accounts(name,api_key,api_secret) VALUES('multiplier-test','key','secret')")
+            account=db.execute("SELECT id FROM futures_accounts WHERE name='multiplier-test'").fetchone()[0]
+            db.execute("INSERT INTO copy_bindings VALUES(?,?)",(account,'multiplier-leader'))
+            db.execute("INSERT INTO copy_multipliers VALUES(?,?,?)",(account,'multiplier-leader','20'))
+        binding=next(b for b in self.request('/api/state')[1]['copy_bindings'] if b['account_id']==account)
+        self.assertEqual(binding['multiplier'],'1')
+        args={'account_id':account,'target_id':'multiplier-leader','multiplier':'2.5'}
+        self.assertEqual(self.request('/api/copy-multiplier',args)[0],200)
+        binding=next(b for b in self.request('/api/state')[1]['copy_bindings'] if b['account_id']==account)
+        self.assertEqual(binding['multiplier'],'2.5')
+        for invalid in ('0','100.0001','NaN','1e2','0.00001'):
+            self.assertNotEqual(self.request('/api/copy-multiplier',{**args,'multiplier':invalid})[0],200)
+        self.assertNotEqual(self.request('/api/copy-multiplier',{**args,'target_id':'missing'})[0],200)
+
     def test_leader_records_exclude_copy_notifications(self):
         with self.store.db() as db:
             for kind in ('order','transfer','copy'):
