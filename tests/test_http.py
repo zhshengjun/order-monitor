@@ -101,6 +101,23 @@ class HTTPTests(unittest.TestCase):
         status,data=self.request('/api/events?target=separate&kind=leader')
         self.assertEqual(status,200);self.assertEqual({x['kind'] for x in data['list']},{'order','transfer'})
 
+    def test_copy_record_pnl_is_order_scoped_and_validated(self):
+        with self.store.db() as db:
+            db.execute("INSERT INTO futures_accounts(name,api_key,api_secret) VALUES('pnl-test','key','secret')")
+            account=db.execute("SELECT id FROM futures_accounts WHERE name='pnl-test'").fetchone()[0]
+            db.execute("INSERT INTO copy_tasks(account_id,target_id,order_key,body,action,before_qty,lead_balance,client_id,created,state,result) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(account,'pnl-leader','pnl-order',json.dumps({'symbol':'BTCUSDT','quoteAsset':'USDT'}),'close','1','100','pnl-client',1,'filled',json.dumps({'orderId':42,'executedQty':'1'})))
+            task=db.execute("SELECT id FROM copy_tasks WHERE client_id='pnl-client'").fetchone()[0]
+        trades=[{'id':1,'symbol':'BTCUSDT','orderId':42,'qty':'1','realizedPnl':'2.5'}]
+        with patch('app.FuturesClient') as client:
+            client.return_value.trades.return_value=trades
+            status,data=self.request('/api/copy-task-pnl?account_id=%s&task_id=%s'%(account,task))
+            self.assertEqual((status,data['pnl'],data['asset']),(200,'2.5','USDT'))
+            client.return_value.trades.assert_called_once_with('BTCUSDT',42)
+            client.return_value.trades.return_value=[{**trades[0], 'qty':'0.5'}]
+            self.assertIsNone(self.request('/api/copy-task-pnl?account_id=%s&task_id=%s'%(account,task))[1]['pnl'])
+            self.assertNotEqual(self.request('/api/copy-task-pnl?account_id=0&task_id=%s'%task)[0],200)
+            self.assertEqual(self.request('/api/copy-task-pnl?account_id=%s&task_id=%s'%(account,task),authenticated=False)[0],401)
+
     def test_leader_record_pages_use_ten(self):
         with self.store.db() as db:
             for i in range(21):

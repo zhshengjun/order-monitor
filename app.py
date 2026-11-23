@@ -1745,13 +1745,32 @@ def handler_factory(store, monitor, token):
                         if not db.execute('SELECT 1 FROM futures_accounts WHERE id=?',(account_id,)).fetchone():
                             raise ValueError('账号不存在')
                         total=db.execute('SELECT COUNT(*) FROM copy_tasks WHERE account_id=?',(account_id,)).fetchone()[0]
-                        rows=[dict(r) for r in db.execute("SELECT c.id,c.target_id,c.state,c.error,c.created,c.result,c.body,a.asset,a.wallet_balance,a.available_balance,a.lead_balance,a.planned_quantity,t.name AS target_name FROM copy_tasks c LEFT JOIN copy_task_audit a ON a.task_id=c.id LEFT JOIN targets t ON t.id=c.target_id WHERE c.account_id=? ORDER BY c.id DESC LIMIT 50 OFFSET ?",(account_id,(page-1)*50))]
+                        rows=[dict(r) for r in db.execute("SELECT c.id,c.target_id,c.action,c.state,c.error,c.created,c.result,c.body,a.asset,a.wallet_balance,a.available_balance,a.lead_balance,a.planned_quantity,t.name AS target_name FROM copy_tasks c LEFT JOIN copy_task_audit a ON a.task_id=c.id LEFT JOIN targets t ON t.id=c.target_id WHERE c.account_id=? ORDER BY c.id DESC LIMIT 50 OFFSET ?",(account_id,(page-1)*50))]
                     for row in rows:
                         row['body']=json.loads(row['body'])
                         row['result']=json.loads(row['result']) if row['result'] else None
                         if row['result'] and row['result'].get('orderId') is not None:
                             row['result']['orderId']=str(row['result']['orderId'])
                     return self.reply({'list':store.attach_discovery(rows),'total':total,'page':page})
+                if parsed.path == '/api/copy-task-pnl':
+                    account_id=int(query.get('account_id',['0'])[0])
+                    task_id=int(query.get('task_id',['0'])[0])
+                    with store.db() as db:
+                        task=db.execute("SELECT c.action,c.state,c.body,c.result,a.api_key,a.api_secret FROM copy_tasks c JOIN futures_accounts a ON a.id=c.account_id WHERE c.id=? AND c.account_id=?",(task_id,account_id)).fetchone()
+                    if not task:
+                        raise ValueError('跟单记录不存在')
+                    pnl=None; asset='USDT'
+                    if task['action'] in ('close','unmatched_close') and task['state'] in ('filled','finished') and task['result']:
+                        try:
+                            source=json.loads(task['body']); result=json.loads(task['result'])
+                            asset=source.get('quoteAsset') or 'USDT'
+                            executed=number(result['executedQty']); order_id=result.get('orderId')
+                            if executed>0 and order_id is not None:
+                                trades=FuturesClient(task['api_key'],task['api_secret']).trades(source['symbol'],order_id)
+                                pnl=actual_copy_realized_pnl(trades,source['symbol'],order_id,executed,asset)
+                        except (ExchangeError,ValueError,TypeError,KeyError,InvalidOperation,OverflowError):
+                            LOG.warning('copy record pnl lookup failed task=%s',task_id)
+                    return self.reply({'pnl':pnl,'asset':asset})
                 if parsed.path == '/api/events':
                     page = max(1, min(100000, int(query.get('page', ['1'])[0])))
                     limit = max(1, min(50, int(query.get('limit', ['50'])[0])))
