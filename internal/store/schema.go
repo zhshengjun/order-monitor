@@ -22,6 +22,7 @@ func (s *SQLiteStore) InitializeMonitorTables(ctx context.Context) error {
 	for _, field := range []struct{ table, column, declaration string }{
 		{"copy_tasks", "retry_count", "INTEGER NOT NULL DEFAULT 0"},
 		{"copy_tasks", "reconcile_attempts", "INTEGER NOT NULL DEFAULT 0"},
+		{"account_health", "failures", "INTEGER NOT NULL DEFAULT 0"},
 		{"manual_closes", "unknown_notified", "INTEGER NOT NULL DEFAULT 0"},
 		{"leader_history_sync", "last_batch", "TEXT NOT NULL DEFAULT ''"},
 		{"leader_history_sync", "started_at", "INTEGER NOT NULL DEFAULT 0"},

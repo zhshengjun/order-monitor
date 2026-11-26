@@ -134,12 +134,25 @@ func (h *HistoryWorker) Delete(ctx context.Context, isTarget bool, item any, cli
 			return err
 		}
 	} else {
-		if _, err = tx.ExecContext(ctx, "DELETE FROM margin_alert_state WHERE account_id=?", item); err != nil {
-			return err
+		for _, query := range []string{"DELETE FROM margin_alert_state WHERE account_id=?", "DELETE FROM account_health WHERE account_id=?", "DELETE FROM position_reconciliation WHERE account_id=?", "DELETE FROM risk_breakers WHERE scope=?", "DELETE FROM alerts WHERE scope=?"} {
+			value := item
+			if query == "DELETE FROM risk_breakers WHERE scope=?" || query == "DELETE FROM alerts WHERE scope=?" {
+				value = fmt.Sprintf("account:%v", item)
+			}
+			if _, err = tx.ExecContext(ctx, query, value); err != nil {
+				return err
+			}
 		}
 	}
 	if _, err = tx.ExecContext(ctx, "DELETE FROM display_order WHERE kind=? AND item_id=?", kind, fmt.Sprint(item)); err != nil {
 		return err
+	}
+	if isTarget {
+		for _, query := range []string{"DELETE FROM risk_breakers WHERE scope=?", "DELETE FROM alerts WHERE scope=?"} {
+			if _, err = tx.ExecContext(ctx, query, "target:"+fmt.Sprint(item)); err != nil {
+				return err
+			}
+		}
 	}
 	if _, err = tx.ExecContext(ctx, "DELETE FROM "+table+" WHERE id=?", item); err != nil {
 		return err

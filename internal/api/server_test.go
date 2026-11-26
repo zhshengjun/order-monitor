@@ -38,6 +38,12 @@ func TestDashboardRequiresLoginAndUsesOriginalContract(t *testing.T) {
 	if got := get(nil).Code; got != 401 {
 		t.Fatalf("unauthenticated status %d", got)
 	}
+	metrics := httptest.NewRequest("GET", "/metrics", nil)
+	metricsOut := httptest.NewRecorder()
+	handler.ServeHTTP(metricsOut, metrics)
+	if metricsOut.Code != 200 || !strings.Contains(metricsOut.Body.String(), "order_monitor_up 1") {
+		t.Fatalf("metrics: %d %q", metricsOut.Code, metricsOut.Body.String())
+	}
 	login := httptest.NewRequest("POST", "/api/login", strings.NewReader(`{"token":"test-admin-password"}`))
 	login.Header.Set("Content-Type", "application/json")
 	out := httptest.NewRecorder()

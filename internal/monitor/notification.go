@@ -58,7 +58,7 @@ func sendNotification(ctx context.Context, client *http.Client, settings map[str
 	return nil
 }
 func notificationText(name, kind string, stamp int64, body map[string]any) (string, string) {
-	labels := map[string]string{"copy": "跟单结果", "margin": "保证金风险", "order": "交易操作", "transfer": "资金划转"}
+	labels := map[string]string{"copy": "跟单结果", "margin": "保证金风险", "order": "交易操作", "transfer": "资金划转", "alert": "告警"}
 	title := name + " · " + labels[kind]
 	value := func(key string) string {
 		v := body[key]
@@ -68,6 +68,9 @@ func notificationText(name, kind string, stamp int64, body map[string]any) (stri
 		return fmt.Sprint(v)
 	}
 	text := value("message")
+	if kind == "alert" {
+		text = fmt.Sprintf("【%s】\n%s", value("title"), value("message"))
+	}
 	if kind == "transfer" {
 		text = fmt.Sprintf("%s\n%s %s\n%s → %s", value("transType"), value("amount"), value("coin"), value("from"), value("to"))
 	}

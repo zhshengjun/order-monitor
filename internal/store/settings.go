@@ -12,7 +12,7 @@ import (
 )
 
 func defaultSettings() map[string]any {
-	return map[string]any{"interval": 60, "page_size": 20, "balance_threshold": "0", "telegram_enabled": false, "telegram_token": "", "telegram_chat": "", "bark_enabled": false, "bark_url": "https://api.day.app", "bark_key": ""}
+	return map[string]any{"interval": 60, "page_size": 20, "balance_threshold": "0", "telegram_enabled": false, "telegram_token": "", "telegram_chat": "", "telegram_min_severity": "info", "bark_enabled": false, "bark_url": "https://api.day.app", "bark_key": "", "bark_min_severity": "info"}
 }
 
 func (s *SQLiteStore) SaveSettings(ctx context.Context, patch map[string]any) error {
@@ -45,6 +45,13 @@ func (s *SQLiteStore) SaveSettings(ctx context.Context, patch map[string]any) er
 		if patch["clear_"+key] == true {
 			settings[key] = ""
 		}
+	}
+	for _, key := range []string{"telegram_min_severity", "bark_min_severity"} {
+		value := fmt.Sprint(settings[key])
+		if value != "info" && value != "warning" && value != "critical" {
+			return InputError("通知最低级别必须为 info、warning 或 critical")
+		}
+		settings[key] = value
 	}
 	for _, field := range []struct {
 		name     string

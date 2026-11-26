@@ -55,6 +55,16 @@ func Handler(core *store.SQLiteStore, service *monitor.Service, leader *exchange
 			w.Write(data)
 		})
 	}
+	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
+		text, err := service.Metrics(r.Context())
+		if err != nil {
+			http.Error(w, "metrics unavailable", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = w.Write([]byte(text))
+	})
 	mux.HandleFunc("GET /api/state", func(w http.ResponseWriter, r *http.Request) {
 		if !auth(r) {
 			fail(w, 401, "请先登录")
@@ -241,7 +251,7 @@ func Handler(core *store.SQLiteStore, service *monitor.Service, leader *exchange
 		}
 		reply(w, 200, result)
 	})
-	for _, path := range []string{"/api/login", "/api/logout", "/api/toggle", "/api/copy-binding", "/api/copy-multiplier", "/api/copy-live", "/api/virtual-session", "/api/targets", "/api/display-order", "/api/futures-account", "/api/settings", "/api/leader-history-refresh", "/api/delete-target", "/api/delete-account", "/api/test-notification", "/api/resolve-copy-task", "/api/copy-position"} {
+	for _, path := range []string{"/api/login", "/api/logout", "/api/toggle", "/api/copy-binding", "/api/copy-multiplier", "/api/copy-live", "/api/virtual-session", "/api/targets", "/api/display-order", "/api/futures-account", "/api/settings", "/api/leader-history-refresh", "/api/delete-target", "/api/delete-account", "/api/test-notification", "/api/resolve-copy-task", "/api/copy-position", "/api/risk-breaker"} {
 		mux.HandleFunc("POST "+path, func(w http.ResponseWriter, r *http.Request) {
 			if origin := r.Header.Get("Origin"); origin != "" {
 				u, err := url.Parse(origin)
@@ -320,6 +330,26 @@ func Handler(core *store.SQLiteStore, service *monitor.Service, leader *exchange
 						}
 						reply(w, 200, map[string]bool{"ok": true})
 						return
+					case "/api/risk-breaker":
+						var request struct {
+							Scope  string `json:"scope"`
+							Action string `json:"action"`
+						}
+						if json.Unmarshal(raw, &request) != nil || request.Action != "reset" {
+							fail(w, 400, "风控操作参数错误")
+							return
+						}
+						if err := service.ResetBreaker(r.Context(), request.Scope); err != nil {
+							var invalid store.InputError
+							if errors.As(err, &invalid) {
+								fail(w, 400, invalid.Error())
+							} else {
+								fail(w, 500, "服务器处理失败")
+							}
+							return
+						}
+						reply(w, 200, map[string]bool{"ok": true})
+						return
 					case "/api/test-notification":
 						operationErr = service.TestNotification(r.Context(), &http.Client{Timeout: 15 * time.Second}, body)
 					case "/api/delete-target", "/api/delete-account":
@@ -369,7 +399,7 @@ func Handler(core *store.SQLiteStore, service *monitor.Service, leader *exchange
 							fail(w, 400, "账号参数错误")
 							return
 						}
-						operationErr = service.SaveAccount(r.Context(), account)
+						operationErr = service.SaveAccountChecked(r.Context(), &http.Client{Timeout: 15 * time.Second}, account)
 					case "/api/targets":
 						if leaderErr != nil {
 							fail(w, 500, "带单员接口配置无效")

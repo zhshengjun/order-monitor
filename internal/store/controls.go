@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/big"
 	"regexp"
 	"strings"
@@ -158,6 +159,13 @@ func (s *SQLiteStore) ApplyControl(ctx context.Context, path string, in ControlI
 		if live {
 			return tx.Commit()
 		}
+		var blocked bool
+		if err = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM risk_breakers WHERE active=1 AND (scope=? OR scope=?))", fmt.Sprintf("account:%d", id), "target:"+target).Scan(&blocked); err != nil {
+			return err
+		}
+		if blocked {
+			return InputError("该账户或带单员已触发风控暂停，请先核对并解除")
+		}
 		if unknown {
 			return InputError("该账号有结果未确认的订单，请先核对")
 		}
@@ -252,6 +260,7 @@ func rebaseVirtualPosition(ctx context.Context, tx *sql.Tx, account int64, targe
 }
 
 func storeNotice(ctx context.Context, tx *sql.Tx, target, message string) error {
+	severity := SeverityWarning
 	var name string
 	err := tx.QueryRowContext(ctx, "SELECT name FROM targets WHERE id=?", target).Scan(&name)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -259,7 +268,7 @@ func storeNotice(ctx context.Context, tx *sql.Tx, target, message string) error 
 	} else if err != nil {
 		return err
 	}
-	raw, err := json.Marshal(map[string]any{"message": message})
+	raw, err := json.Marshal(map[string]any{"message": message, "severity": severity})
 	if err != nil {
 		return err
 	}
@@ -271,5 +280,5 @@ func storeNotice(ctx context.Context, tx *sql.Tx, target, message string) error 
 	if err != nil {
 		return err
 	}
-	return queueEvent(ctx, tx, id)
+	return QueueEventSeverity(ctx, tx, id, severity)
 }

@@ -108,3 +108,22 @@ CREATE TABLE IF NOT EXISTS outbox (
   id INTEGER PRIMARY KEY AUTOINCREMENT, event INTEGER NOT NULL, channel TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
   next_try REAL NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '', UNIQUE(event,channel));
+
+CREATE TABLE IF NOT EXISTS alerts (
+  key TEXT PRIMARY KEY, scope TEXT NOT NULL, severity TEXT NOT NULL,
+  title TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active',
+  count INTEGER NOT NULL DEFAULT 0, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL,
+  last_notified INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS alerts_active ON alerts(status,severity,last_seen DESC);
+CREATE TABLE IF NOT EXISTS risk_breakers (
+  scope TEXT PRIMARY KEY, reason TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+  updated INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS position_reconciliation (
+  account_id INTEGER NOT NULL, symbol TEXT NOT NULL, position_side TEXT NOT NULL,
+  actual_quantity TEXT NOT NULL, local_quantity TEXT NOT NULL, difference TEXT NOT NULL,
+  status TEXT NOT NULL, checked_at INTEGER NOT NULL,
+  PRIMARY KEY(account_id,symbol,position_side));
+CREATE TABLE IF NOT EXISTS account_health (
+  account_id INTEGER PRIMARY KEY, ok INTEGER NOT NULL, can_trade INTEGER NOT NULL,
+  can_withdraw INTEGER NOT NULL, checked_at INTEGER NOT NULL, error TEXT NOT NULL DEFAULT '',
+  failures INTEGER NOT NULL DEFAULT 0);

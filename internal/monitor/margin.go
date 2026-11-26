@@ -92,7 +92,7 @@ func marginRisks(account marginAccount, positions []riskPosition) (map[string]ma
 	return risks, nil
 }
 func (s *Service) writeMarginEvent(ctx context.Context, tx *sql.Tx, id int64, name, message string) error {
-	body, err := json.Marshal(map[string]string{"message": message})
+	body, err := json.Marshal(map[string]string{"message": message, "severity": store.SeverityCritical})
 	if err != nil {
 		return err
 	}
@@ -104,26 +104,7 @@ func (s *Service) writeMarginEvent(ctx context.Context, tx *sql.Tx, id int64, na
 	if err != nil {
 		return err
 	}
-	var raw string
-	err = tx.QueryRowContext(ctx, "SELECT value FROM settings WHERE id=1").Scan(&raw)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	var settings map[string]any
-	if err = json.Unmarshal([]byte(raw), &settings); err != nil {
-		return err
-	}
-	for _, channel := range []string{"telegram", "bark"} {
-		if settings[channel+"_enabled"] == true {
-			if _, err = tx.ExecContext(ctx, "INSERT INTO outbox(event,channel) VALUES(?,?)", event, channel); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	return store.QueueEventSeverity(ctx, tx, event, store.SeverityCritical)
 }
 func (s *Service) checkMargin(ctx context.Context, id int64, name, key, secret string, client *http.Client) error {
 	c, err := exchange.NewFuturesClient(client, "https://fapi.binance.com", key, secret)
