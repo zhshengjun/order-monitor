@@ -21,9 +21,17 @@ jobs:
       - run: go test -race ./...
       - run: go vet ./...
       - run: go build ./...
-      - run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ./...
-      - run: CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build ./...
       - run: node --check internal/web/static/app.js
+      - name: Cross-compile release binaries
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o dist/order-monitor-linux-amd64 ./cmd/order-monitor
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' -o dist/order-monitor-linux-arm64 ./cmd/order-monitor
+      - uses: actions/upload-artifact@v4
+        with:
+          name: order-monitor-binaries
+          path: dist/
+          retention-days: 1
   docker:
     needs: test
     runs-on: ubuntu-latest
@@ -34,12 +42,18 @@ jobs:
       DOCKER_BUILDKIT: "1"
     steps:
       - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v4
+        with:
+          name: order-monitor-binaries
+          path: dist
+      - run: chmod +x dist/*
       - uses: docker/setup-qemu-action@v4.4.0
       - uses: docker/setup-buildx-action@v4.4.1
       - name: Build amd64 smoke image
         uses: docker/build-push-action@v7.4.0
         with:
           context: .
+          file: Dockerfile.prebuilt
           platforms: linux/amd64
           load: true
           tags: order-monitor:smoke
@@ -85,6 +99,7 @@ jobs:
         if: github.event_name != 'pull_request'
         with:
           context: .
+          file: Dockerfile.prebuilt
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}

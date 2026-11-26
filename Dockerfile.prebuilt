@@ -1,0 +1,20 @@
+# syntax=docker/dockerfile:1.7
+# CI image: binaries are cross-compiled once by the test job, so the image build
+# only assembles the Alpine runtime and never runs the Go compiler under QEMU.
+FROM --platform=$BUILDPLATFORM alpine:3.20 AS certs
+RUN apk add --no-cache ca-certificates
+
+FROM alpine:3.20
+ARG TARGETARCH
+RUN addgroup -g 10001 monitor && adduser -D -u 10001 -G monitor monitor && mkdir -p /data /etc/ssl/certs && chown monitor:monitor /data
+COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+ENV HOST=0.0.0.0 PORT=8080 DATABASE_PATH=/data/monitor.db DROP_PRIVILEGES=1
+WORKDIR /app
+COPY dist/order-monitor-linux-${TARGETARCH} /app/order-monitor
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN chmod 0755 /app/order-monitor /app/docker-entrypoint.sh
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
+VOLUME /data
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s CMD wget -qO- http://127.0.0.1:8080/healthz || exit 1
+CMD ["/app/order-monitor"]

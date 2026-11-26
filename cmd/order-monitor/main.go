@@ -7,6 +7,7 @@ import (
 )
 
 func main() {
+	dropPrivileges()
 	if err := app.Run(); err != nil {
 		log.Fatal(err)
 	}

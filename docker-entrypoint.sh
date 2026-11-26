@@ -26,4 +26,4 @@ case "$dir/" in
     done
     ;;
 esac
-exec setpriv --reuid=10001 --regid=10001 --clear-groups "$@"
+exec "$@"
