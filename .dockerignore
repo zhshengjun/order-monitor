@@ -4,3 +4,9 @@
 data
 __pycache__
 tests
+.idea
+legacy
+.gocache
+.gomodcache
+.pydeps
+.tmp-arch

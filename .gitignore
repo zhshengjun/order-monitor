@@ -5,6 +5,13 @@ data/
 __pycache__/
 *.pyc
 .DS_Store
+.idea/
 *.db
 *.db-shm
 *.db-wal
+
+.gomodcache
+.gocache
+.pydeps
+.tmp-arch
+.tmp-arch/

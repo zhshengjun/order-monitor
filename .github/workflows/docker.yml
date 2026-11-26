@@ -15,12 +15,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: actions/setup-python@v7.1.0
+      - uses: actions/setup-go@v6
         with:
-          python-version: '3.13'
-      - run: 'pip install --require-hashes --only-binary=:all: -r requirements.txt'
-      - run: python -m unittest discover -s tests -v
-      - run: node --check static/app.js
+          go-version-file: go.mod
+      - run: go test -race ./...
+      - run: go vet ./...
+      - run: go build ./...
+      - run: node --check internal/web/static/app.js
   docker:
     needs: test
     runs-on: ubuntu-latest
@@ -41,7 +42,7 @@ jobs:
             sleep 1
           done
           curl -fsS http://127.0.0.1:18080/healthz
-          docker exec monitor-smoke python -c "from pathlib import Path; assert '10001' in next(x for x in Path('/proc/1/status').read_text().splitlines() if x.startswith('Uid:'))"
+          docker exec monitor-smoke sh -c "grep -E '^Uid:[[:space:]]+10001[[:space:]]' /proc/1/status"
           curl -fsS -c /tmp/monitor-cookies -H 'Content-Type: application/json' -d '{"token":"ci-smoke-token-123456"}' http://127.0.0.1:18080/api/login
           curl -fsS -b /tmp/monitor-cookies -H 'Content-Type: application/json' -d '{"interval":42}' http://127.0.0.1:18080/api/settings
           docker restart monitor-smoke
