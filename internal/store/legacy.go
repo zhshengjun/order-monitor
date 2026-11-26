@@ -165,6 +165,15 @@ func (s *SQLiteStore) MigrateLegacyHistory(ctx context.Context) error {
 	// Existing Python-era bindings have no trust row. Seed them as untrusted so
 	// the UI warns and an unmatched close is not auto-flattened until the
 	// operator re-enables copy (which rebuilds the virtual position).
+	// Older builds inferred withdrawal permission from /fapi/v2/account's
+	// canWithdraw flag, which is not the API key restriction. Clear those
+	// false positives so they disappear from the UI and notification queue.
+	if _, err = tx.ExecContext(ctx, "UPDATE alerts SET status='resolved' WHERE key LIKE 'account-withdraw:%' AND status='active'"); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, "UPDATE outbox SET status='cancelled' WHERE status='pending' AND event IN (SELECT id FROM events WHERE kind='alert' AND json_extract(body,'$.alert_key') LIKE 'account-withdraw:%')"); err != nil {
+		return err
+	}
 	if _, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO virtual_trust(account_id,target_id,trusted,reason,updated)
 		SELECT account_id,target_id,0,'迁移前旧数据，请重新开启跟单重算',? FROM copy_live WHERE enabled=1`, time.Now().UnixMilli()); err != nil {
 		return err

@@ -109,11 +109,6 @@ func (s *Service) runHealth(ctx context.Context, client *http.Client) {
 			}
 			continue
 		}
-		if status.CanWithdraw {
-			s.raise(ctx, store.AlertSpec{Key: fmt.Sprintf("account-withdraw:%d", accountID), Scope: fmt.Sprintf("account:%d", accountID), Severity: store.SeverityWarning, Title: "API Key 含提现权限", Message: fmt.Sprintf("%s 的 API Key 开启了提现权限，建议关闭", account.Name)})
-		} else {
-			s.resolve(ctx, fmt.Sprintf("account-withdraw:%d", accountID), "提现权限已关闭")
-		}
 		s.resolve(ctx, fmt.Sprintf("account-health:%d", accountID), "API Key 恢复正常")
 	}
 }
@@ -466,10 +461,5 @@ func (s *Service) SaveAccountChecked(ctx context.Context, client *http.Client, i
 		return err
 	}
 	s.resolve(ctx, fmt.Sprintf("account-health:%d", id), "API Key 已更新并验证通过")
-	if status.CanWithdraw {
-		s.raise(ctx, store.AlertSpec{Key: fmt.Sprintf("account-withdraw:%d", id), Scope: fmt.Sprintf("account:%d", id), Severity: store.SeverityWarning, Title: "API Key 含提现权限", Message: "API Key 开启了提现权限，建议关闭"})
-	} else {
-		s.resolve(ctx, fmt.Sprintf("account-withdraw:%d", id), "提现权限已关闭")
-	}
 	return nil
 }

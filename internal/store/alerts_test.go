@@ -83,3 +83,34 @@ func TestAccountHealthFailureCounterResetsOnSuccess(t *testing.T) {
 		t.Fatalf("reset %d %v", got, err)
 	}
 }
+
+func TestMigrationDropsLegacyWithdrawWarnings(t *testing.T) {
+	ctx := context.Background()
+	s, err := OpenSQLiteStore(ctx, filepath.Join(t.TempDir(), "withdraw.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err = s.InitializeMonitorTables(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.DB().ExecContext(ctx, `INSERT INTO alerts(key,scope,severity,title,message,status,count,first_seen,last_seen,last_notified)
+		VALUES('account-withdraw:1','account:1','warning','旧告警','旧判断','active',1,1,1,1);
+		INSERT INTO events(target,name,kind,body,stamp,historical) VALUES('account:1','account:1','alert','{"alert_key":"account-withdraw:1"}',1,0);
+		INSERT INTO outbox(event,channel,status) VALUES((SELECT MAX(id) FROM events),'telegram','pending')`); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.MigrateLegacyHistory(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var status, outbox string
+	if err = s.DB().QueryRowContext(ctx, "SELECT status FROM alerts WHERE key='account-withdraw:1'").Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.DB().QueryRowContext(ctx, "SELECT status FROM outbox").Scan(&outbox); err != nil {
+		t.Fatal(err)
+	}
+	if status != "resolved" || outbox != "cancelled" {
+		t.Fatalf("alert=%s outbox=%s", status, outbox)
+	}
+}
