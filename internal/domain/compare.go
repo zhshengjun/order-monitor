@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 )
 
 // OrderKey identifies a group of fills from one lead portfolio. Binance's
@@ -51,6 +52,7 @@ type cachedComparison struct {
 // Comparator has one owner. The store remains authoritative after eviction
 // and across process restarts. A failed commit never updates the cache.
 type Comparator struct {
+	mu       sync.Mutex
 	store    ComparisonStore
 	capacity int
 	entries  map[OrderKey]*list.Element
@@ -69,7 +71,12 @@ func NewComparator(store ComparisonStore, capacity int) (*Comparator, error) {
 
 var ErrFillRegression = errors.New("cumulative fill quantity or cost regressed")
 
+func (c *Comparator) lock()   { c.mu.Lock() }
+func (c *Comparator) unlock() { c.mu.Unlock() }
+
 func (c *Comparator) Apply(ctx context.Context, observation Observation, leaderBalance ...string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	balance := ""
 	if len(leaderBalance) > 0 {
 		balance = leaderBalance[0]
@@ -158,6 +165,8 @@ func (c *Comparator) ApplyRecord(ctx context.Context, observation Observation, l
 // records the regressed row before stopping the leader copy, so later polls do
 // not repeat the same regression notice.
 func (c *Comparator) Accept(ctx context.Context, observation Observation, leaderBalance string, record map[string]any) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	key := observation.Key
 	key.Symbol = strings.ToUpper(strings.TrimSpace(key.Symbol))
 	key.Side = strings.ToUpper(strings.TrimSpace(key.Side))

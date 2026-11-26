@@ -18,7 +18,7 @@ type LeaderClient struct {
 	client      *http.Client
 	base        string
 	historyLock sync.Mutex
-	historyNext time.Time
+	historyNext map[string]time.Time
 }
 
 func NewLeaderClient(client *http.Client, base string) (*LeaderClient, error) {
@@ -26,7 +26,7 @@ func NewLeaderClient(client *http.Client, base string) (*LeaderClient, error) {
 	if client == nil || err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Path != "" {
 		return nil, errors.New("leader API requires an HTTP client and an HTTPS origin")
 	}
-	return &LeaderClient{client: client, base: base}, nil
+	return &LeaderClient{client: client, base: base, historyNext: map[string]time.Time{}}, nil
 }
 
 func (c *LeaderClient) Detail(ctx context.Context, portfolio string) (LeaderDetail, error) {
@@ -40,23 +40,20 @@ func (c *LeaderClient) Detail(ctx context.Context, portfolio string) (LeaderDeta
 }
 
 func (c *LeaderClient) History(ctx context.Context, portfolio string, page, size int) (LeaderPage, error) {
-	c.historyLock.Lock()
-	defer c.historyLock.Unlock()
-	// The public copy-trade history endpoint is informal and rate sensitive;
-	// keep at least two seconds between requests, including failures.
-	if wait := time.Until(c.historyNext); wait > 0 {
+	var history LeaderPage
+	if portfolio == "" || page < 1 || size < 1 || size > 100 {
+		return history, errors.New("invalid leader history request")
+	}
+	// Pace requests per portfolio: parallel pollers cannot starve each other and
+	// each portfolio still respects the informal two-second limit.
+	if wait := c.reserveHistory(portfolio); wait > 0 {
 		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return LeaderPage{}, ctx.Err()
+			return history, ctx.Err()
 		case <-timer.C:
 		}
-	}
-	defer func() { c.historyNext = time.Now().Add(2 * time.Second) }()
-	var history LeaderPage
-	if portfolio == "" || page < 1 || size < 1 || size > 100 {
-		return history, errors.New("invalid leader history request")
 	}
 	body, err := json.Marshal(struct {
 		Portfolio string `json:"portfolioId"`
@@ -67,10 +64,28 @@ func (c *LeaderClient) History(ctx context.Context, portfolio string, page, size
 		return history, err
 	}
 	err = c.request(ctx, "lead-portfolio/order-history", body, &history)
+	c.historyLock.Lock()
+	c.historyNext[portfolio] = time.Now().Add(2 * time.Second)
+	c.historyLock.Unlock()
 	if err == nil && (history.Fills == nil || history.Total == "") {
 		err = errors.New("invalid leader history page")
 	}
 	return history, err
+}
+
+// reserveHistory returns how long the caller must wait before the next request
+// for this portfolio is allowed.
+func (c *LeaderClient) reserveHistory(portfolio string) time.Duration {
+	c.historyLock.Lock()
+	defer c.historyLock.Unlock()
+	if c.historyNext == nil {
+		c.historyNext = map[string]time.Time{}
+	}
+	wait := time.Until(c.historyNext[portfolio])
+	if wait < 0 {
+		return 0
+	}
+	return wait
 }
 
 func (c *LeaderClient) request(ctx context.Context, path string, data []byte, dest any) error {

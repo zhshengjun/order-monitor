@@ -129,7 +129,7 @@ func Handler(core *store.SQLiteStore, service *monitor.Service, leader *exchange
 			fail(w, 400, "账号参数错误")
 			return
 		}
-		data, err := service.Snapshot(r.Context(), id, &http.Client{Timeout: 15 * time.Second})
+		data, err := service.Snapshot(r.Context(), id, &http.Client{Timeout: exchange.FuturesRequestTimeout})
 		if err != nil {
 			var invalid exchange.InputError
 			if errors.As(err, &invalid) {
@@ -146,7 +146,7 @@ func Handler(core *store.SQLiteStore, service *monitor.Service, leader *exchange
 			fail(w, 401, "请先登录")
 			return
 		}
-		data, _ := exchange.MarkPrices(r.Context(), &http.Client{Timeout: 15 * time.Second})
+		data, _ := exchange.MarkPrices(r.Context(), &http.Client{Timeout: exchange.FuturesRequestTimeout})
 		reply(w, 200, data)
 	})
 	mux.HandleFunc("GET /api/futures-network", func(w http.ResponseWriter, r *http.Request) {
@@ -154,7 +154,7 @@ func Handler(core *store.SQLiteStore, service *monitor.Service, leader *exchange
 			fail(w, 401, "请先登录")
 			return
 		}
-		reply(w, 200, exchange.FuturesNetwork(r.Context(), &http.Client{Timeout: 15 * time.Second}))
+		reply(w, 200, exchange.FuturesNetwork(r.Context(), &http.Client{Timeout: exchange.FuturesRequestTimeout}))
 	})
 	mux.HandleFunc("GET /api/events", func(w http.ResponseWriter, r *http.Request) {
 		if !auth(r) {
@@ -201,7 +201,7 @@ func Handler(core *store.SQLiteStore, service *monitor.Service, leader *exchange
 			fail(w, 400, "跟单记录参数错误")
 			return
 		}
-		result, err := service.CopyPnL(r.Context(), account, task, &http.Client{Timeout: 15 * time.Second})
+		result, err := service.CopyPnL(r.Context(), account, task, &http.Client{Timeout: exchange.FuturesRequestTimeout})
 		if err != nil {
 			var invalid exchange.InputError
 			if errors.As(err, &invalid) {
@@ -301,7 +301,7 @@ func Handler(core *store.SQLiteStore, service *monitor.Service, leader *exchange
 							fail(w, 400, "跟单记录参数错误")
 							return
 						}
-						result, err := service.ResolveSubmittedCopy(r.Context(), request.ID, copy.ClientFactory(&http.Client{Timeout: 15 * time.Second}))
+						result, err := service.ResolveSubmittedCopy(r.Context(), request.ID, copy.ClientFactory(&http.Client{Timeout: exchange.FuturesRequestTimeout}))
 						if err != nil {
 							var invalid store.InputError
 							if errors.As(err, &invalid) {
@@ -399,7 +399,7 @@ func Handler(core *store.SQLiteStore, service *monitor.Service, leader *exchange
 							fail(w, 400, "账号参数错误")
 							return
 						}
-						operationErr = service.SaveAccountChecked(r.Context(), &http.Client{Timeout: 15 * time.Second}, account)
+						operationErr = service.SaveAccountChecked(r.Context(), &http.Client{Timeout: exchange.FuturesRequestTimeout}, account)
 					case "/api/targets":
 						if leaderErr != nil {
 							fail(w, 500, "带单员接口配置无效")

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"math/big"
 	"net/http"
-	"net/url"
 	"order-monitor/internal/exchange"
 	"strings"
 	"time"
@@ -46,32 +45,19 @@ func (s *Service) preparePending(ctx context.Context, task PendingCopy, c *Futur
 		}
 	}
 	prepared.LeaderBalance = in.LeaderBalance
-	balances, err := c.Balances(ctx)
+	// The read-only preflight calls are independent, so they run together. The
+	// exchange metadata (rules, mode, leverage) is cached separately, which
+	// removes most requests from the critical path.
+	snapshot, err := c.Snapshot(ctx, in.Key.Symbol, task.Action == "open")
 	if err != nil {
 		return prepared, err
 	}
-	prepared.BalanceAt = time.Now().UnixMilli()
-	for _, b := range balances {
-		if b.Asset == "USDT" {
-			in.WalletBalance, in.Available = b.Balance, b.Available
-			prepared.Wallet, prepared.Available = &in.WalletBalance, &in.Available
-			break
-		}
-	}
-	positions, err := c.Positions(ctx)
-	if err != nil {
-		return prepared, err
-	}
-	if in.HedgeMode, err = c.HedgeMode(ctx); err != nil {
-		return prepared, err
-	}
-	rules, err := c.MarketRules(ctx)
-	if err != nil {
-		return prepared, err
-	}
-	if in.Market, err = c.Market(ctx, in.Key.Symbol, rules, task.Action == "open"); err != nil {
-		return prepared, err
-	}
+	in.WalletBalance, in.Available = snapshot.WalletBalance, snapshot.Available
+	prepared.Wallet, prepared.Available = &in.WalletBalance, &in.Available
+	prepared.BalanceAt = snapshot.QueriedAt
+	in.HedgeMode, in.Market = snapshot.HedgeMode, snapshot.Market
+	in.Leverage = snapshot.Leverage
+	positions := snapshot.Positions
 	if task.Action == "open" {
 		opposite := "SHORT"
 		if in.Key.PositionSide == "SHORT" {
@@ -79,19 +65,6 @@ func (s *Service) preparePending(ctx context.Context, task PendingCopy, c *Futur
 		}
 		if in.OppositePosition, err = PositionAmount(positions, in.Key.Symbol, opposite); err != nil {
 			return prepared, err
-		}
-		var configs []struct {
-			Symbol   string
-			Leverage json.Number
-		}
-		if err = c.Request(ctx, http.MethodGet, "/fapi/v1/symbolConfig", url.Values{"symbol": {in.Key.Symbol}}, true, &configs); err != nil {
-			return prepared, err
-		}
-		for _, v := range configs {
-			if v.Symbol == in.Key.Symbol {
-				in.Leverage = v.Leverage.String()
-				break
-			}
 		}
 		if task.Body.Incremental && !task.Body.Standalone {
 			if err = s.planIncrement(ctx, task, &in); err != nil {

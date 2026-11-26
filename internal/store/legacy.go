@@ -96,7 +96,7 @@ func (s *SQLiteStore) MigrateLegacyHistory(ctx context.Context) error {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, "INSERT OR IGNORE INTO settings VALUES(1,?)", `{"interval":60,"page_size":20,"balance_threshold":"0","telegram_enabled":false,"telegram_token":"","telegram_chat":"","bark_enabled":false,"bark_url":"https://api.day.app","bark_key":""}`); err != nil {
+	if _, err = tx.ExecContext(ctx, "INSERT OR IGNORE INTO settings VALUES(1,?)", `{"interval":5,"page_size":20,"balance_threshold":"0","telegram_enabled":false,"telegram_token":"","telegram_chat":"","bark_enabled":false,"bark_url":"https://api.day.app","bark_key":""}`); err != nil {
 		return err
 	}
 	var complete bool

@@ -12,7 +12,7 @@ import (
 )
 
 func defaultSettings() map[string]any {
-	return map[string]any{"interval": 60, "page_size": 20, "balance_threshold": "0", "telegram_enabled": false, "telegram_token": "", "telegram_chat": "", "telegram_min_severity": "info", "bark_enabled": false, "bark_url": "https://api.day.app", "bark_key": "", "bark_min_severity": "info"}
+	return map[string]any{"interval": 5, "page_size": 20, "balance_threshold": "0", "telegram_enabled": false, "telegram_token": "", "telegram_chat": "", "telegram_min_severity": "info", "bark_enabled": false, "bark_url": "https://api.day.app", "bark_key": "", "bark_min_severity": "info"}
 }
 
 func (s *SQLiteStore) SaveSettings(ctx context.Context, patch map[string]any) error {
@@ -57,7 +57,7 @@ func (s *SQLiteStore) SaveSettings(ctx context.Context, patch map[string]any) er
 		name     string
 		min, max int
 		message  string
-	}{{"interval", 10, 86400, "监听频率必须为 10～86400 秒"}, {"page_size", 1, 20, "轮询每页数量必须为 1～20 条"}} {
+	}{{"interval", 1, 86400, "监听频率必须为 1～86400 秒"}, {"page_size", 1, 20, "轮询每页数量必须为 1～20 条"}} {
 		n, err := strconv.Atoi(fmt.Sprint(settings[field.name]))
 		if err != nil || n < field.min || n > field.max {
 			return InputError(field.message)

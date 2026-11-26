@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"order-monitor/internal/exchange"
 	"time"
 )
 
@@ -94,7 +95,11 @@ func (s *Service) SubmitPending(ctx context.Context, task PendingCopy, plan Prep
 	if err = tx.Commit(); err != nil {
 		return err
 	}
-	result, err := client.Submit(ctx, plan.Order, task.ClientID)
+	// The submit is attempted exactly once. A timeout or lost response keeps the
+	// task in `submitted`, and the worker only queries the original client id.
+	submitCtx, submitCancel := context.WithTimeout(ctx, exchange.FuturesSubmitTimeout)
+	result, err := client.Submit(submitCtx, plan.Order, task.ClientID)
+	submitCancel()
 	if err == nil {
 		switch result.Status {
 		case "FILLED", "CANCELED", "EXPIRED", "REJECTED", "EXPIRED_IN_MATCH":
@@ -110,6 +115,10 @@ func (s *Service) SubmitPending(ctx context.Context, task PendingCopy, plan Prep
 	state := "submitted"
 	message := "下单结果未知，等待查询确认：" + err.Error()
 	notice := "下单结果未知，正在查询订单状态：" + err.Error()
+	if errors.Is(err, context.DeadlineExceeded) {
+		message = "下单超时，结果未知，等待查询确认"
+		notice = task.Body.Symbol + " 下单超时，结果未知，系统只查询原订单，不会重发"
+	}
 	if errors.As(err, &exchangeErr) && exchangeErr.DefinitelyRejected() {
 		state = "skipped"
 		message = err.Error()

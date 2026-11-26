@@ -98,7 +98,7 @@ func Run() error {
 	recoveryDone := make(chan struct{})
 	go func() {
 		defer close(recoveryDone)
-		service.RunCopyWorker(ctx, &http.Client{Timeout: 15 * time.Second}, leader)
+		service.RunCopyWorker(ctx, &http.Client{Timeout: exchange.FuturesRequestTimeout}, leader)
 	}()
 	defer func() { cancel(); <-recoveryDone }()
 	done := make(chan error, 1)

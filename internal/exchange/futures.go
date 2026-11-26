@@ -150,3 +150,11 @@ func (c *FuturesClient) request(ctx context.Context, method, path string, params
 	}
 	return nil
 }
+
+// FuturesRequestTimeout bounds one futures API call. A submit that times out is
+// never resent; the task is reconciled by querying the original client order.
+const FuturesRequestTimeout = 5 * time.Second
+
+// FuturesSubmitTimeout bounds the order submission call. Reconciliation and
+// other reads keep the shorter FuturesRequestTimeout.
+const FuturesSubmitTimeout = 10 * time.Second
