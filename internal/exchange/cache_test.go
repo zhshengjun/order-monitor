@@ -98,3 +98,46 @@ func TestCacheExpiryRefetches(t *testing.T) {
 		t.Fatalf("expired mode calls %d", got)
 	}
 }
+
+func TestRiskComputesMaintenanceRatio(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/fapi/v2/account" {
+			http.NotFound(w, r)
+			return
+		}
+		fmt.Fprint(w, `{"totalMaintMargin":"48","totalCrossWalletBalance":"100","totalCrossUnPnl":"-20","multiAssetsMargin":false}`)
+	}))
+	defer server.Close()
+	client, err := NewFuturesClient(server.Client(), server.URL, "key", "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	risk, err := client.Risk(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if risk.Ratio < 59.99 || risk.Ratio > 60.01 {
+		t.Fatalf("ratio %f", risk.Ratio)
+	}
+	if risk.MultiAssets {
+		t.Fatalf("risk %+v", risk)
+	}
+}
+
+func TestRiskSkipsRatioInMultiAssetMode(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"totalMaintMargin":"48","totalWalletBalance":"100","totalUnrealizedProfit":"0","multiAssetsMargin":true}`)
+	}))
+	defer server.Close()
+	client, err := NewFuturesClient(server.Client(), server.URL, "key", "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	risk, err := client.Risk(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if risk.Ratio != 0 || !risk.MultiAssets {
+		t.Fatalf("risk %+v", risk)
+	}
+}

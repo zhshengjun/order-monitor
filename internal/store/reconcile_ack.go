@@ -60,3 +60,20 @@ func (s *SQLiteStore) AcknowledgedOverAttributions(ctx context.Context, account 
 	}
 	return result, rows.Err()
 }
+
+// SaveAccountRisk stores the account-level risk snapshot used by account
+// cards: margin ratio percentage (maintenance / margin) and whether the account
+// uses unified multi-asset margin.
+func (s *SQLiteStore) SaveAccountRisk(ctx context.Context, account int64, ratio float64, multiAssets bool) error {
+	_, err := s.DB().ExecContext(ctx, `INSERT INTO account_risk(account_id,ratio,multi_assets,checked_at) VALUES(?,?,?,?)
+	ON CONFLICT(account_id) DO UPDATE SET ratio=excluded.ratio,multi_assets=excluded.multi_assets,checked_at=excluded.checked_at`,
+		account, ratio, boolToInt(multiAssets), time.Now().UnixMilli())
+	return err
+}
+
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}

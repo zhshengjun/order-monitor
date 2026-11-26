@@ -3,6 +3,7 @@ package exchange
 import (
 	"context"
 	"errors"
+	"math/big"
 	"net/http"
 	"net/url"
 	"sync"
@@ -108,4 +109,52 @@ func FuturesNetwork(ctx context.Context, client *http.Client) map[string]any {
 		output["error"] = err.Error()
 	}
 	return output
+}
+
+// AccountRisk is the account-level margin snapshot shown on the account card.
+type AccountRisk struct {
+	Ratio       float64
+	Notional    string
+	Leverage    string
+	MultiAssets bool
+}
+
+// Risk snapshots /fapi/v2/account: total notional, maintenance margin and the
+// cross/isolated margin balance. Multi-asset mode is reported separately
+// because the margin ratio is undefined there.
+func (c *FuturesClient) Risk(ctx context.Context) (AccountRisk, error) {
+	var account struct {
+		TotalMaintMargin        string `json:"totalMaintMargin"`
+		TotalWalletBalance      string `json:"totalWalletBalance"`
+		TotalUnrealizedProfit   string `json:"totalUnrealizedProfit"`
+		TotalCrossWalletBalance string `json:"totalCrossWalletBalance"`
+		TotalCrossUnPnl         string `json:"totalCrossUnPnl"`
+		MultiAssetsMargin       bool   `json:"multiAssetsMargin"`
+	}
+	if err := c.Request(ctx, http.MethodGet, "/fapi/v2/account", nil, true, &account); err != nil {
+		return AccountRisk{}, err
+	}
+	risk := AccountRisk{MultiAssets: account.MultiAssetsMargin}
+	maint := new(big.Rat)
+	if value, err := decimal(account.TotalMaintMargin); err == nil {
+		maint = value
+	}
+	margin := new(big.Rat)
+	wallet, e1 := signedDecimal(account.TotalCrossWalletBalance)
+	pnl, e2 := signedDecimal(account.TotalCrossUnPnl)
+	if e1 == nil && e2 == nil {
+		margin.Add(wallet, pnl)
+	} else if value, err := signedDecimal(account.TotalWalletBalance); err == nil {
+		wallet, _ := signedDecimal(account.TotalUnrealizedProfit)
+		if wallet != nil {
+			margin.Add(value, wallet)
+		} else {
+			margin = value
+		}
+	}
+	if margin.Sign() > 0 && !risk.MultiAssets {
+		ratio, _ := new(big.Rat).Quo(maint, margin).Float64()
+		risk.Ratio = ratio * 100
+	}
+	return risk, nil
 }

@@ -198,3 +198,7 @@ dialog .section-title>button.quiet:hover:not(:disabled){background:#303741;color
   .recon-value{text-align:left}
   .recon-value:before{content:attr(data-label) " ";color:#929daa}
 }
+
+/* Account card margin ratio severity. */
+.account-summary .warning{color:#e5bc42}
+.account-summary b[title]{cursor:help;text-decoration:underline dotted}

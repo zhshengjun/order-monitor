@@ -19,6 +19,7 @@ var dashboardQueries = map[string]string{
 	"virtual_events":           `SELECT account_id,target_id,symbol,position_side,stamp,action,quantity FROM virtual_events WHERE action='unmatched_close' ORDER BY stamp DESC LIMIT 20`,
 	"virtual_trust":            `SELECT account_id,target_id,trusted,reason,updated FROM virtual_trust`,
 	"active_alerts":            `SELECT key,scope,severity,title,message,count,first_seen,last_seen FROM alerts WHERE status='active' ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END,last_seen DESC`,
+	"account_risk":             `SELECT account_id,ratio,multi_assets,checked_at FROM account_risk`,
 	"account_health":           `SELECT a.id AS account_id,a.name,h.ok AS ok,h.can_trade AS can_trade,h.can_withdraw AS can_withdraw,h.checked_at AS checked_at,COALESCE(h.error,'') AS error FROM futures_accounts a LEFT JOIN account_health h ON h.account_id=a.id`,
 	"position_reconciliation":  `SELECT account_id,symbol,position_side,actual_quantity,local_quantity,difference,status,checked_at,acknowledged FROM position_reconciliation ORDER BY CASE status WHEN 'over' THEN 0 WHEN 'unattributed' THEN 1 ELSE 2 END,account_id,symbol`,
 	"risk_breakers":            `SELECT scope,reason,active,updated FROM risk_breakers WHERE active=1`,

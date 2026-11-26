@@ -79,6 +79,7 @@ func (s *Service) runHealth(ctx context.Context, client *http.Client) {
 		return
 	}
 	for _, account := range accounts {
+		s.refreshAccountRisk(ctx, client, account.ID, account.Key, account.Secret)
 		status, checkErr := exchange.CheckAccount(ctx, client, account.Key, account.Secret)
 		accountID := account.ID
 		ok := checkErr == nil && status.CanTrade
@@ -524,4 +525,21 @@ func (s *Service) SaveAccountChecked(ctx context.Context, client *http.Client, i
 	}
 	s.resolve(ctx, fmt.Sprintf("account-health:%d", id), "API Key 已更新并验证通过")
 	return nil
+}
+
+// refreshAccountRisk stores the account margin ratio used by account cards.
+// Failures are logged only: the previous snapshot stays visible.
+func (s *Service) refreshAccountRisk(ctx context.Context, client *http.Client, account int64, key, secret string) {
+	c, err := exchange.NewFuturesClient(client, "https://fapi.binance.com", key, secret)
+	if err != nil {
+		return
+	}
+	risk, err := c.Risk(ctx)
+	if err != nil {
+		log.Printf("账户风险快照失败 account=%d: %v", account, err)
+		return
+	}
+	if err = s.SaveAccountRisk(ctx, account, risk.Ratio, risk.MultiAssets); err != nil {
+		log.Printf("保存账户风险快照失败 account=%d: %v", account, err)
+	}
 }

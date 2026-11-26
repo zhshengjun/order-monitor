@@ -123,6 +123,9 @@ CREATE TABLE IF NOT EXISTS position_reconciliation (
   actual_quantity TEXT NOT NULL, local_quantity TEXT NOT NULL, difference TEXT NOT NULL,
   status TEXT NOT NULL, checked_at INTEGER NOT NULL, acknowledged INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY(account_id,symbol,position_side));
+CREATE TABLE IF NOT EXISTS account_risk (
+  account_id INTEGER PRIMARY KEY, ratio REAL NOT NULL DEFAULT 0,
+  multi_assets INTEGER NOT NULL DEFAULT 0, checked_at INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS account_health (
   account_id INTEGER PRIMARY KEY, ok INTEGER NOT NULL, can_trade INTEGER NOT NULL,
   can_withdraw INTEGER NOT NULL, checked_at INTEGER NOT NULL, error TEXT NOT NULL DEFAULT '',
