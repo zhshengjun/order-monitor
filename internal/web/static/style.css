@@ -164,14 +164,14 @@ dialog .section-title>button.quiet:hover:not(:disabled){background:#303741;color
 
 /* Reconciliation summary: counts first, detail table on demand. */
 .recon-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:0;border:1px solid #343b44;border-radius:9px;overflow:hidden;background:#242a32}
-.recon-summary-item{display:flex;flex-direction:column;gap:6px;padding:11px 13px;border-right:1px solid #343b44;min-width:0}
+.recon-summary-item{display:grid;grid-template-rows:16px 22px;row-gap:6px;align-content:start;padding:11px 13px;border-right:1px solid #343b44;min-width:0;line-height:1}
 .recon-summary-item:last-child{border-right:0}
-.recon-summary-item span{font-size:11px;color:#929daa;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.recon-summary-item strong{font-size:17px;font-weight:600;font-variant-numeric:tabular-nums;color:#eaecef}
-.recon-summary-item.critical strong{color:#f6465d}
-.recon-summary-item.warn strong{color:#e5bc42}
-.recon-summary-item.ok strong{color:#0ecb81}
-.recon-summary-item.muted strong{color:#aeb7c2}
+.recon-summary-label{display:block;font-size:11px;line-height:16px;color:#929daa;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.recon-summary-value{display:block;font-size:17px;line-height:22px;font-weight:600;font-variant-numeric:tabular-nums;color:#eaecef}
+.recon-summary-item.critical .recon-summary-value{color:#f6465d}
+.recon-summary-item.warn .recon-summary-value{color:#e5bc42}
+.recon-summary-item.ok .recon-summary-value{color:#0ecb81}
+.recon-summary-item.muted .recon-summary-value{color:#aeb7c2}
 .recon-detail{margin-top:10px;border:1px solid #343b44;border-radius:8px;overflow:hidden}
 .recon-table{max-height:260px;overflow:auto;overscroll-behavior:contain}
 .recon-row{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(0,1fr) repeat(3,minmax(0,.7fr));align-items:center;gap:10px;padding:9px 12px;border-bottom:1px solid #2b3139;font-size:12px}
