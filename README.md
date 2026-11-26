@@ -40,6 +40,8 @@ ssh -L 8080:127.0.0.1:8080 user@your-server
 
 ### 使用自动构建镜像
 
+`main` 分支 push 只发布 `linux/amd64`；`v*` tag 会同时发布 `linux/amd64` 和 `linux/arm64`。手动运行 Actions 默认按 amd64 发布。
+
 `main` 分支 push 或手动运行 Actions 后会发布：
 
 ```text

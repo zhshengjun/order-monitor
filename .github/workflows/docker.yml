@@ -22,11 +22,13 @@ jobs:
       - run: go vet ./...
       - run: go build ./...
       - run: node --check internal/web/static/app.js
-      - name: Cross-compile release binaries
+      - name: Cross-compile amd64 release binary
         run: |
           mkdir -p dist
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o dist/order-monitor-linux-amd64 ./cmd/order-monitor
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' -o dist/order-monitor-linux-arm64 ./cmd/order-monitor
+      - name: Cross-compile arm64 release binary
+        if: github.ref_type == 'tag'
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' -o dist/order-monitor-linux-arm64 ./cmd/order-monitor
       - uses: actions/upload-artifact@v4
         with:
           name: order-monitor-binaries
@@ -48,6 +50,7 @@ jobs:
           path: dist
       - run: chmod +x dist/*
       - uses: docker/setup-qemu-action@v4.4.0
+        if: github.ref_type == 'tag'
       - uses: docker/setup-buildx-action@v4.4.1
       - name: Build amd64 smoke image
         uses: docker/build-push-action@v7.4.0
@@ -100,7 +103,7 @@ jobs:
         with:
           context: .
           file: Dockerfile.prebuilt
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ github.ref_type == 'tag' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
