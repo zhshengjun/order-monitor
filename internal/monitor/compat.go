@@ -41,6 +41,7 @@ var (
 	TransitionLeaderPosition = domain.TransitionLeaderPosition
 	DashboardRows            = store.DashboardRows
 	QueueEvent               = store.QueueEvent
+	MergeLeaderRecords       = store.MergeLeaderRecords
 	DefaultSettings          = store.DefaultSettings
 	PositionAmount           = exchange.PositionAmount
 	defaultSettings          = store.DefaultSettings

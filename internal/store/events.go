@@ -4,8 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"math/big"
 	"sort"
+	"strconv"
 )
 
 func (s *SQLiteStore) Events(ctx context.Context, target, kind string, page, limit int) (map[string]any, error) {
@@ -27,28 +27,16 @@ func (s *SQLiteStore) Events(ctx context.Context, target, kind string, page, lim
 	if historical {
 		rows = []map[string]any{}
 		if kind == "leader" || kind == "order" {
-			raw, err := dashboardRows(ctx, tx, "SELECT body,stamp FROM leader_history WHERE target=?", target)
+			records, err := mergeFillsToRecords(leaderHistoryFills(ctx, tx, target))
 			if err != nil {
 				return nil, err
 			}
-			for _, r := range raw {
-				body, err := DecodeRecord(r["body"])
-				if err != nil {
-					return nil, err
+			for _, body := range records {
+				stamp, e := strconv.ParseInt(fmt.Sprint(body["orderTime"]), 10, 64)
+				if e != nil {
+					return nil, e
 				}
-				body["direction"] = direction(body)
-				if _, ok := body["notional"]; !ok {
-					q, e := decimal(fmt.Sprint(body["executedQty"]))
-					if e != nil {
-						return nil, e
-					}
-					p, e := decimal(fmt.Sprint(body["avgPrice"]))
-					if e != nil {
-						return nil, e
-					}
-					body["notional"] = decimalString(new(big.Rat).Mul(q, p))
-				}
-				rows = append(rows, map[string]any{"target": target, "name": name, "kind": "order", "body": body, "stamp": r["stamp"], "historical": 0})
+				rows = append(rows, map[string]any{"target": target, "name": name, "kind": "order", "body": body, "stamp": stamp, "historical": 0})
 			}
 		}
 		if kind == "leader" || kind == "transfer" {

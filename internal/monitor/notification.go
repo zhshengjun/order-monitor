@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/url"
 	"strings"
@@ -57,6 +58,47 @@ func sendNotification(ctx context.Context, client *http.Client, settings map[str
 	}
 	return nil
 }
+
+// compactNumber trims trailing zeros so a derived 40-digit average price reads
+// like 1697.07. It only falls back to the raw value when parsing fails.
+func compactNumber(raw string) string {
+	value, err := decimal(raw)
+	if err != nil {
+		return raw
+	}
+	text := strings.TrimRight(strings.TrimRight(value.FloatString(valueScale(value)), "0"), ".")
+	if text == "" || text == "-" {
+		return "0"
+	}
+	return text
+}
+
+func valueScale(value *big.Rat) int {
+	if scale, exact := value.FloatPrec(); exact && scale <= 60 {
+		return scale
+	}
+	return 12
+}
+
+func noticeNumberString(raw string) string {
+	if raw == "" {
+		return "—"
+	}
+	value, err := decimal(raw)
+	if err != nil {
+		return raw
+	}
+	return noticeNumber(value)
+}
+
+func int64Slice(values []int64) []any {
+	args := make([]any, len(values))
+	for i, v := range values {
+		args[i] = v
+	}
+	return args
+}
+
 func notificationText(name, kind string, stamp int64, body map[string]any) (string, string) {
 	labels := map[string]string{"copy": "跟单结果", "margin": "保证金风险", "order": "交易操作", "transfer": "资金划转", "alert": "告警"}
 	title := name + " · " + labels[kind]
@@ -76,7 +118,7 @@ func notificationText(name, kind string, stamp int64, body map[string]any) (stri
 	}
 	if kind == "order" {
 		direction := map[[2]string]string{{"BUY", "LONG"}: "开多", {"SELL", "LONG"}: "平多", {"SELL", "SHORT"}: "开空", {"BUY", "SHORT"}: "平空"}[[2]string{value("side"), value("positionSide")}]
-		text = fmt.Sprintf("%s %s\n数量：%s %s\n均价：%s %s\n成交金额：%s %s\n已实现盈亏：%s %s", value("symbol"), direction, value("executedQty"), value("baseAsset"), value("avgPrice"), value("quoteAsset"), value("notional"), value("quoteAsset"), value("totalPnl"), value("quoteAsset"))
+		text = fmt.Sprintf("%s %s\n数量：%s %s\n均价：%s %s\n成交金额：%s %s\n已实现盈亏：%s %s", value("symbol"), direction, compactNumber(value("executedQty")), value("baseAsset"), compactNumber(value("avgPrice")), value("quoteAsset"), noticeNumberString(value("notional")), value("quoteAsset"), noticeNumberString(value("totalPnl")), value("quoteAsset"))
 	}
 	return title, text + "\n时间（UTC+8）：" + time.UnixMilli(stamp).In(time.FixedZone("UTC+8", 8*3600)).Format("2006-01-02 15:04:05")
 }
@@ -127,6 +169,17 @@ func (s *Service) deliverNext(ctx context.Context, client *http.Client) (bool, e
 	if kind == "copy" {
 		if err = s.enrichCopy(ctx, client, event, body); err != nil {
 			return false, err
+		}
+	}
+	if combinedRaw, absorb, e := s.combineBatch(ctx, event, channel, kind, bodyRaw, body); e != nil {
+		return false, e
+	} else if len(absorb) > 0 {
+		bodyRaw = combinedRaw
+		if err = json.Unmarshal([]byte(bodyRaw), &body); err != nil {
+			return false, err
+		}
+		if _, e = s.DB().ExecContext(ctx, "UPDATE outbox SET status='cancelled',error='已合并到后续通知' WHERE status='pending' AND event IN (?"+strings.Repeat(",?", len(absorb)-1)+")", int64Slice(absorb)...); e != nil {
+			return false, e
 		}
 	}
 	mergedID, leaderTitle, leaderMessage, wait, err := s.notificationMerge(ctx, target, channel, kind, body)

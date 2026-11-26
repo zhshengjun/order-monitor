@@ -12,10 +12,31 @@ type LeaderFill struct {
 	Symbol       string          `json:"symbol"`
 	Side         string          `json:"side"`
 	PositionSide string          `json:"positionSide"`
+	Type         string          `json:"type"`
 	Quantity     json.Number     `json:"executedQty"`
 	Price        json.Number     `json:"avgPrice"`
 	Created      json.Number     `json:"orderTime"`
 	Updated      json.Number     `json:"orderUpdateTime"`
+	// Historic fields only exist on rows stored by older builds.
+	Notional json.Number `json:"notional"`
+	Pnl      json.Number `json:"totalPnl"`
+}
+
+// CumulativeNotional is the total quote amount for a stored row, preferring the
+// merged notional and falling back to quantity times average price.
+func (f LeaderFill) CumulativeNotional() (*big.Rat, error) {
+	if f.Notional != "" {
+		return Decimal(f.Notional.String())
+	}
+	quantity, err := Decimal(f.Quantity.String())
+	if err != nil {
+		return nil, err
+	}
+	price, err := Decimal(f.Price.String())
+	if err != nil {
+		return nil, err
+	}
+	return new(big.Rat).Mul(quantity, price), nil
 }
 
 func (f *LeaderFill) UnmarshalJSON(raw []byte) error {
@@ -30,7 +51,9 @@ func (f *LeaderFill) UnmarshalJSON(raw []byte) error {
 }
 
 func (f LeaderFill) MarshalJSON() ([]byte, error) {
-	if len(f.Raw) > 0 {
+	// Stored rows keep their original JSON (without merged fields); use the
+	// struct form when the derived cumulative fields are present.
+	if len(f.Raw) > 0 && f.Notional == "" && f.Pnl == "" && f.Type == "" {
 		return f.Raw, nil
 	}
 	type fields LeaderFill
