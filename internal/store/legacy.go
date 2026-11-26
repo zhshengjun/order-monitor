@@ -162,5 +162,12 @@ func (s *SQLiteStore) MigrateLegacyHistory(ctx context.Context) error {
 	if _, err = tx.ExecContext(ctx, "INSERT OR IGNORE INTO baseline_watermarks SELECT id,'transfer',0 FROM targets WHERE initialized=1"); err != nil {
 		return err
 	}
+	// Existing Python-era bindings have no trust row. Seed them as untrusted so
+	// the UI warns and an unmatched close is not auto-flattened until the
+	// operator re-enables copy (which rebuilds the virtual position).
+	if _, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO virtual_trust(account_id,target_id,trusted,reason,updated)
+		SELECT account_id,target_id,0,'迁移前旧数据，请重新开启跟单重算',? FROM copy_live WHERE enabled=1`, time.Now().UnixMilli()); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
