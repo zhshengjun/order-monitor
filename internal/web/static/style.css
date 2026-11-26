@@ -161,3 +161,40 @@ dialog .section-title>button.quiet:hover:not(:disabled){background:#303741;color
 .position-quantity-trigger{display:inline-flex;align-items:center;gap:5px;padding:0;border:0;border-radius:3px;background:transparent;color:inherit;font-weight:inherit;font-size:inherit;line-height:inherit;font-variant-numeric:tabular-nums;white-space:nowrap}.position-quantity-trigger:hover{filter:none;color:#f0b90b}.position-quantity-trigger:focus-visible{outline:2px solid #f0b90b;outline-offset:3px}.quantity-info{color:#929daa;font-size:11px}.position-quantity-trigger.has-warning .quantity-info{display:inline-grid;place-items:center;width:14px;height:14px;border-radius:50%;background:#68313a;color:#ff7a8a;font-size:10px}.position-ownership{min-width:180px;margin:0;gap:6px}.position-ownership-title{color:#dce1e7;font-weight:600}.position-ownership>span{justify-content:space-between;gap:10px}.position-ownership .error{justify-content:flex-start}#position-tooltip{width:max-content;max-width:min(280px,calc(100vw - 16px));white-space:normal;pointer-events:none}@media(min-width:701px){.positions-table th:nth-child(1){width:14%}.positions-table th:nth-child(2){width:6%}.positions-table th:nth-child(3){width:9%}.positions-table th:nth-child(4),.positions-table th:nth-child(5){width:10.5%}.positions-table th:nth-child(6){width:10%}.positions-table th:nth-child(7){width:9%}.positions-table th:nth-child(8){width:13%}.positions-table th:nth-child(9){width:10%}.positions-table th:nth-child(10){width:8%}.positions-panel .positions-table th:last-child,.positions-panel .positions-table td.position-actions{text-align:center}}
 
 .boot-screen{padding:18vh 24px;text-align:center;color:var(--muted,#667085);font-size:14px}
+
+/* Reconciliation summary: counts first, detail table on demand. */
+.recon-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:0;border:1px solid #343b44;border-radius:9px;overflow:hidden;background:#242a32}
+.recon-summary-item{display:flex;flex-direction:column;gap:6px;padding:11px 13px;border-right:1px solid #343b44;min-width:0}
+.recon-summary-item:last-child{border-right:0}
+.recon-summary-item span{font-size:11px;color:#929daa;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.recon-summary-item strong{font-size:17px;font-weight:600;font-variant-numeric:tabular-nums;color:#eaecef}
+.recon-summary-item.critical strong{color:#f6465d}
+.recon-summary-item.warn strong{color:#e5bc42}
+.recon-summary-item.ok strong{color:#0ecb81}
+.recon-summary-item.muted strong{color:#aeb7c2}
+.recon-detail{margin-top:10px;border:1px solid #343b44;border-radius:8px;overflow:hidden}
+.recon-table{max-height:260px;overflow:auto;overscroll-behavior:contain}
+.recon-row{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(0,1fr) repeat(3,minmax(0,.7fr));align-items:center;gap:10px;padding:9px 12px;border-bottom:1px solid #2b3139;font-size:12px}
+.recon-row:last-child{border-bottom:0}
+.recon-row.recon-head{padding:8px 12px;background:#242a32;color:#929daa;font-size:11px;position:sticky;top:0;z-index:1}
+.recon-pair{display:flex;align-items:center;gap:7px;min-width:0}
+.recon-pair strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.recon-pair em{font-style:normal;font-size:10px;color:#929daa;border:1px solid #414a56;border-radius:4px;padding:1px 5px;flex:none}
+.recon-badge{justify-self:start;font-size:10px;padding:3px 7px;border-radius:5px;white-space:nowrap;background:#343b44;color:#aeb7c2}
+.recon-badge.critical{background:#3b2229;color:#f6465d}
+.recon-badge.warn{background:#3b321b;color:#e5bc42}
+.recon-badge.ok{background:#173b31;color:#0ecb81}
+.recon-value{text-align:right;font-variant-numeric:tabular-nums;color:#d1d6dc}
+.recon-diff{font-weight:600}
+.recon-row.critical .recon-diff{color:#f6465d}
+.recon-row.warn .recon-diff{color:#e5bc42}
+.recon-row.ok .recon-diff{color:#848e9c}
+@media(max-width:550px){
+  .recon-summary{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .recon-summary-item:nth-child(2n){border-right:0}
+  .recon-summary-item:nth-child(n+3){border-top:1px solid #343b44}
+  .recon-row{grid-template-columns:1fr auto;gap:4px 10px}
+  .recon-row.recon-head{display:none}
+  .recon-value{text-align:left}
+  .recon-value:before{content:attr(data-label) " ";color:#929daa}
+}
