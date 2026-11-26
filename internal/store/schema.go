@@ -27,6 +27,7 @@ func (s *SQLiteStore) InitializeMonitorTables(ctx context.Context) error {
 		{"leader_history_sync", "last_batch", "TEXT NOT NULL DEFAULT ''"},
 		{"leader_history_sync", "started_at", "INTEGER NOT NULL DEFAULT 0"},
 		{"leader_history_sync", "failures", "INTEGER NOT NULL DEFAULT 0"},
+		{"position_reconciliation", "acknowledged", "INTEGER NOT NULL DEFAULT 0"},
 	} {
 		var exists bool
 		if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?) WHERE name=?)", field.table, field.column).Scan(&exists); err != nil {

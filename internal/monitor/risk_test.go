@@ -100,3 +100,87 @@ func TestBreakerBlocksCopyEnableUntilReset(t *testing.T) {
 }
 
 func int64Ptr(v int64) *int64 { return &v }
+
+func TestReconcileAfterManualResetDoesNotPauseAgain(t *testing.T) {
+	s := riskFixture(t)
+	ctx := context.Background()
+	actual := []exchange.FuturesPosition{{Symbol: "BTCUSDT", Side: "BOTH", Amount: "0.5"}}
+	if err := s.reconcilePositions(ctx, 1, actual); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ResetBreaker(ctx, "account:1"); err != nil {
+		t.Fatal(err)
+	}
+	// Operator resumed copy and believes the local attribution is correct.
+	enabled := true
+	if err := s.ApplyControl(ctx, "/api/copy-live", store.ControlInput{AccountID: int64Ptr(1), TargetID: "kol", Enabled: &enabled}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.reconcilePositions(ctx, 1, actual); err != nil {
+		t.Fatal(err)
+	}
+	var acknowledged bool
+	if err := s.DB().QueryRowContext(ctx, "SELECT acknowledged FROM position_reconciliation WHERE account_id=1").Scan(&acknowledged); err != nil || !acknowledged {
+		t.Fatalf("acknowledged=%v err=%v", acknowledged, err)
+	}
+	var breakers, activeAlerts int
+	if err := s.DB().QueryRowContext(ctx, "SELECT COUNT(*) FROM risk_breakers WHERE active=1").Scan(&breakers); err != nil || breakers != 0 {
+		t.Fatalf("breaker reactivated: %d %v", breakers, err)
+	}
+	if err := s.DB().QueryRowContext(ctx, "SELECT COUNT(*) FROM alerts WHERE key LIKE 'reconcile:%' AND status='active'").Scan(&activeAlerts); err != nil || activeAlerts != 0 {
+		t.Fatalf("reconcile alert re-raised: %d %v", activeAlerts, err)
+	}
+	var live int
+	if err := s.DB().QueryRowContext(ctx, "SELECT enabled FROM copy_live WHERE account_id=1").Scan(&live); err != nil || live != 1 {
+		t.Fatalf("copy was disabled again: %d %v", live, err)
+	}
+}
+
+func TestReconcileAfterManualResetDetectsChangedLocalQuantity(t *testing.T) {
+	s := riskFixture(t)
+	ctx := context.Background()
+	actual := []exchange.FuturesPosition{{Symbol: "BTCUSDT", Side: "BOTH", Amount: "0.5"}}
+	if err := s.reconcilePositions(ctx, 1, actual); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ResetBreaker(ctx, "account:1"); err != nil {
+		t.Fatal(err)
+	}
+	enabled := true
+	if err := s.ApplyControl(ctx, "/api/copy-live", store.ControlInput{AccountID: int64Ptr(1), TargetID: "kol", Enabled: &enabled}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	// A new fill raises the local attribution again; that is a new mismatch.
+	if _, err := s.DB().ExecContext(ctx, "UPDATE copied_positions SET quantity='0.8'"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.reconcilePositions(ctx, 1, actual); err != nil {
+		t.Fatal(err)
+	}
+	var breakers int
+	if err := s.DB().QueryRowContext(ctx, "SELECT COUNT(*) FROM risk_breakers WHERE active=1").Scan(&breakers); err != nil || breakers != 1 {
+		t.Fatalf("changed mismatch must pause copy: %d %v", breakers, err)
+	}
+}
+
+func TestReconcileMatchClearsAcknowledgement(t *testing.T) {
+	s := riskFixture(t)
+	ctx := context.Background()
+	if err := s.reconcilePositions(ctx, 1, []exchange.FuturesPosition{{Symbol: "BTCUSDT", Side: "BOTH", Amount: "0.5"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ResetBreaker(ctx, "account:1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.reconcilePositions(ctx, 1, []exchange.FuturesPosition{{Symbol: "BTCUSDT", Side: "BOTH", Amount: "1"}}); err != nil {
+		t.Fatal(err)
+	}
+	var status string
+	var acknowledged bool
+	if err := s.DB().QueryRowContext(ctx, "SELECT status,acknowledged FROM position_reconciliation WHERE account_id=1").Scan(&status, &acknowledged); err != nil {
+		t.Fatal(err)
+	}
+	if status != "match" || acknowledged {
+		t.Fatalf("status=%s acknowledged=%v", status, acknowledged)
+	}
+}

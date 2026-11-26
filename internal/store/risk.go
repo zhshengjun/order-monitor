@@ -39,14 +39,6 @@ func (s *SQLiteStore) ResetBreaker(ctx context.Context, scope string) error {
 	return nil
 }
 
-func (s *SQLiteStore) SaveReconciliation(ctx context.Context, tx *sql.Tx, account int64, symbol, side, actual, local, difference, status string) error {
-	_, err := tx.ExecContext(ctx, `INSERT INTO position_reconciliation(account_id,symbol,position_side,actual_quantity,local_quantity,difference,status,checked_at)
-	VALUES(?,?,?,?,?,?,?,?)
-	ON CONFLICT(account_id,symbol,position_side) DO UPDATE SET actual_quantity=excluded.actual_quantity,local_quantity=excluded.local_quantity,difference=excluded.difference,status=excluded.status,checked_at=excluded.checked_at`,
-		account, symbol, side, actual, local, difference, status, time.Now().UnixMilli())
-	return err
-}
-
 // ResolveReconciliation removes rows for positions that no longer exist.
 func (s *SQLiteStore) PruneReconciliation(ctx context.Context, tx *sql.Tx, account int64, keep map[string]bool) error {
 	rows, err := tx.QueryContext(ctx, "SELECT symbol,position_side FROM position_reconciliation WHERE account_id=?", account)

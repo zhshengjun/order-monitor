@@ -121,7 +121,7 @@ CREATE TABLE IF NOT EXISTS risk_breakers (
 CREATE TABLE IF NOT EXISTS position_reconciliation (
   account_id INTEGER NOT NULL, symbol TEXT NOT NULL, position_side TEXT NOT NULL,
   actual_quantity TEXT NOT NULL, local_quantity TEXT NOT NULL, difference TEXT NOT NULL,
-  status TEXT NOT NULL, checked_at INTEGER NOT NULL,
+  status TEXT NOT NULL, checked_at INTEGER NOT NULL, acknowledged INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY(account_id,symbol,position_side));
 CREATE TABLE IF NOT EXISTS account_health (
   account_id INTEGER PRIMARY KEY, ok INTEGER NOT NULL, can_trade INTEGER NOT NULL,

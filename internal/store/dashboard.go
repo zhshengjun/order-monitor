@@ -20,7 +20,7 @@ var dashboardQueries = map[string]string{
 	"virtual_trust":            `SELECT account_id,target_id,trusted,reason,updated FROM virtual_trust`,
 	"active_alerts":            `SELECT key,scope,severity,title,message,count,first_seen,last_seen FROM alerts WHERE status='active' ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END,last_seen DESC`,
 	"account_health":           `SELECT a.id AS account_id,a.name,h.ok AS ok,h.can_trade AS can_trade,h.can_withdraw AS can_withdraw,h.checked_at AS checked_at,COALESCE(h.error,'') AS error FROM futures_accounts a LEFT JOIN account_health h ON h.account_id=a.id`,
-	"position_reconciliation":  `SELECT account_id,symbol,position_side,actual_quantity,local_quantity,difference,status,checked_at FROM position_reconciliation ORDER BY CASE status WHEN 'over' THEN 0 WHEN 'unattributed' THEN 1 ELSE 2 END,account_id,symbol`,
+	"position_reconciliation":  `SELECT account_id,symbol,position_side,actual_quantity,local_quantity,difference,status,checked_at,acknowledged FROM position_reconciliation ORDER BY CASE status WHEN 'over' THEN 0 WHEN 'unattributed' THEN 1 ELSE 2 END,account_id,symbol`,
 	"risk_breakers":            `SELECT scope,reason,active,updated FROM risk_breakers WHERE active=1`,
 	"notification_errors":      `SELECT channel,attempts,error FROM outbox WHERE status='pending' AND error!='' ORDER BY id DESC LIMIT 5`,
 	"unresolved_orders":        `SELECT c.id,c.body,c.error,a.name AS account_name,t.name AS target_name FROM copy_tasks c JOIN futures_accounts a ON a.id=c.account_id JOIN targets t ON t.id=c.target_id WHERE c.state='submitted' ORDER BY c.id`,

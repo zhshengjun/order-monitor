@@ -198,6 +198,10 @@ func (s *Service) tripTx(ctx context.Context, tx *sql.Tx, scope, reason string) 
 
 // ResetBreaker clears the breaker record and its alert. Copy is not re-enabled
 // automatically; the operator must explicitly turn it back on.
+// ResetBreaker clears the breaker record and its alert. For an account the
+// current reconciliation mismatches are acknowledged, so the operator's manual
+// review is final: the same mismatch will not pause copy again. A later change
+// in the local attribution is a new mismatch and is evaluated normally.
 func (s *Service) ResetBreaker(ctx context.Context, scope string) error {
 	if !strings.HasPrefix(scope, "account:") && !strings.HasPrefix(scope, "target:") {
 		return store.InputError("风控范围无效")
@@ -205,8 +209,58 @@ func (s *Service) ResetBreaker(ctx context.Context, scope string) error {
 	if err := s.ResetBreakerRecord(ctx, scope); err != nil {
 		return err
 	}
+	if strings.HasPrefix(scope, "account:") {
+		var account int64
+		if _, err := fmt.Sscanf(scope, "account:%d", &account); err == nil {
+			s.acknowledgeReconciliations(ctx, account)
+		}
+	}
 	s.resolve(ctx, "breaker:"+scope, "风控暂停已人工解除")
 	return nil
+}
+
+// acknowledgeReconciliations records that the operator reviewed the current
+// mismatches and clears their alerts.
+func (s *Service) acknowledgeReconciliations(ctx context.Context, account int64) {
+	tx, err := s.DB().BeginTx(ctx, nil)
+	if err != nil {
+		log.Printf("确认对账记录失败 account=%d: %v", account, err)
+		return
+	}
+	defer tx.Rollback()
+	if _, err = s.AcknowledgeReconciliation(ctx, tx, account); err != nil {
+		log.Printf("确认对账记录失败 account=%d: %v", account, err)
+		return
+	}
+	rows, err := tx.QueryContext(ctx, "SELECT symbol,position_side FROM position_reconciliation WHERE account_id=? AND acknowledged=1", account)
+	if err != nil {
+		log.Printf("确认对账记录失败 account=%d: %v", account, err)
+		return
+	}
+	type entry struct{ symbol, side string }
+	var entries []entry
+	for rows.Next() {
+		var e entry
+		if err = rows.Scan(&e.symbol, &e.side); err != nil {
+			rows.Close()
+			return
+		}
+		entries = append(entries, e)
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return
+	}
+	rows.Close()
+	for _, e := range entries {
+		key := fmt.Sprintf("reconcile:%d:%s:%s", account, e.symbol, e.side)
+		if _, err = s.ResolveAlert(ctx, tx, key, "已人工核对对账差异，不再重复提醒"); err != nil {
+			return
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		log.Printf("确认对账记录失败 account=%d: %v", account, err)
+	}
 }
 
 func (s *Service) ResetBreakerRecord(ctx context.Context, scope string) error {
@@ -328,11 +382,19 @@ func (s *Service) reconcilePositions(ctx context.Context, account int64, positio
 			status = "unattributed"
 		}
 		keep[mapKey] = true
-		if err = s.SaveReconciliation(ctx, tx, account, symbol, side, decimalString(actual), decimalString(localQty), decimalString(difference), status); err != nil {
+		if err = s.SaveReconciliationWithAck(ctx, tx, account, symbol, side, decimalString(actual), decimalString(localQty), decimalString(difference), status); err != nil {
 			return err
 		}
 		alertKey := fmt.Sprintf("reconcile:%d:%s:%s", account, symbol, side)
 		if status == "over" {
+			var acknowledged bool
+			if err = tx.QueryRowContext(ctx, "SELECT acknowledged FROM position_reconciliation WHERE account_id=? AND symbol=? AND position_side=?", account, symbol, side).Scan(&acknowledged); err != nil {
+				return err
+			}
+			if acknowledged {
+				// The operator reviewed this same mismatch and resumed copy.
+				continue
+			}
 			if _, err = s.RaiseAlert(ctx, tx, store.AlertSpec{Key: alertKey, Scope: fmt.Sprintf("account:%d", account), Severity: store.SeverityCritical, Title: "持仓对账不一致", Message: fmt.Sprintf("%s %s 本地归属 %s 超过交易所实际 %s", symbol, side, decimalString(localQty), decimalString(actual))}); err != nil {
 				return err
 			}
