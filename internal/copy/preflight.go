@@ -37,8 +37,8 @@ func (s *Service) preparePending(ctx context.Context, task PendingCopy, c *Futur
 	}
 	in := PlanInput{Key: obs.Key, Action: task.Action, Signal: Signal{Quantity: task.Body.Quantity.String(), Price: task.Body.Price.String()}, LeaderBefore: task.Before, LeaderBalance: task.LeaderBalance, Multiplier: task.Multiplier}
 	// The copy ratio uses the leader balance captured when the task was queued.
-	// A saved value up to three minutes old is accepted as-is; anything older
-	// (or missing) is re-fetched so the ratio tracks the leader's current funds.
+	// A saved value up to one minute old is accepted as-is (normally it is only
+	// seconds old thanks to polling); anything older is re-fetched.
 	// close-type plans ignore the leader balance entirely.
 	if task.Action == "open" {
 		savedBalance, savedAt, err := s.LeaderBalance(ctx, task.Target)
@@ -119,8 +119,9 @@ func (s *Service) preparePending(ctx context.Context, task PendingCopy, c *Futur
 }
 
 // leaderBalanceMaxAge is how old a saved leader balance may be for the copy
-// ratio calculation before a fresh request is made.
-const leaderBalanceMaxAge = 3 * time.Minute
+// ratio calculation before a fresh request is made. Polling refreshes it every
+// few seconds, so in practice tasks always reuse a near-current balance.
+const leaderBalanceMaxAge = time.Minute
 
 func (s *Service) planIncrement(ctx context.Context, t PendingCopy, in *PlanInput) error {
 	fill, err := s.Load(ctx, in.Key)

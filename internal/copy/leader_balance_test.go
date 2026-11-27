@@ -43,7 +43,14 @@ func TestRecentLeaderBalanceIsReusedAndStaleOneRefetched(t *testing.T) {
 	if prepared.LeaderBalance != "200" {
 		t.Fatalf("recent saved balance should be reused, got %s", prepared.LeaderBalance)
 	}
-	if _, err = s.DB().ExecContext(ctx, "UPDATE targets SET balance_time=0"); err != nil {
+	// A balance just inside the one-minute window is still reused.
+	if _, err = s.DB().ExecContext(ctx, "UPDATE targets SET balance_time=?", time.Now().Add(-50*time.Second).UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	if prepared, err = s.preparePending(ctx, task, client, staleDetail{"999"}); err != nil || prepared.LeaderBalance != "200" {
+		t.Fatalf("50s old balance should be reused: %s %v", prepared.LeaderBalance, err)
+	}
+	if _, err = s.DB().ExecContext(ctx, "UPDATE targets SET balance_time=?", time.Now().Add(-90*time.Second).UnixMilli()); err != nil {
 		t.Fatal(err)
 	}
 	prepared, err = s.preparePending(ctx, task, client, staleDetail{"999"})
