@@ -14,6 +14,7 @@ type PendingCopy struct {
 	Target, OriginalKey, ClientID, Action, Before, LeaderBalance, Multiplier string
 	APIKey, APISecret                                                        string
 	Retries                                                                  int
+	Created                                                                  int64
 	Body                                                                     struct {
 		LeaderFill
 		Incremental bool `json:"incremental"`
@@ -24,11 +25,11 @@ type PendingCopy struct {
 func (s *Service) NextPending(ctx context.Context, now time.Time) (PendingCopy, bool, error) {
 	var task PendingCopy
 	var raw string
-	err := s.DB().QueryRowContext(ctx, `SELECT c.id,c.account_id,c.target_id,c.order_key,c.client_id,c.action,c.before_qty,c.lead_balance,c.retry_count,c.body,a.api_key,a.api_secret,COALESCE(m.multiplier,'1')
+	err := s.DB().QueryRowContext(ctx, `SELECT c.id,c.account_id,c.target_id,c.order_key,c.client_id,c.action,c.before_qty,c.lead_balance,c.retry_count,c.created,c.body,a.api_key,a.api_secret,COALESCE(m.multiplier,'1')
 	FROM copy_tasks c JOIN futures_accounts a ON a.id=c.account_id JOIN virtual_sessions v ON v.account_id=c.account_id AND v.target_id=c.target_id AND v.active=1
 	JOIN targets t ON t.id=c.target_id AND t.enabled=1 LEFT JOIN copy_task_multiplier_v2 m ON m.task_id=c.id
 	WHERE c.state='pending' AND c.next_check<=? AND NOT EXISTS(SELECT 1 FROM copy_tasks earlier WHERE earlier.account_id=c.account_id AND earlier.state='pending' AND earlier.id<c.id)
-	ORDER BY c.id LIMIT 1`, now.Unix()).Scan(&task.ID, &task.AccountID, &task.Target, &task.OriginalKey, &task.ClientID, &task.Action, &task.Before, &task.LeaderBalance, &task.Retries, &raw, &task.APIKey, &task.APISecret, &task.Multiplier)
+	ORDER BY c.id LIMIT 1`, now.Unix()).Scan(&task.ID, &task.AccountID, &task.Target, &task.OriginalKey, &task.ClientID, &task.Action, &task.Before, &task.LeaderBalance, &task.Retries, &task.Created, &raw, &task.APIKey, &task.APISecret, &task.Multiplier)
 	if errors.Is(err, sql.ErrNoRows) {
 		return task, false, nil
 	}

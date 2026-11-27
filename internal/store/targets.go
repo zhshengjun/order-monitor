@@ -37,7 +37,7 @@ func (s *SQLiteStore) AddTarget(ctx context.Context, c *exchange.LeaderClient, i
 	if _, err = tx.ExecContext(ctx, "INSERT OR IGNORE INTO targets(id,name,detail) VALUES(?,?,?)", id, detail.Name, string(data)); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, "UPDATE targets SET balance=? WHERE id=?", detail.MarginBalance.String(), id); err != nil {
+	if _, err = tx.ExecContext(ctx, "UPDATE targets SET balance=?,balance_time=? WHERE id=?", detail.MarginBalance.String(), now.UnixMilli(), id); err != nil {
 		return err
 	}
 	if _, err = tx.ExecContext(ctx, "INSERT OR IGNORE INTO monitor_start VALUES(?,?)", id, now.UnixMilli()); err != nil {
@@ -100,6 +100,14 @@ func (s *SQLiteStore) SaveLeaderDetail(ctx context.Context, id, name, balance st
 	if name == "" {
 		return nil
 	}
-	_, err := s.DB().ExecContext(ctx, "UPDATE targets SET name=?,balance=?,detail=? WHERE id=?", name, balance, string(detail), id)
+	_, err := s.DB().ExecContext(ctx, "UPDATE targets SET name=?,balance=?,balance_time=?,detail=? WHERE id=?", name, balance, time.Now().UnixMilli(), string(detail), id)
 	return err
+}
+
+// LeaderBalance returns the last saved balance and when it was fetched.
+func (s *SQLiteStore) LeaderBalance(ctx context.Context, id string) (string, int64, error) {
+	var balance string
+	var fetched int64
+	err := s.DB().QueryRowContext(ctx, "SELECT COALESCE(balance,''),balance_time FROM targets WHERE id=?", id).Scan(&balance, &fetched)
+	return balance, fetched, err
 }

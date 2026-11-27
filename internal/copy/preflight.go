@@ -13,7 +13,12 @@ import (
 	"time"
 )
 
-func (s *Service) preparePending(ctx context.Context, task PendingCopy, c *FuturesClient, leader *exchange.LeaderClient) (PreparedCopy, error) {
+// LeaderDetailSource fetches the leader portfolio detail (and margin balance).
+type LeaderDetailSource interface {
+	Detail(context.Context, string) (exchange.LeaderDetail, error)
+}
+
+func (s *Service) preparePending(ctx context.Context, task PendingCopy, c *FuturesClient, leader LeaderDetailSource) (PreparedCopy, error) {
 	var prepared PreparedCopy
 	obs, err := task.Body.Observation(task.Target)
 	now := time.Now()
@@ -31,17 +36,42 @@ func (s *Service) preparePending(ctx context.Context, task PendingCopy, c *Futur
 		}
 	}
 	in := PlanInput{Key: obs.Key, Action: task.Action, Signal: Signal{Quantity: task.Body.Quantity.String(), Price: task.Body.Price.String()}, LeaderBefore: task.Before, LeaderBalance: task.LeaderBalance, Multiplier: task.Multiplier}
-	if in.LeaderBalance == "" {
-		detail, err := leader.Detail(ctx, task.Target)
+	// The copy ratio uses the leader balance captured when the task was queued.
+	// A saved value up to three minutes old is accepted as-is; anything older
+	// (or missing) is re-fetched so the ratio tracks the leader's current funds.
+	// close-type plans ignore the leader balance entirely.
+	if task.Action == "open" {
+		savedBalance, savedAt, err := s.LeaderBalance(ctx, task.Target)
 		if err != nil {
-			return prepared, fmt.Errorf("%w: %v", exchange.ErrNetwork, err)
-		}
-		in.LeaderBalance = detail.MarginBalance.String()
-		if _, err = positiveDecimal(in.LeaderBalance, "带单员余额"); err != nil {
 			return prepared, err
 		}
-		if _, err = s.DB().ExecContext(ctx, "UPDATE copy_tasks SET lead_balance=? WHERE id=? AND state='pending'", in.LeaderBalance, task.ID); err != nil {
+		// A missing timestamp means the saved balance was never refreshed; only
+		// fall back to the task's own snapshot when nothing is stored at all.
+		if savedBalance == "" {
+			savedBalance, savedAt = task.LeaderBalance, task.Created
+		}
+		stale := savedBalance == "" || savedAt == 0 || time.Since(time.UnixMilli(savedAt)) > leaderBalanceMaxAge
+		if stale {
+			if leader == nil {
+				return prepared, errors.New("带单员余额已过期，需要重新获取余额")
+			}
+			detail, err := leader.Detail(ctx, task.Target)
+			if err != nil {
+				return prepared, fmt.Errorf("%w: %v", exchange.ErrNetwork, err)
+			}
+			savedBalance = detail.MarginBalance.String()
+			if _, err = s.DB().ExecContext(ctx, "UPDATE targets SET balance=?,balance_time=? WHERE id=?", savedBalance, time.Now().UnixMilli(), task.Target); err != nil {
+				return prepared, err
+			}
+		}
+		if _, err = positiveDecimal(savedBalance, "带单员余额"); err != nil {
 			return prepared, err
+		}
+		in.LeaderBalance = savedBalance
+		if in.LeaderBalance != task.LeaderBalance {
+			if _, err = s.DB().ExecContext(ctx, "UPDATE copy_tasks SET lead_balance=? WHERE id=? AND state='pending'", in.LeaderBalance, task.ID); err != nil {
+				return prepared, err
+			}
 		}
 	}
 	prepared.LeaderBalance = in.LeaderBalance
@@ -87,6 +117,10 @@ func (s *Service) preparePending(ctx context.Context, task PendingCopy, c *Futur
 	prepared.Order, err = PlanOrder(in)
 	return prepared, err
 }
+
+// leaderBalanceMaxAge is how old a saved leader balance may be for the copy
+// ratio calculation before a fresh request is made.
+const leaderBalanceMaxAge = 3 * time.Minute
 
 func (s *Service) planIncrement(ctx context.Context, t PendingCopy, in *PlanInput) error {
 	fill, err := s.Load(ctx, in.Key)

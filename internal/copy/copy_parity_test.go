@@ -439,7 +439,7 @@ func TestPrepareIncrementStopsAtAlreadyFilledCumulativeTarget(t *testing.T) {
 	if err := store.Commit(ctx, Comparison{Observation: Observation{Key: key, Fill: CumulativeFill{Quantity: "0.002", Cost: "0.2"}}}); err != nil {
 		t.Fatal(err)
 	}
-	task := PendingCopy{ID: 2, AccountID: 1, Target: "kol", OriginalKey: "base", Action: "open", Before: "0.001", LeaderBalance: "100", Multiplier: "1"}
+	task := PendingCopy{ID: 2, AccountID: 1, Target: "kol", OriginalKey: "base", Action: "open", Before: "0.001", LeaderBalance: "100", Multiplier: "1", Created: time.Now().UnixMilli()}
 	task.Body = struct {
 		LeaderFill
 		Incremental bool `json:"incremental"`
