@@ -130,3 +130,43 @@ func countRows(t *testing.T, store *Service, query string, args ...any) int {
 	}
 	return count
 }
+
+func TestPollPersistsLeaderBalanceAndName(t *testing.T) {
+	ctx := context.Background()
+	now := time.UnixMilli(1760000000000)
+	store, err := OpenService(ctx, filepath.Join(t.TempDir(), "balance.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err = store.DB().ExecContext(ctx, `INSERT INTO targets(id,name,initialized,balance) VALUES('kol','old',1,'0')`); err != nil {
+		t.Fatal(err)
+	}
+	cache, err := NewComparator(store, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stamp := json.Number("1760000000000")
+	fill := LeaderFill{Symbol: "BTCUSDT", Side: "BUY", PositionSide: "LONG", Quantity: "1", Price: "100", Created: stamp, Updated: stamp}
+	poller := LeaderPoller{Source: detailHistory{testHistory{pages: [][]LeaderFill{{fill}}}, "新名字", "12345.6789"}, Store: store, Comparator: cache, Now: func() time.Time { return now }}
+	if err := poller.PollPortfolio(ctx, "kol", 10, now.Add(-time.Minute), true); err != nil {
+		t.Fatal(err)
+	}
+	var name, balance string
+	if err = store.DB().QueryRowContext(ctx, "SELECT name,balance FROM targets WHERE id='kol'").Scan(&name, &balance); err != nil {
+		t.Fatal(err)
+	}
+	if name != "新名字" || balance != "12345.6789" {
+		t.Fatalf("name=%s balance=%s", name, balance)
+	}
+}
+
+type detailHistory struct {
+	testHistory
+	name    string
+	balance string
+}
+
+func (h detailHistory) Detail(_ context.Context, portfolio string) (LeaderDetail, error) {
+	return LeaderDetail{ID: portfolio, Name: h.name, MarginBalance: json.Number(h.balance)}, nil
+}

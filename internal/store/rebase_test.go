@@ -105,3 +105,28 @@ func TestEnablingCopyWithIncompleteHistoryMarksVirtualPositionUntrusted(t *testi
 		t.Fatalf("trust=%v reason=%s", trusted, reason)
 	}
 }
+
+func TestAddTargetStoresInitialBalance(t *testing.T) {
+	ctx := context.Background()
+	s, err := OpenSQLiteStore(ctx, filepath.Join(t.TempDir(), "add.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err = s.InitializeMonitorTables(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.DB().ExecContext(ctx, "INSERT INTO targets(id,name,detail) VALUES('123','旧', '{}')"); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.SaveLeaderDetail(ctx, "123", "新名字", "987.65", []byte(`{"nickname":"新名字","marginBalance":"987.65"}`)); err != nil {
+		t.Fatal(err)
+	}
+	var name, balance, detail string
+	if err = s.DB().QueryRowContext(ctx, "SELECT name,balance,detail FROM targets WHERE id='123'").Scan(&name, &balance, &detail); err != nil {
+		t.Fatal(err)
+	}
+	if name != "新名字" || balance != "987.65" || detail == "{}" {
+		t.Fatalf("name=%s balance=%s detail=%s", name, balance, detail)
+	}
+}

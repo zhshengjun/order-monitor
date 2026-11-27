@@ -36,6 +36,11 @@ func (p LeaderPoller) PollPortfolio(ctx context.Context, portfolio string, pageS
 	}); ok {
 		if detail, err := source.Detail(ctx, portfolio); err == nil {
 			leaderBalance = detail.MarginBalance.String()
+			if raw, marshalErr := json.Marshal(detail); marshalErr == nil {
+				if saveErr := p.Store.SaveLeaderDetail(ctx, portfolio, detail.Name, leaderBalance, raw); saveErr != nil {
+					return saveErr
+				}
+			}
 		}
 	}
 	byOrder := make(map[OrderKey]map[string]*big.Rat)

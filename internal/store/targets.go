@@ -37,6 +37,9 @@ func (s *SQLiteStore) AddTarget(ctx context.Context, c *exchange.LeaderClient, i
 	if _, err = tx.ExecContext(ctx, "INSERT OR IGNORE INTO targets(id,name,detail) VALUES(?,?,?)", id, detail.Name, string(data)); err != nil {
 		return err
 	}
+	if _, err = tx.ExecContext(ctx, "UPDATE targets SET balance=? WHERE id=?", detail.MarginBalance.String(), id); err != nil {
+		return err
+	}
 	if _, err = tx.ExecContext(ctx, "INSERT OR IGNORE INTO monitor_start VALUES(?,?)", id, now.UnixMilli()); err != nil {
 		return err
 	}
@@ -89,4 +92,14 @@ func (s *SQLiteStore) Reorder(ctx context.Context, kind, item, relative, side st
 		}
 	}
 	return tx.Commit()
+}
+
+// SaveLeaderDetail refreshes the cached leader detail and margin balance. A
+// failure keeps the previous values.
+func (s *SQLiteStore) SaveLeaderDetail(ctx context.Context, id, name, balance string, detail []byte) error {
+	if name == "" {
+		return nil
+	}
+	_, err := s.DB().ExecContext(ctx, "UPDATE targets SET name=?,balance=?,detail=? WHERE id=?", name, balance, string(detail), id)
+	return err
 }
